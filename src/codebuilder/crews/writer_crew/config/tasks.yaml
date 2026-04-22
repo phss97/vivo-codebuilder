@@ -1,0 +1,31 @@
+write_task:
+  description: >
+    Implement this subtask by writing the full contents of a single file.
+
+    Subtask:
+    {subtask}
+
+    Workspace root: {workspace_dir}
+    Relative paths already present in the workspace you should consult before
+    writing:
+    {workspace_listing}
+
+    User amendments from the plan approval step (may be empty):
+    {amendments}
+
+    Prior review feedback to incorporate (only populated on retry; may be empty):
+    {prior_review_issues}
+
+    Rules:
+    - Write ONE file whose path is exactly `file_path` from the subtask.
+    - Include complete, runnable code — no placeholders, no `...`.
+    - Do NOT embed tests inside a production module. Tests belong in a
+      `tests/` file, which the planner schedules as its own subtask. If
+      `file_path` is under `tests/`, write tests there; otherwise write
+      production code only.
+    - Persist the file via the `workspace_write` tool before finalizing.
+      The downstream Reviewer will run lint and tests against it.
+  expected_output: >
+    A CodeArtifact JSON object with: subtask_id, file_path (must match the
+    subtask), content (the full file text you wrote), language, tests_included.
+  agent: writer
