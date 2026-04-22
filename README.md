@@ -1,56 +1,119 @@
-# {{crew_name}} Crew
+# codebuilder
 
-Welcome to the {{crew_name}} Crew project, powered by [crewAI](https://crewai.com). This template is designed to help you set up a multi-agent AI system with ease, leveraging the powerful and flexible framework provided by crewAI. Our goal is to enable your agents to collaborate effectively on complex tasks, maximizing their collective intelligence and capabilities.
+A CrewAI **Flow** that turns a project brief into working code. It plans the work with a human-in-the-loop (HITL) gate, builds the code in an isolated per-job workspace, and reviews every artifact through a writer↔reviewer loop before a final QA pass.
 
-## Installation
-
-Ensure you have Python >=3.10 <3.14 installed on your system. This project uses [UV](https://docs.astral.sh/uv/) for dependency management and package handling, offering a seamless setup and execution experience.
-
-First, if you haven't already, install uv:
-
-```bash
-pip install uv
+```
+brief.json ──▶ ingest ──▶ plan ──▶ [HITL approve/amend/reject]
+                                         │
+                                         ▼
+                          build (writer ↔ reviewer loop) ──▶ finalize (QA + history)
 ```
 
-Next, navigate to your project directory and install the dependencies:
+Two modes:
 
-(Optional) Lock the dependencies and install them by using the CLI command:
-```bash
-crewai install
-```
+- **`new_project`** — agents scaffold a fresh project under `workspaces/<job_id>/output/` and `git init` it.
+- **`patch_existing`** — the Git attachment in the brief is cloned into `workspaces/<job_id>/inputs/repo`, agents edit it in place, and a diff is captured on finalize.
 
-### Customizing
+## Requirements
 
-**Add your `OPENAI_API_KEY` into the `.env` file**
+- Python `>=3.10, <3.14`
+- [`uv`](https://docs.astral.sh/uv/) for dependency management
+- An OpenAI API key
 
-- Modify `src/codebuilder/config/agents.yaml` to define your agents
-- Modify `src/codebuilder/config/tasks.yaml` to define your tasks
-- Modify `src/codebuilder/crew.py` to add your own logic, tools and specific args
-- Modify `src/codebuilder/main.py` to add custom inputs for your agents and tasks
-
-## Running the Project
-
-To kickstart your flow and begin execution, run this from the root folder of your project:
+## Setup
 
 ```bash
-crewai run
+# Install deps
+uv sync
+
+# Configure environment
+cp .env.example .env
+# then edit .env and fill in OPENAI_API_KEY
 ```
 
-This command initializes the codebuilder Flow as defined in your configuration.
+Optional environment variables (see `.env.example`):
 
-This example, unmodified, will run the create a `report.md` file with the output of a research on LLMs in the root folder.
+| Variable | Default | Purpose |
+|---|---|---|
+| `OPENAI_API_KEY` | — | Required. Used by all agents. |
+| `MODEL` | `gpt-5.4` | Override the default model. |
+| `CODEBUILDER_WORKSPACE_ROOT` | `./workspaces` | Where each job's `inputs/`/`output/` lives. |
+| `CODEBUILDER_HISTORY_DB` | `./data/codebuilder_history.db` | Per-project history SQLite log. |
+| `CODEBUILDER_APPROVAL_WEBHOOK` | *(unset)* | POST target for HITL plan approvals. Falls back to a console prompt when unset. |
 
-## Understanding Your Crew
+## Running a job
 
-The codebuilder Crew is composed of multiple AI agents, each with unique roles, goals, and tools. These agents collaborate on a series of tasks, defined in `config/tasks.yaml`, leveraging their collective skills to achieve complex objectives. The `config/agents.yaml` file outlines the capabilities and configurations of each agent in your crew.
+The brief is a JSON payload describing the project. See `brief.json` locally or the example below:
 
-## Support
+```json
+{
+  "project_name": "invoice_folder_sorter",
+  "brief": "Build a Python RPA script that watches an 'inbox' folder for PDF invoices…",
+  "goals": ["Single-file stdlib-first script", "Pytest unit tests", "Structured logging"],
+  "tech_stack": ["python", "pypdf", "pytest", "ruff"],
+  "attachments": []
+}
+```
 
-For support, questions, or feedback regarding the {{crew_name}} Crew or crewAI.
+`attachments[]` entries can be `git` URLs (cloned), `zip` / `pdf` / `image` (base64 or path).
 
-- Visit our [documentation](https://docs.crewai.com)
-- Reach out to us through our [GitHub repository](https://github.com/joaomdmoura/crewai)
-- [Join our Discord](https://discord.com/invite/X4JWnZnxPb)
-- [Chat with our docs](https://chatg.pt/DWjSBZn)
+### Entrypoints
 
-Let's create wonders together with the power and simplicity of crewAI.
+```bash
+# Start a new job (accepts a JSON string or a path to a JSON file)
+uv run kickoff brief.json
+uv run kickoff '{"project_name": "...", "brief": "...", "goals": [], "tech_stack": [], "attachments": []}'
+
+# Resume a paused flow after HITL review
+uv run resume <job_id> "approved"
+uv run resume <job_id> "amend: swap pypdf for pdfplumber and add --verbose"
+uv run resume <job_id> "rejected: out of scope"
+
+# Render the flow graph
+uv run plot          # writes codebuilder_flow.html
+```
+
+### HITL approval
+
+After the planner runs, the flow pauses and either:
+
+- POSTs the plan to `$CODEBUILDER_APPROVAL_WEBHOOK` and returns — your webhook later calls `uv run resume <job_id> <feedback>` once a human responds, **or**
+- (no webhook configured) prompts on the console for `approved` / `amend: …` / `rejected: …`.
+
+`amend` loops back through the planner with the prior plan + the amendment and gates again.
+
+## Project layout
+
+```
+src/codebuilder/
+├── main.py                 # CodebuilderFlow: ingest → plan → build → finalize
+├── schemas.py              # Plan, SubTask, CodeArtifact, ReviewResult, QAReport, …
+├── history.py              # Per-project SQLite history (observability only)
+├── feedback_provider.py    # WebhookFeedbackProvider + ConsoleProvider fallback
+├── crews/
+│   ├── planner_crew/       # FileRead + DirectoryRead; produces a Plan
+│   ├── writer_crew/        # Workspace tools only; produces a CodeArtifact
+│   └── reviewer_crew/      # Lint/test + read/list; per-subtask + final QA
+├── tools/
+│   ├── workspace_tool.py   # Sandboxed read/write/list within a job workspace
+│   ├── lint_runner_tool.py # ruff check + pytest -q
+│   ├── git_tool.py         # clone / init+commit / diff
+│   └── attachment_tool.py  # Materialise brief attachments into inputs/
+└── knowledge/              # Markdown knowledge sources loaded into each crew
+```
+
+Memory is isolated per project at `workspaces/_memory/<project_key>/` so planner/reviewer recall stays scoped to one repo or project name. History from past runs is summarised and fed to the planner on every new run against the same project.
+
+## Dev commands
+
+```bash
+uv run ruff check src
+uv run pytest -q
+uv add <pkg>                 # prefer this over hand-editing pyproject
+```
+
+## Notes
+
+- Workspaces, history DB, and the local `.env` are gitignored — see `.gitignore`.
+- All file I/O from agents is routed through `Workspace*Tool`, which enforces that relative paths cannot escape the job workspace. Never give agents a raw `FileReadTool` pointed at a real filesystem path.
+- Crew outputs are validated through pydantic schemas with guardrails (e.g. the planner's `Plan` must have 1–15 subtasks with non-empty `file_path` and `test_criteria`; the writer's `CodeArtifact` rejects placeholder/TODO stubs).
