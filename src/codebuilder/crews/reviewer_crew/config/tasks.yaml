@@ -1,0 +1,41 @@
+review_task:
+  description: >
+    Review this CodeArtifact and decide whether it passes.
+
+    Subtask:
+    {subtask}
+
+    Artifact to review:
+    {artifact}
+
+    Workspace root: {workspace_dir}
+
+    Use the `workspace_read` and `workspace_list` tools to read the file at
+    `artifact.file_path` and any related files in the workspace. Run the
+    `lint_runner` tool against the artifact path. Apply the review_checklist
+    criteria from your knowledge sources.
+  expected_output: >
+    A ReviewResult JSON object with: subtask_id (matching the artifact),
+    passed (bool), issues (list of concrete problems), suggestions (list of
+    recommended improvements).
+  agent: reviewer
+
+qa_task:
+  description: >
+    Run final QA on the whole workspace at {workspace_dir}.
+
+    Plan metadata:
+    {plan_summary}
+
+    Steps:
+    1. Use `lint_runner` with path "." to lint the entire workspace.
+    2. Use `test_runner` with path "." to run pytest.
+    3. Use `workspace_list` to check the documented entry point from the plan
+       actually exists.
+    4. Assess integration coherence across the generated files.
+
+    If any step fails, set `passed=False` and include the failing output.
+  expected_output: >
+    A QAReport JSON object with: passed (bool), lint_output (raw), test_output
+    (raw), integration_notes (narrative summary of what you checked).
+  agent: qa_agent

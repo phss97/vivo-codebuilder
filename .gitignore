@@ -1,4 +1,31 @@
+# Env / secrets
 .env
+.env.*
+!.env.example
+
+# Python
 __pycache__/
+*.py[cod]
+*.egg-info/
 lib/
+.venv/
+venv/
+
+# Tooling caches
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+
+# OS
 .DS_Store
+
+# Codebuilder runtime artifacts
+workspaces/
+data/
+*.db
+*.sqlite
+*.sqlite3
+brief.json
+
+# CrewAI scaffolding doc (kept locally, not pushed)
+AGENTS.md

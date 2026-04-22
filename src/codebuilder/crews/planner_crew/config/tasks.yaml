@@ -1,0 +1,66 @@
+plan_task:
+  description: >
+    Produce a build plan for this project.
+
+    Project name: {project_name}
+
+    Brief:
+    {brief}
+
+    Goals:
+    {goals}
+
+    Tech stack hints from user:
+    {tech_stack}
+
+    Attachments materialized into the workspace (relative paths):
+    {attachment_records}
+
+    Workspace root (read-only for you): {workspace_dir}
+
+    Prior work on this project (most recent first):
+    {prior_history}
+
+    Prior plan (only populated on revision; empty on first pass):
+    {prior_plan}
+
+    User amendments (only populated on revision; empty on first pass):
+    {amendments}
+
+    Rules:
+    - Decide whether `mode` is "new_project" or "patch_existing" based on whether
+      a git repo or zipped existing code was attached.
+    - Break the work into atomic subtasks. Each subtask must map to exactly one
+      file the Writer will create or modify. Max 15 subtasks total.
+    - Every subtask must include: id, title, description, file_path, depends_on,
+      tech_notes, test_criteria.
+    - Use `depends_on` only when one subtask truly cannot start before another
+      completes.
+    - Subtasks execute in list order. Order them so each subtask has a fair
+      chance to pass lint + tests when it runs:
+        1. Project scaffolding first for `new_project` mode: `pyproject.toml`
+           / package layout files (`src/<pkg>/__init__.py`) come before any
+           module that imports from the package.
+        2. Shared primitives (schemas, types, constants) before the modules
+           that consume them.
+        3. Feature modules next, with their dedicated test file as the
+           immediately following subtask so failures surface close to the
+           code that caused them.
+        4. Integration glue (CLI entry point, `__main__.py`) after the
+           features it wires together.
+        5. `README.md` LAST. It documents what actually shipped — entry
+           points, flags, install steps — and can only be accurate once the
+           rest of the plan has executed.
+    - Populate `open_questions` with anything the user must clarify later.
+    - Populate `assumptions` with anything you decided on the user's behalf.
+    - If the user submitted amendments, fold them into the revised plan. Keep
+      unchanged subtasks stable; only modify what the feedback requires.
+    - If prior history is present, treat it as authoritative about conventions
+      and prior decisions on this project. Reuse files, patterns, and tech
+      choices already established. Surface any conflicts with the current brief
+      in `open_questions` rather than silently overriding.
+  expected_output: >
+    A Plan JSON object matching the Plan schema: project_name, mode,
+    tech_stack (list), subtasks (list of SubTask), open_questions (list),
+    assumptions (list).
+  agent: planner
