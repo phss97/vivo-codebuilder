@@ -26,6 +26,14 @@ log = logging.getLogger(__name__)
 DB_PATH = Path(os.environ.get("CODEBUILDER_HISTORY_DB", "./data/codebuilder_history.db")).resolve()
 
 
+def _enabled() -> bool:
+    """Feature flag: set CODEBUILDER_HISTORY_ENABLED=false on ephemeral runtimes
+    (e.g. CrewAI AMP) where the local SQLite file is wiped between invocations.
+    Default true so local development keeps working unchanged.
+    """
+    return os.environ.get("CODEBUILDER_HISTORY_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS project_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -104,6 +112,8 @@ def project_key_from(state: "CodebuilderState") -> str:
 
 def record(state: "CodebuilderState") -> None:
     """Upsert a history row for this job. Called from ``finalize()``."""
+    if not _enabled():
+        return
     if not state.project_key:
         log.info("history.record skipped: no project_key on state")
         return
@@ -155,7 +165,7 @@ def record(state: "CodebuilderState") -> None:
 
 
 def recent(project_key: str, limit: int = 3) -> list[dict]:
-    if not project_key:
+    if not _enabled() or not project_key:
         return []
     try:
         with _connect() as conn:

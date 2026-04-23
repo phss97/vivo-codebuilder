@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import sys
+import zipfile
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +29,7 @@ from codebuilder.schemas import (
     SubTask,
 )
 from codebuilder.tools import attachment_tool, git_tool
+from codebuilder.tools.s3_artifacts import SKIP_DIRS, SKIP_FILES, upload_file, upload_workspace
 from codebuilder.tools.workspace_tool import WorkspaceListTool
 
 
@@ -35,6 +38,36 @@ log = logging.getLogger(__name__)
 WORKSPACE_ROOT = Path(os.environ.get("CODEBUILDER_WORKSPACE_ROOT", "./workspaces")).resolve()
 MAX_SUBTASK_RETRIES = 2
 AMEND_FEEDBACK_PROVIDER = WebhookFeedbackProvider()
+
+
+_ZIP_NAME_RE = re.compile(r"[^a-zA-Z0-9._-]+")
+
+
+def _safe_zip_stem(name: str) -> str:
+    stem = _ZIP_NAME_RE.sub("-", name).strip("-.") or "project"
+    return stem[:80]
+
+
+def _zip_build(build_dir: str, out_dir: Path, project_name: str) -> Path:
+    """Zip the built project into ``out_dir/<project>.zip``. Overwrites if present."""
+    src = Path(build_dir).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"{_safe_zip_stem(project_name)}.zip"
+    if out_path.exists():
+        out_path.unlink()
+
+    arcroot = out_path.stem  # wrap contents under a top-level folder in the archive
+    with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        for path in src.rglob("*"):
+            if not path.is_file():
+                continue
+            if path.name in SKIP_FILES:
+                continue
+            rel = path.relative_to(src)
+            if any(part in SKIP_DIRS for part in rel.parts):
+                continue
+            zf.write(path, arcname=f"{arcroot}/{rel.as_posix()}")
+    return out_path
 
 
 def _planner_inputs(state: CodebuilderState) -> dict:
@@ -59,7 +92,15 @@ class CodebuilderFlow(Flow[CodebuilderState]):
     """Single flow: ingest → plan (HITL) → build → finalize."""
 
     @start()
-    def ingest(self, crewai_trigger_payload: dict | None = None):
+    def ingest(self, crewai_trigger_payload: dict | str | None = None):
+        # AMP sends `inputs` as a flat KV of strings; accept a JSON string
+        # here so both local CLI (dict) and AMP (str) paths work.
+        if isinstance(crewai_trigger_payload, str):
+            try:
+                crewai_trigger_payload = json.loads(crewai_trigger_payload)
+            except json.JSONDecodeError:
+                log.warning("crewai_trigger_payload was a non-JSON string; ignoring")
+                crewai_trigger_payload = None
         payload = crewai_trigger_payload or {}
         self.state.brief = payload.get("brief", "") or self.state.brief
         self.state.project_name = payload.get("project_name", "") or self.state.project_name
@@ -202,6 +243,32 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                 log.warning("patch generation failed: %s", exc)
                 self.state.patch = ""
 
+        if self.state.plan and self.state.plan.mode == "new_project":
+            try:
+                zip_path = _zip_build(
+                    build_dir,
+                    Path(self.state.workspace_dir),
+                    self.state.project_name or self.state.id,
+                )
+                self.state.zip_path = str(zip_path)
+                log.info("job %s zipped to %s", self.state.id, zip_path)
+            except Exception as exc:  # noqa: BLE001 — zip is convenience, not correctness
+                log.warning("zip generation failed: %s", exc)
+
+        try:
+            prefix = f"{self.state.project_key or self.state.id}/{self.state.id}"
+            self.state.qa_report.artifact_urls = upload_workspace(build_dir, prefix=prefix)
+            if self.state.zip_path:
+                zip_ref = upload_file(
+                    self.state.zip_path,
+                    key=f"{prefix}/{Path(self.state.zip_path).name}",
+                )
+                if zip_ref:
+                    self.state.zip_url = zip_ref["url"]
+                    self.state.qa_report.artifact_urls.append(zip_ref)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("artifact upload failed: %s", exc)
+
         self.state.status = "done"
         log.info("job %s complete", self.state.id)
 
@@ -300,8 +367,17 @@ def kickoff(payload: dict | None = None) -> Any:
     if isinstance(result, HumanFeedbackPending):
         print(json.dumps({"status": "pending", "job_id": result.context.flow_id}))
     else:
-        print(json.dumps({"status": flow.state.status, "job_id": flow.state.id}))
+        print(json.dumps(_cli_summary(flow)))
     return result
+
+
+def _cli_summary(flow: "CodebuilderFlow") -> dict:
+    out = {"status": flow.state.status, "job_id": flow.state.id}
+    if flow.state.zip_path:
+        out["zip_path"] = flow.state.zip_path
+    if flow.state.zip_url:
+        out["zip_url"] = flow.state.zip_url
+    return out
 
 
 def resume(job_id: str | None = None, feedback: str | None = None) -> Any:
@@ -315,7 +391,7 @@ def resume(job_id: str | None = None, feedback: str | None = None) -> Any:
     if isinstance(result, HumanFeedbackPending):
         print(json.dumps({"status": "pending", "job_id": result.context.flow_id}))
     else:
-        print(json.dumps({"status": flow.state.status, "job_id": flow.state.id}))
+        print(json.dumps(_cli_summary(flow)))
     return result
 
 
