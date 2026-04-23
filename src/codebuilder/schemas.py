@@ -61,6 +61,7 @@ class QAReport(BaseModel):
     lint_output: str = ""
     test_output: str = ""
     integration_notes: str = ""
+    artifact_urls: list[dict] = Field(default_factory=list)
 
 
 class CodebuilderState(FlowState):
@@ -78,4 +79,6 @@ class CodebuilderState(FlowState):
     review_results: list[ReviewResult] = Field(default_factory=list)
     qa_report: QAReport | None = None
     patch: str = ""
+    zip_path: str = ""
+    zip_url: str = ""
     status: JobStatus = "pending"
