@@ -37,7 +37,9 @@ from codebuilder.tools.workspace_tool import WorkspaceListTool, resolve_within
 log = logging.getLogger(__name__)
 
 WORKSPACE_ROOT = Path(os.environ.get("CODEBUILDER_WORKSPACE_ROOT", "./workspaces")).resolve()
-MAX_SUBTASK_RETRIES = 1
+DEFAULT_MAX_SUBTASK_RETRIES = 1
+DEFAULT_MAX_FINAL_QA_REPAIRS = 1
+MAX_QA_OUTPUT_CHARS = 12000
 
 
 _ZIP_NAME_RE = re.compile(r"[^a-zA-Z0-9._-]+")
@@ -51,6 +53,37 @@ _PLACEHOLDER_LINE_RE = re.compile(
 def _safe_zip_stem(name: str) -> str:
     stem = _ZIP_NAME_RE.sub("-", name).strip("-.") or "project"
     return stem[:80]
+
+
+def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        log.warning("%s=%r is not an integer; using %s", name, raw, default)
+        return default
+    return max(minimum, value)
+
+
+def _max_subtask_retries() -> int:
+    return _env_int("CODEBUILDER_MAX_SUBTASK_RETRIES", DEFAULT_MAX_SUBTASK_RETRIES)
+
+
+def _max_final_qa_repairs() -> int:
+    return _env_int("CODEBUILDER_MAX_FINAL_QA_REPAIRS", DEFAULT_MAX_FINAL_QA_REPAIRS)
+
+
+def _truncate(value: str, limit: int = MAX_QA_OUTPUT_CHARS) -> str:
+    if len(value) <= limit:
+        return value
+    omitted = len(value) - limit
+    return f"{value[:limit]}\n\n[truncated {omitted} chars]"
+
+
+def _append_note(report: QAReport, note: str) -> None:
+    report.integration_notes = " ".join(part for part in (report.integration_notes, note) if part)
 
 
 def _zip_build(build_dir: str, out_dir: Path, project_name: str) -> Path:
@@ -183,16 +216,18 @@ def run_deterministic_review(
             ReviewResult(subtask_id=subtask.id, passed=False, issues=issues)
         )
 
+    actual = ""
     if not target.is_file():
         issues.append(f"Artifact file was not written to workspace: {artifact.file_path}")
     else:
         actual = target.read_text(encoding="utf-8", errors="replace")
-        if actual != artifact.content:
+        if artifact.content and actual != artifact.content:
             issues.append(
                 f"Workspace file '{artifact.file_path}' does not match CodeArtifact.content."
             )
 
-    if _looks_like_placeholder(artifact.content):
+    content_to_check = actual or artifact.content
+    if _looks_like_placeholder(content_to_check):
         issues.append("Artifact content is empty or contains placeholder/TODO-only output.")
 
     if not issues:
@@ -406,9 +441,10 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                 history.record(self.state)
             except Exception as exc:  # noqa: BLE001 — history is observability, never fatal
                 log.warning("history.record on build failure failed: %s", exc)
-            return
+            return self._completion_payload(build_dir)
 
         self.state.qa_report = run_final_qa(build_dir)
+        self._repair_final_qa_if_needed(build_dir)
 
         if self.state.plan and self.state.plan.mode == "patch_existing":
             try:
@@ -452,6 +488,8 @@ class CodebuilderFlow(Flow[CodebuilderState]):
         except Exception as exc:  # noqa: BLE001 — history is observability, never fatal
             log.warning("history.record on finalize failed: %s", exc)
 
+        return self._completion_payload(build_dir)
+
     # --- helpers ---------------------------------------------------------
 
     def _existing_repo_root(self) -> str | None:
@@ -464,6 +502,142 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                 return str(child)
         return None
 
+    def _plan_summary(self) -> str:
+        if not self.state.plan:
+            return "(no plan available)"
+        subtasks = [
+            {
+                "id": subtask.id,
+                "title": subtask.title,
+                "file_path": subtask.file_path,
+                "test_criteria": subtask.test_criteria,
+            }
+            for subtask in self.state.plan.subtasks
+        ]
+        return json.dumps(
+            {
+                "project_name": self.state.plan.project_name,
+                "mode": self.state.plan.mode,
+                "tech_stack": self.state.plan.tech_stack,
+                "subtasks": subtasks,
+            },
+            indent=2,
+        )
+
+    def _qa_report_for_repair(self, report: QAReport) -> str:
+        payload = report.model_dump()
+        payload["lint_output"] = _truncate(payload.get("lint_output") or "")
+        payload["test_output"] = _truncate(payload.get("test_output") or "")
+        return json.dumps(payload, indent=2)
+
+    def _validate_repair_artifact(self, artifact: CodeArtifact, build_dir: str) -> bool:
+        try:
+            target = resolve_within(build_dir, artifact.file_path)
+        except ValueError as exc:
+            log.warning("final QA repair returned invalid path: %s", exc)
+            return False
+        if not target.is_file():
+            log.warning("final QA repair did not write returned artifact: %s", artifact.file_path)
+            return False
+        content = target.read_text(encoding="utf-8", errors="replace")
+        if artifact.content and artifact.content != content:
+            log.warning(
+                "final QA repair artifact content differs from workspace file: %s",
+                artifact.file_path,
+            )
+        if _looks_like_placeholder(content):
+            log.warning("final QA repair produced placeholder content: %s", artifact.file_path)
+            return False
+        return True
+
+    def _repair_final_qa_once(self, build_dir: str, report: QAReport) -> CodeArtifact | None:
+        writer = WriterCrew(workspace_dir=build_dir)
+        listing_tool = WorkspaceListTool(workspace_dir=build_dir)
+        result = writer.repair_crew().kickoff(
+            inputs={
+                "workspace_dir": build_dir,
+                "workspace_listing": listing_tool._run("."),
+                "plan_summary": self._plan_summary(),
+                "qa_report": self._qa_report_for_repair(report),
+            }
+        )
+        artifact = result.pydantic if isinstance(result.pydantic, CodeArtifact) else None
+        if artifact is None:
+            log.warning("final QA repair writer did not return a CodeArtifact")
+            return None
+        if artifact.subtask_id != "final_qa_repair":
+            artifact.subtask_id = "final_qa_repair"
+        if not self._validate_repair_artifact(artifact, build_dir):
+            return None
+        return artifact
+
+    def _repair_final_qa_if_needed(self, build_dir: str) -> None:
+        attempts = _max_final_qa_repairs()
+        if attempts <= 0:
+            return
+
+        for attempt in range(1, attempts + 1):
+            report = self.state.qa_report
+            if report is None or report.passed:
+                return
+
+            log.info(
+                "job %s final QA failed; starting writer repair attempt %s/%s",
+                self.state.id,
+                attempt,
+                attempts,
+            )
+            try:
+                artifact = self._repair_final_qa_once(build_dir, report)
+            except Exception as exc:  # noqa: BLE001 — repair is best-effort; still deliver artifacts
+                log.warning("final QA repair attempt failed: %s", exc)
+                artifact = None
+            self.state.final_qa_repair_attempts += 1
+            if artifact is not None:
+                self.state.artifacts.append(artifact)
+                self.state.qa_report = run_final_qa(build_dir)
+                if self.state.qa_report.passed:
+                    _append_note(
+                        self.state.qa_report,
+                        f"Final QA passed after {attempt} writer repair attempt(s).",
+                    )
+                    return
+                continue
+
+            _append_note(
+                report,
+                f"Final QA repair attempt {attempt}/{attempts} did not produce a valid patch.",
+            )
+            return
+
+        if self.state.qa_report and not self.state.qa_report.passed:
+            _append_note(
+                self.state.qa_report,
+                f"Final QA still failing after {attempts} writer repair attempt(s).",
+            )
+
+    def _completion_payload(self, build_dir: str | None = None) -> dict:
+        payload: dict[str, Any] = {
+            "status": self.state.status,
+            "job_id": self.state.id,
+            "project_name": self.state.project_name,
+            "final_qa_repair_attempts": self.state.final_qa_repair_attempts,
+        }
+        if build_dir:
+            payload["build_dir"] = build_dir
+        if self.state.qa_report:
+            qa = self.state.qa_report.model_dump(mode="json")
+            payload["qa_report"] = qa
+            payload["artifact_urls"] = qa.get("artifact_urls", [])
+            payload["qa_passed"] = self.state.qa_report.passed
+        if self.state.zip_path:
+            payload["zip_path"] = self.state.zip_path
+        if self.state.zip_url:
+            payload["zip_url"] = self.state.zip_url
+        if self.state.patch:
+            payload["patch"] = self.state.patch
+        return payload
+
     def _build_subtask(self, subtask: SubTask, build_dir: str) -> None:
         writer = WriterCrew(workspace_dir=build_dir)
         reviewer = ReviewerCrew(workspace_dir=build_dir)
@@ -473,7 +647,7 @@ class CodebuilderFlow(Flow[CodebuilderState]):
         artifact: CodeArtifact | None = None
         review: ReviewResult | None = None
 
-        for attempt in range(MAX_SUBTASK_RETRIES + 1):
+        for attempt in range(_max_subtask_retries() + 1):
             write_result = writer.crew().kickoff(
                 inputs={
                     "subtask": subtask.model_dump_json(indent=2),

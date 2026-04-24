@@ -44,7 +44,7 @@ uv run pytest -q tests/test_foo.py::test_name   # single test
 2. `plan` (`@listen(ingest)` + `@human_feedback`) — runs `PlannerCrew`, then pauses for human review. The `@human_feedback` decorator emits one of `approved | amend | rejected`.
 3. `revise_plan` (`@listen("amend")`) — loops the plan back through `PlannerCrew` with prior plan + user amendments, re-gating on another `@human_feedback`.
 4. `build` (`@listen("approved")`) — chooses `build_dir` based on `plan.mode` (`patch_existing` writes into the cloned repo under `inputs/repo`; `new_project` writes into `output/` and `git init`s it), then loops over `plan.subtasks` running the Writer→Reviewer loop.
-5. `finalize` (`@listen(build)`) — invokes `ReviewerCrew.qa_crew()` for integration QA, captures a git diff for patch jobs, and writes a `project_history` row via `history.record(...)`. `on_rejected` and build-failure branches also call `history.record` so every terminated job is auditable.
+5. `finalize` (`@listen(build)`) — runs deterministic integration QA (`ruff` + `pytest`) over the whole workspace. If QA fails, it gives `WriterCrew.repair_crew()` one repair pass by default, reruns QA, uploads artifacts, returns a completion payload, captures a git diff for patch jobs, and writes a `project_history` row via `history.record(...)`. `on_rejected` and build-failure branches also call `history.record` so every terminated job is auditable.
 
 State is a pydantic `CodebuilderState` (`schemas.py`) extending `FlowState`. `JobStatus` transitions: `pending → planning → awaiting_approval → executing → done|failed`.
 
@@ -55,10 +55,10 @@ State is a pydantic `CodebuilderState` (`schemas.py`) extending `FlowState`. `Jo
 Three `@CrewBase` classes, each with YAML-driven `agents.yaml` + `tasks.yaml` siblings:
 
 - `PlannerCrew` — one `planner` agent, one `plan_task` producing `Plan` (pydantic-validated, guardrail enforces 1–15 subtasks with non-empty `file_path`/`test_criteria`). Has only `FileReadTool` + `DirectoryReadTool` — the planner does **not** write files. Crew runs with `memory=True`; on each run it receives a `prior_history` markdown block assembled from the `project_history` SQLite table and can recall distilled learnings from previous runs on the same `project_key`.
-- `WriterCrew(workspace_dir)` — one `writer` agent, one `write_task` producing `CodeArtifact`. Scoped to `workspace_dir` via the three `Workspace*Tool`s. Guardrail forbids placeholder/TODO/`...` stubs.
-- `ReviewerCrew(workspace_dir)` — exposes two entry points: `.crew()` runs `review_task` (per-subtask, returns `ReviewResult`) and `.qa_crew()` runs `qa_task` (final integration pass, returns `QAReport`). Has `LintRunnerTool` (ruff) + `TestRunnerTool` (pytest) in addition to read/list. Both entry points run with `memory=True` so findings persist into the project-scoped memory store for future planner runs.
+- `WriterCrew(workspace_dir)` — one `writer` agent. `.crew()` runs `write_task` for planned files; `.repair_crew()` runs `repair_task` after failed final QA and patches one failing file. Scoped to `workspace_dir` via the three `Workspace*Tool`s. Deterministic review forbids placeholder/TODO/`...` stubs.
+- `ReviewerCrew(workspace_dir)` — `.crew()` runs `review_task` only as fallback for ambiguous deterministic per-subtask checks. `.qa_crew()` exists for LLM QA diagnostics but the hot final-QA path in `finalize()` is deterministic for speed. Has `LintRunnerTool` (ruff) + `TestRunnerTool` (pytest) in addition to read/list.
 
-The Writer↔Reviewer loop in `main.py::_build_subtask` retries up to `MAX_SUBTASK_RETRIES + 1` times per subtask, feeding prior review issues back into the writer's inputs.
+The Writer↔Reviewer loop in `main.py::_build_subtask` retries up to `CODEBUILDER_MAX_SUBTASK_RETRIES + 1` times per subtask, feeding prior review issues back into the writer's inputs. Final QA repair is controlled separately by `CODEBUILDER_MAX_FINAL_QA_REPAIRS` (default `1`).
 
 ### Schemas (src/codebuilder/schemas.py)
 
@@ -93,7 +93,7 @@ Markdown files loaded as `StringKnowledgeSource` via each crew's `_load_knowledg
 - Workspace root is `$CODEBUILDER_WORKSPACE_ROOT` (defaults to `./workspaces`). Each job lives in `<root>/<flow_id>/` with `inputs/` and `output/` subdirs. Never let tools touch anything outside this root.
 - Crew memory currently uses crewai's default global storage location (the `CREWAI_STORAGE_DIR` app-dirs path). We previously scoped it per-project by mutating that env var in `ingest()`, but that collided with flow pending-feedback persistence and broke HITL resume — see the `ingest` note above. Treat per-project memory isolation as an open item.
 - The stable project identifier is `state.project_key`, not `state.project_name`. Always derive via `history.project_key_from(state)` — never reconstruct ad-hoc from the name (it loses the git-URL canonicalisation that makes two users hitting the same repo share context).
-- All agents use `llm: openai/gpt-5.4` in the YAML configs. Keep this consistent when adding new agents unless there's a reason to diverge.
+- All agents use `llm: openai/gpt-5.4` in the YAML configs. `WriterCrew` also supports `CODEBUILDER_WRITER_LLM` and `CODEBUILDER_WRITER_REASONING` overrides for benchmark/tuning runs without editing YAML.
 - Planner and writer YAMLs set `reasoning: true`, `multimodal: true`, `inject_date: true` — keep these for any new reasoning-heavy agent.
 - When adding a task that returns structured data, set `output_pydantic=<Schema>` and, where correctness matters, a string `guardrail=...` on the `Task`. See `plan_task` and `write_task` for examples.
 - `_planner_inputs()` in `main.py` is the single source of truth for the dict passed to `PlannerCrew`. Add new template variables here **and** in `crews/planner_crew/config/tasks.yaml` together — the YAML uses `{var_name}` interpolation and will raise on missing keys.

@@ -1,6 +1,8 @@
 from pathlib import Path
+from types import SimpleNamespace
 
-from codebuilder.main import run_deterministic_review, run_final_qa
+import codebuilder.main as main
+from codebuilder.main import CodebuilderFlow, run_deterministic_review, run_final_qa
 from codebuilder.schemas import ArtifactRef, CodeArtifact, QAReport, SubTask
 
 
@@ -66,6 +68,25 @@ def test_deterministic_review_passes_good_file(tmp_path: Path) -> None:
 
     assert review.result.passed is True
     assert lint.calls == ["hello.py"]
+
+
+def test_deterministic_review_accepts_workspace_content_without_echo(tmp_path: Path) -> None:
+    target = tmp_path / "hello.py"
+    target.write_text('def greet() -> str:\n    return "hello"\n', encoding="utf-8")
+    artifact = CodeArtifact(
+        subtask_id="s1",
+        file_path="hello.py",
+        language="python",
+    )
+
+    review = run_deterministic_review(
+        _subtask("hello.py"),
+        artifact,
+        str(tmp_path),
+        lint_runner=FakeTool("PASS"),
+    )
+
+    assert review.result.passed is True
 
 
 def test_deterministic_review_rejects_wrong_path(tmp_path: Path) -> None:
@@ -163,3 +184,125 @@ def test_final_qa_builds_report_and_preserves_artifact_refs() -> None:
         ArtifactRef(file_path="hello.py", size=12, url="https://example.test/hello.py")
     ]
     assert "Deterministic QA" in qa.integration_notes
+
+
+def test_finalize_repairs_failed_final_qa_and_returns_payload(monkeypatch, tmp_path: Path) -> None:
+    flow = CodebuilderFlow()
+    flow.state.workspace_dir = str(tmp_path)
+    flow.state.project_name = "demo"
+    flow.state.status = "executing"
+    monkeypatch.setenv("CODEBUILDER_MAX_FINAL_QA_REPAIRS", "1")
+
+    qa_calls: list[str] = []
+
+    def fake_run_final_qa(build_dir: str) -> QAReport:
+        qa_calls.append(build_dir)
+        if len(qa_calls) == 1:
+            return QAReport(
+                passed=False,
+                lint_output="PASS",
+                test_output="FAILED tests/test_app.py::test_demo",
+                integration_notes="Tests failed.",
+            )
+        return QAReport(passed=True, lint_output="PASS", test_output="PASS", integration_notes="Clean.")
+
+    class FakeWriterCrew:
+        def __init__(self, workspace_dir: str):
+            self.workspace_dir = workspace_dir
+
+        def repair_crew(self):
+            workspace_dir = self.workspace_dir
+
+            class FakeCrew:
+                def kickoff(self, inputs: dict):
+                    target = Path(workspace_dir) / "app.py"
+                    target.write_text('def fixed() -> bool:\n    return True\n', encoding="utf-8")
+                    return SimpleNamespace(
+                        pydantic=CodeArtifact(
+                            subtask_id="final_qa_repair",
+                            file_path="app.py",
+                            language="python",
+                        )
+                    )
+
+            return FakeCrew()
+
+    monkeypatch.setattr(main, "run_final_qa", fake_run_final_qa)
+    monkeypatch.setattr(main, "WriterCrew", FakeWriterCrew)
+    monkeypatch.setattr(
+        main,
+        "upload_workspace",
+        lambda build_dir, prefix: [
+            {"file_path": "app.py", "size": 37, "url": "https://example.test/app.py"}
+        ],
+    )
+    monkeypatch.setattr(main, "upload_file", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main.history, "record", lambda state: None)
+
+    payload = flow.finalize(None)
+
+    assert qa_calls == [str(tmp_path), str(tmp_path)]
+    assert flow.state.status == "done"
+    assert flow.state.final_qa_repair_attempts == 1
+    assert payload["qa_report"]["passed"] is True
+    assert payload["artifact_urls"] == [
+        {"file_path": "app.py", "size": 37, "url": "https://example.test/app.py"}
+    ]
+
+
+def test_finalize_returns_artifacts_when_final_qa_still_fails(monkeypatch, tmp_path: Path) -> None:
+    flow = CodebuilderFlow()
+    flow.state.workspace_dir = str(tmp_path)
+    flow.state.status = "executing"
+    monkeypatch.setenv("CODEBUILDER_MAX_FINAL_QA_REPAIRS", "1")
+
+    def fake_run_final_qa(build_dir: str) -> QAReport:
+        return QAReport(
+            passed=False,
+            lint_output="PASS",
+            test_output="FAILED tests/test_app.py::test_demo",
+            integration_notes="Tests failed.",
+        )
+
+    class FakeWriterCrew:
+        def __init__(self, workspace_dir: str):
+            self.workspace_dir = workspace_dir
+
+        def repair_crew(self):
+            workspace_dir = self.workspace_dir
+
+            class FakeCrew:
+                def kickoff(self, inputs: dict):
+                    target = Path(workspace_dir) / "app.py"
+                    target.write_text('def still_broken() -> bool:\n    return False\n', encoding="utf-8")
+                    return SimpleNamespace(
+                        pydantic=CodeArtifact(
+                            subtask_id="final_qa_repair",
+                            file_path="app.py",
+                            language="python",
+                        )
+                    )
+
+            return FakeCrew()
+
+    monkeypatch.setattr(main, "run_final_qa", fake_run_final_qa)
+    monkeypatch.setattr(main, "WriterCrew", FakeWriterCrew)
+    monkeypatch.setattr(
+        main,
+        "upload_workspace",
+        lambda build_dir, prefix: [
+            {"file_path": "app.py", "size": 45, "url": "https://example.test/app.py"}
+        ],
+    )
+    monkeypatch.setattr(main, "upload_file", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main.history, "record", lambda state: None)
+
+    payload = flow.finalize(None)
+
+    assert flow.state.status == "done"
+    assert flow.state.final_qa_repair_attempts == 1
+    assert payload["qa_report"]["passed"] is False
+    assert "still failing after 1 writer repair attempt" in payload["qa_report"]["integration_notes"]
+    assert payload["artifact_urls"] == [
+        {"file_path": "app.py", "size": 45, "url": "https://example.test/app.py"}
+    ]

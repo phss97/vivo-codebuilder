@@ -27,5 +27,37 @@ write_task:
       The downstream Reviewer will run lint and tests against it.
   expected_output: >
     A CodeArtifact JSON object with: subtask_id, file_path (must match the
-    subtask), content (the full file text you wrote), language, tests_included.
+    subtask), content (may be empty because the file was already persisted
+    with workspace_write), language, tests_included.
+  agent: writer
+
+repair_task:
+  description: >
+    Final QA failed after all planned subtasks were written. Repair the
+    workspace by changing exactly one file that is most likely responsible
+    for the failing lint or test output.
+
+    Workspace root: {workspace_dir}
+
+    Plan summary:
+    {plan_summary}
+
+    Current workspace files:
+    {workspace_listing}
+
+    Final QA report:
+    {qa_report}
+
+    Rules:
+    - Use workspace_read and workspace_list to inspect the failing code before
+      choosing the file to change.
+    - Use workspace_write to persist exactly one complete file.
+    - Prefer fixing production code when tests reveal a product bug; only edit
+      tests when the tests themselves are clearly wrong or incomplete.
+    - Do not add placeholders, TODOs, or `...`.
+    - Do not create broad rewrites unrelated to the QA failure.
+  expected_output: >
+    A CodeArtifact JSON object with: subtask_id set to "final_qa_repair",
+    file_path set to the repaired file path, content optionally set to the
+    full file text, language, and tests_included.
   agent: writer

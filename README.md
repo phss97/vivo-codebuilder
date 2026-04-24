@@ -40,6 +40,10 @@ Optional environment variables (see `.env.example`):
 | `CODEBUILDER_WORKSPACE_ROOT` | `./workspaces` | Where each job's `inputs/`/`output/` lives. |
 | `CODEBUILDER_HISTORY_DB` | `./data/codebuilder_history.db` | Per-project history SQLite log. |
 | `CODEBUILDER_APPROVAL_WEBHOOK` | *(unset)* | POST target for HITL plan approvals. Falls back to a console prompt when unset. |
+| `CODEBUILDER_WRITER_LLM` | `openai/gpt-5.4` | Override the writer model without editing YAML. |
+| `CODEBUILDER_WRITER_REASONING` | `true` | Set to `false` for a faster but less careful writer. |
+| `CODEBUILDER_MAX_SUBTASK_RETRIES` | `1` | Per-file writer retry count after deterministic review failure. |
+| `CODEBUILDER_MAX_FINAL_QA_REPAIRS` | `1` | Whole-workspace repair attempts after final QA failure. |
 
 ## Running a job
 
@@ -93,7 +97,7 @@ src/codebuilder/
 ├── crews/
 │   ├── planner_crew/       # FileRead + DirectoryRead; produces a Plan
 │   ├── writer_crew/        # Workspace tools only; produces a CodeArtifact
-│   └── reviewer_crew/      # Lint/test + read/list; per-subtask + final QA
+│   └── reviewer_crew/      # Lint/test + read/list; fallback review + QA task
 ├── tools/
 │   ├── workspace_tool.py   # Sandboxed read/write/list within a job workspace
 │   ├── lint_runner_tool.py # ruff check + pytest -q
@@ -116,4 +120,5 @@ uv add <pkg>                 # prefer this over hand-editing pyproject
 
 - Workspaces, history DB, and the local `.env` are gitignored — see `.gitignore`.
 - All file I/O from agents is routed through `Workspace*Tool`, which enforces that relative paths cannot escape the job workspace. Never give agents a raw `FileReadTool` pointed at a real filesystem path.
-- Crew outputs are validated through pydantic schemas with guardrails (e.g. the planner's `Plan` must have 1–15 subtasks with non-empty `file_path` and `test_criteria`; the writer's `CodeArtifact` rejects placeholder/TODO stubs).
+- Final QA runs deterministic `ruff` + `pytest` across the whole workspace. If it fails, the writer gets one repair pass by default, QA reruns, and artifacts are still returned with the final QA status.
+- Crew outputs are validated through pydantic schemas with guardrails (e.g. the planner's `Plan` must have 1–15 subtasks with non-empty `file_path` and `test_criteria`; deterministic review rejects placeholder/TODO-only files).

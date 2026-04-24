@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 
 from crewai import Agent, Crew, Process, Task
@@ -13,6 +14,13 @@ from codebuilder.tools import (
 
 
 KNOWLEDGE_DIR = Path(__file__).resolve().parents[2] / "knowledge"
+
+
+def _env_bool(name: str) -> bool | None:
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _load_knowledge(*names: str) -> list[StringKnowledgeSource]:
@@ -43,8 +51,16 @@ class WriterCrew:
 
     @agent
     def writer(self) -> Agent:
+        config = dict(self.agents_config["writer"])  # type: ignore[index]
+        llm_override = os.environ.get("CODEBUILDER_WRITER_LLM")
+        if llm_override:
+            config["llm"] = llm_override
+        reasoning_override = _env_bool("CODEBUILDER_WRITER_REASONING")
+        if reasoning_override is not None:
+            config["reasoning"] = reasoning_override
+
         return Agent(
-            config=self.agents_config["writer"],  # type: ignore[index]
+            config=config,
             tools=self._workspace_tools(),
             knowledge_sources=_load_knowledge(
                 "python_best_practices.md",
@@ -59,11 +75,25 @@ class WriterCrew:
             output_pydantic=CodeArtifact,
         )
 
+    def repair_task(self) -> Task:
+        return Task(
+            config=self.tasks_config["repair_task"],  # type: ignore[index]
+            output_pydantic=CodeArtifact,
+        )
+
     @crew
     def crew(self) -> Crew:
         return Crew(
             agents=self.agents,
             tasks=self.tasks,
+            process=Process.sequential,
+            verbose=True,
+        )
+
+    def repair_crew(self) -> Crew:
+        return Crew(
+            agents=[self.writer()],
+            tasks=[self.repair_task()],
             process=Process.sequential,
             verbose=True,
         )
