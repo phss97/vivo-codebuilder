@@ -7,7 +7,9 @@ reviewer:
   backstory: >
     You review code the way a principal engineer reviews PRs: you don't care
     about bikeshedding, but you catch real bugs and missing tests.
-  llm: openai/gpt-5.4
+  llm: openai/gpt-5.4-mini
+  max_iter: 3
+  max_retry_limit: 1
   verbose: true
 
 qa_agent:
@@ -19,5 +21,7 @@ qa_agent:
   backstory: >
     You test the whole product, not individual files. You confirm the
     documented entry point actually runs. You're honest about failures.
-  llm: openai/gpt-5.4
+  llm: openai/gpt-5.4-mini
+  max_iter: 4
+  max_retry_limit: 1
   verbose: true

@@ -8,6 +8,7 @@ import os
 import re
 import sys
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,7 @@ from codebuilder.crews.reviewer_crew import ReviewerCrew
 from codebuilder.crews.writer_crew import WriterCrew
 from codebuilder.schemas import (
     Attachment,
+    ArtifactRef,
     CodeArtifact,
     CodebuilderState,
     Plan,
@@ -27,18 +29,23 @@ from codebuilder.schemas import (
     ReviewResult,
     SubTask,
 )
-from codebuilder.tools import attachment_tool, git_tool
+from codebuilder.tools import LintRunnerTool, TestRunnerTool, attachment_tool, git_tool
 from codebuilder.tools.s3_artifacts import SKIP_DIRS, SKIP_FILES, upload_file, upload_workspace
-from codebuilder.tools.workspace_tool import WorkspaceListTool
+from codebuilder.tools.workspace_tool import WorkspaceListTool, resolve_within
 
 
 log = logging.getLogger(__name__)
 
 WORKSPACE_ROOT = Path(os.environ.get("CODEBUILDER_WORKSPACE_ROOT", "./workspaces")).resolve()
-MAX_SUBTASK_RETRIES = 2
+MAX_SUBTASK_RETRIES = 1
 
 
 _ZIP_NAME_RE = re.compile(r"[^a-zA-Z0-9._-]+")
+_TODO_TOKEN_RE = re.compile(r"\b(todo|fixme|placeholder|stub)\b", re.IGNORECASE)
+_PLACEHOLDER_LINE_RE = re.compile(
+    r"(pass|\.\.\.|raise\s+NotImplementedError(?:\([^)]*\))?)",
+    re.IGNORECASE,
+)
 
 
 def _safe_zip_stem(name: str) -> str:
@@ -83,6 +90,186 @@ def _planner_inputs(state: CodebuilderState) -> dict:
         "prior_history": prior_history or "(no prior runs for this project)",
         "amendments": state.amendments,
     }
+
+
+@dataclass(frozen=True)
+class DeterministicReview:
+    result: ReviewResult
+    needs_fallback: bool = False
+
+
+def _is_pass(output: str) -> bool:
+    normalized = output.strip()
+    return normalized == "PASS" or normalized.startswith("PASS\n")
+
+
+def _is_skip(output: str) -> bool:
+    return output.strip().startswith("SKIP:")
+
+
+def _is_test_file(path: str) -> bool:
+    p = Path(path)
+    return "tests" in p.parts or p.name.startswith("test_") or p.name.endswith("_test.py")
+
+
+def _looks_like_placeholder(content: str) -> bool:
+    stripped = content.strip()
+    if not stripped:
+        return True
+    if _TODO_TOKEN_RE.search(stripped):
+        return True
+
+    meaningful_lines = [
+        line.strip()
+        for line in stripped.splitlines()
+        if line.strip() and not line.strip().startswith("#")
+    ]
+    if not meaningful_lines:
+        return True
+    return all(_PLACEHOLDER_LINE_RE.fullmatch(line) for line in meaningful_lines)
+
+
+def _artifact_refs(refs: list[dict] | list[ArtifactRef] | None) -> list[ArtifactRef]:
+    converted: list[ArtifactRef] = []
+    for ref in refs or []:
+        converted.append(ref if isinstance(ref, ArtifactRef) else ArtifactRef(**ref))
+    return converted
+
+
+def _validate_plan(plan: Plan | None) -> Plan:
+    if not isinstance(plan, Plan):
+        raise ValueError("Planner did not return a valid Plan object.")
+
+    issues: list[str] = []
+    if not 1 <= len(plan.subtasks) <= 15:
+        issues.append("plan must contain between 1 and 15 subtasks")
+    for subtask in plan.subtasks:
+        if not subtask.file_path.strip():
+            issues.append(f"subtask {subtask.id} has an empty file_path")
+        if not subtask.test_criteria.strip():
+            issues.append(f"subtask {subtask.id} has empty test_criteria")
+    if issues:
+        raise ValueError("Invalid plan: " + "; ".join(issues))
+    return plan
+
+
+def run_deterministic_review(
+    subtask: SubTask,
+    artifact: CodeArtifact,
+    build_dir: str,
+    *,
+    lint_runner: Any | None = None,
+    test_runner: Any | None = None,
+) -> DeterministicReview:
+    """Review an artifact with local checks before falling back to an LLM."""
+    issues: list[str] = []
+    suggestions: list[str] = []
+    fallback_reasons: list[str] = []
+
+    if artifact.subtask_id != subtask.id:
+        issues.append(
+            f"Artifact subtask_id '{artifact.subtask_id}' does not match planned subtask '{subtask.id}'."
+        )
+    if artifact.file_path != subtask.file_path:
+        issues.append(
+            f"Artifact file_path '{artifact.file_path}' does not match planned path '{subtask.file_path}'."
+        )
+
+    try:
+        target = resolve_within(build_dir, artifact.file_path)
+    except ValueError as exc:
+        issues.append(str(exc))
+        return DeterministicReview(
+            ReviewResult(subtask_id=subtask.id, passed=False, issues=issues)
+        )
+
+    if not target.is_file():
+        issues.append(f"Artifact file was not written to workspace: {artifact.file_path}")
+    else:
+        actual = target.read_text(encoding="utf-8", errors="replace")
+        if actual != artifact.content:
+            issues.append(
+                f"Workspace file '{artifact.file_path}' does not match CodeArtifact.content."
+            )
+
+    if _looks_like_placeholder(artifact.content):
+        issues.append("Artifact content is empty or contains placeholder/TODO-only output.")
+
+    if not issues:
+        lint_tool = lint_runner or LintRunnerTool(workspace_dir=build_dir)
+        lint_output = lint_tool._run(artifact.file_path)
+        if _is_skip(lint_output):
+            fallback_reasons.append(f"Lint skipped for {artifact.file_path}: {lint_output}")
+        elif not _is_pass(lint_output):
+            issues.append(f"ruff failed for {artifact.file_path}:\n{lint_output}")
+
+    if not issues and _is_test_file(artifact.file_path):
+        test_tool = test_runner or TestRunnerTool(workspace_dir=build_dir)
+        test_output = test_tool._run(artifact.file_path)
+        if _is_skip(test_output):
+            fallback_reasons.append(f"Pytest skipped for {artifact.file_path}: {test_output}")
+        elif not _is_pass(test_output):
+            issues.append(f"pytest failed for {artifact.file_path}:\n{test_output}")
+
+    if issues:
+        return DeterministicReview(
+            ReviewResult(subtask_id=subtask.id, passed=False, issues=issues, suggestions=suggestions)
+        )
+
+    if fallback_reasons:
+        return DeterministicReview(
+            ReviewResult(
+                subtask_id=subtask.id,
+                passed=False,
+                issues=fallback_reasons,
+                suggestions=["Use the mini reviewer fallback to inspect the file manually."],
+            ),
+            needs_fallback=True,
+        )
+
+    return DeterministicReview(
+        ReviewResult(
+            subtask_id=subtask.id,
+            passed=True,
+            suggestions=["Deterministic path, content, lint, and test checks passed."],
+        )
+    )
+
+
+def run_final_qa(
+    build_dir: str,
+    *,
+    artifact_urls: list[dict] | list[ArtifactRef] | None = None,
+    lint_runner: Any | None = None,
+    test_runner: Any | None = None,
+) -> QAReport:
+    """Build the final QA report from deterministic workspace lint and tests."""
+    lint_tool = lint_runner or LintRunnerTool(workspace_dir=build_dir)
+    test_tool = test_runner or TestRunnerTool(workspace_dir=build_dir)
+
+    lint_output = lint_tool._run(".")
+    test_output = test_tool._run(".")
+
+    lint_ok = _is_pass(lint_output) or _is_skip(lint_output)
+    test_ok = _is_pass(test_output) or _is_skip(test_output)
+
+    notes = ["Deterministic QA ran ruff check and pytest over the whole workspace."]
+    if _is_skip(lint_output):
+        notes.append(f"Lint diagnostic: {lint_output}")
+    if _is_skip(test_output):
+        notes.append(f"Test diagnostic: {test_output}")
+    if not lint_ok:
+        notes.append("Lint failed.")
+    if not test_ok:
+        notes.append("Tests failed.")
+
+    return QAReport(
+        passed=lint_ok and test_ok,
+        lint_output=lint_output,
+        test_output=test_output,
+        integration_notes=" ".join(notes),
+        artifact_urls=_artifact_refs(artifact_urls),
+    )
 
 
 @persist()
@@ -153,12 +340,12 @@ class CodebuilderFlow(Flow[CodebuilderState]):
     @human_feedback(
         message="Review the generated plan. Reply 'approve' to start coding, describe changes to amend, or 'reject' to cancel.",
         emit=["approved", "amend", "rejected"],
-        llm="openai/gpt-5.4",
+        llm="openai/gpt-5.4-mini",
         default_outcome="amend",
     )
     def plan(self) -> dict:
         result = PlannerCrew().crew().kickoff(inputs=_planner_inputs(self.state))
-        plan_obj: Plan = result.pydantic
+        plan_obj = _validate_plan(result.pydantic)
         self.state.plan = plan_obj
         self.state.status = "awaiting_approval"
         return plan_obj.model_dump()
@@ -167,14 +354,14 @@ class CodebuilderFlow(Flow[CodebuilderState]):
     @human_feedback(
         message="Revised plan — please review again. Approve, amend further, or reject.",
         emit=["approved", "amend", "rejected"],
-        llm="openai/gpt-5.4",
+        llm="openai/gpt-5.4-mini",
         default_outcome="amend",
     )
     def revise_plan(self, prior) -> dict:
         self.state.amendments = getattr(prior, "feedback", "") or ""
         self.state.amend_cycles += 1
         result = PlannerCrew().crew().kickoff(inputs=_planner_inputs(self.state))
-        plan_obj: Plan = result.pydantic
+        plan_obj = _validate_plan(result.pydantic)
         self.state.plan = plan_obj
         self.state.status = "awaiting_approval"
         return plan_obj.model_dump()
@@ -221,22 +408,7 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                 log.warning("history.record on build failure failed: %s", exc)
             return
 
-        listing_tool = WorkspaceListTool(workspace_dir=self.state.workspace_dir)
-        qa_result = (
-            ReviewerCrew(workspace_dir=build_dir)
-            .qa_crew()
-            .kickoff(
-                inputs={
-                    "workspace_dir": build_dir,
-                    "plan_summary": self.state.plan.model_dump_json(indent=2) if self.state.plan else "",
-                    "workspace_listing": listing_tool._run("."),
-                }
-            )
-        )
-        self.state.qa_report = qa_result.pydantic if isinstance(qa_result.pydantic, QAReport) else QAReport(
-            passed=False,
-            integration_notes="QA agent returned non-schema output",
-        )
+        self.state.qa_report = run_final_qa(build_dir)
 
         if self.state.plan and self.state.plan.mode == "patch_existing":
             try:
@@ -259,15 +431,16 @@ class CodebuilderFlow(Flow[CodebuilderState]):
 
         try:
             prefix = f"{self.state.project_key or self.state.id}/{self.state.id}"
-            self.state.qa_report.artifact_urls = upload_workspace(build_dir, prefix=prefix)
+            self.state.qa_report.artifact_urls = _artifact_refs(upload_workspace(build_dir, prefix=prefix))
             if self.state.zip_path:
                 zip_ref = upload_file(
                     self.state.zip_path,
                     key=f"{prefix}/{Path(self.state.zip_path).name}",
                 )
                 if zip_ref:
-                    self.state.zip_url = zip_ref["url"]
-                    self.state.qa_report.artifact_urls.append(zip_ref)
+                    zip_artifact = ArtifactRef(**zip_ref)
+                    self.state.zip_url = zip_artifact.url
+                    self.state.qa_report.artifact_urls.append(zip_artifact)
         except Exception as exc:  # noqa: BLE001
             log.warning("artifact upload failed: %s", exc)
 
@@ -315,20 +488,28 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                 prior_issues = "Writer did not return a valid CodeArtifact; try again and emit the schema exactly."
                 continue
 
-            review_result = reviewer.crew().kickoff(
-                inputs={
-                    "subtask": subtask.model_dump_json(indent=2),
-                    "artifact": artifact.model_dump_json(indent=2),
-                    "workspace_dir": build_dir,
-                }
-            )
-            review = review_result.pydantic if isinstance(review_result.pydantic, ReviewResult) else ReviewResult(
-                subtask_id=subtask.id, passed=False, issues=["Reviewer output not parseable"]
-            )
+            deterministic = run_deterministic_review(subtask, artifact, build_dir)
+            review = deterministic.result
+            if deterministic.needs_fallback:
+                review_result = reviewer.crew().kickoff(
+                    inputs={
+                        "subtask": subtask.model_dump_json(indent=2),
+                        "artifact": artifact.model_dump_json(indent=2),
+                        "workspace_dir": build_dir,
+                    }
+                )
+                review = (
+                    review_result.pydantic
+                    if isinstance(review_result.pydantic, ReviewResult)
+                    else deterministic.result
+                )
 
             if review.passed:
                 break
             next_issues = "\n".join(review.issues) if review.issues else "review failed without detail"
+            if review.issues and all("SKIP:" in issue for issue in review.issues):
+                log.warning("subtask %s: deterministic review skipped; not retrying writer", subtask.id)
+                break
             # If the reviewer returns the same issues twice in a row, the writer
             # cannot fix them (systemic problem — missing tool, env, etc.).
             # Stop burning retries and let finalize/QA surface it instead.

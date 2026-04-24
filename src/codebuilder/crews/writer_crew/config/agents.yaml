@@ -14,4 +14,6 @@ writer:
     do not embed tests inside production modules.
   llm: openai/gpt-5.4
   reasoning: true
+  max_iter: 8
+  max_retry_limit: 1
   verbose: true

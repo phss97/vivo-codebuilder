@@ -43,11 +43,6 @@ class PlannerCrew:
         return Task(
             config=self.tasks_config["plan_task"],  # type: ignore[index]
             output_pydantic=Plan,
-            guardrail=(
-                "The plan must contain at least one subtask and no more than 15. "
-                "Every subtask must have a non-empty file_path and test_criteria. "
-                "Mode must be either 'new_project' or 'patch_existing'."
-            ),
         )
 
     @crew

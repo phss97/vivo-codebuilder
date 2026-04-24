@@ -75,12 +75,10 @@ class ReviewerCrew:
 
     @crew
     def crew(self) -> Crew:
-        """Default crew runs review_task only (per-subtask).
+        """Fallback crew runs review_task only for ambiguous deterministic checks.
 
-        Memory is intentionally disabled here — per-subtask reviews run up to
-        (MAX_SUBTASK_RETRIES + 1) × len(plan.subtasks) times per job and each
-        retrieve+save adds several seconds with no cross-subtask signal worth
-        persisting. Project-level learning lives on planner and qa_crew.
+        Memory is intentionally disabled here because fallback reviews should
+        be rare and per-file. Project-level learning lives on planner memory.
         """
         return Crew(
             agents=[self.reviewer()],

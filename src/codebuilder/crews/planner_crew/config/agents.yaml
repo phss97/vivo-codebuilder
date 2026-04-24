@@ -16,4 +16,6 @@ planner:
   reasoning: true
   multimodal: true
   inject_date: true
+  max_iter: 8
+  max_retry_limit: 1
   verbose: true

@@ -26,7 +26,7 @@ def _load_knowledge(*names: str) -> list[StringKnowledgeSource]:
 
 @CrewBase
 class WriterCrew:
-    """Writes one file per subtask. Verification happens downstream in ReviewerCrew."""
+    """Writes one file per subtask. Verification happens downstream in the flow."""
 
     agents_config = "config/agents.yaml"
     tasks_config = "config/tasks.yaml"
@@ -57,10 +57,6 @@ class WriterCrew:
         return Task(
             config=self.tasks_config["write_task"],  # type: ignore[index]
             output_pydantic=CodeArtifact,
-            guardrail=(
-                "CodeArtifact.content must be non-empty and must match the subtask's "
-                "file_path. Do not emit placeholders, TODO comments, or '...' stubs."
-            ),
         )
 
     @crew
