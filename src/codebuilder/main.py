@@ -18,7 +18,6 @@ from codebuilder import history
 from codebuilder.crews.planner_crew import PlannerCrew
 from codebuilder.crews.reviewer_crew import ReviewerCrew
 from codebuilder.crews.writer_crew import WriterCrew
-from codebuilder.feedback_provider import WebhookFeedbackProvider
 from codebuilder.schemas import (
     Attachment,
     CodeArtifact,
@@ -37,7 +36,6 @@ log = logging.getLogger(__name__)
 
 WORKSPACE_ROOT = Path(os.environ.get("CODEBUILDER_WORKSPACE_ROOT", "./workspaces")).resolve()
 MAX_SUBTASK_RETRIES = 2
-AMEND_FEEDBACK_PROVIDER = WebhookFeedbackProvider()
 
 
 _ZIP_NAME_RE = re.compile(r"[^a-zA-Z0-9._-]+")
@@ -151,7 +149,6 @@ class CodebuilderFlow(Flow[CodebuilderState]):
         emit=["approved", "amend", "rejected"],
         llm="openai/gpt-5.4",
         default_outcome="amend",
-        provider=AMEND_FEEDBACK_PROVIDER,
     )
     def plan(self) -> dict:
         result = PlannerCrew().crew().kickoff(inputs=_planner_inputs(self.state))
@@ -166,7 +163,6 @@ class CodebuilderFlow(Flow[CodebuilderState]):
         emit=["approved", "amend", "rejected"],
         llm="openai/gpt-5.4",
         default_outcome="amend",
-        provider=AMEND_FEEDBACK_PROVIDER,
     )
     def revise_plan(self, prior) -> dict:
         self.state.amendments = getattr(prior, "feedback", "") or ""
