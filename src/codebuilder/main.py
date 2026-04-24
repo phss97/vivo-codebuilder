@@ -371,6 +371,10 @@ def kickoff(payload: dict | None = None) -> Any:
     return result
 
 
+def kickoff_cli() -> None:
+    kickoff()
+
+
 def _cli_summary(flow: "CodebuilderFlow") -> dict:
     out = {"status": flow.state.status, "job_id": flow.state.id}
     if flow.state.zip_path:
@@ -395,10 +399,14 @@ def resume(job_id: str | None = None, feedback: str | None = None) -> Any:
     return result
 
 
+def resume_cli() -> None:
+    resume()
+
+
 def plot():
     CodebuilderFlow().plot("codebuilder_flow")
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    kickoff()
+    kickoff_cli()
