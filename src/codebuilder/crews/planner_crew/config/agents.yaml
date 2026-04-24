@@ -12,6 +12,7 @@ planner:
     You know when a job is a brand-new project vs. a patch to existing code
     and plan accordingly.
   llm: openai/gpt-5.4
+  planning: true
   reasoning: true
   multimodal: true
   inject_date: true
