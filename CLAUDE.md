@@ -40,7 +40,7 @@ uv run pytest -q tests/test_foo.py::test_name   # single test
 
 `CodebuilderFlow` is a single `Flow[CodebuilderState]` with five methods wired by decorators:
 
-1. `ingest` (`@start`) — reads `crewai_trigger_payload`, creates `workspaces/<flow_id>/{inputs,output}`, materializes attachments, derives `state.project_key` via `history.project_key_from(...)`, and points `CREWAI_STORAGE_DIR` at `workspaces/_memory/<project_key>/` so per-project crew memory is isolated on disk.
+1. `ingest` (`@start`) — reads `crewai_trigger_payload`, creates `workspaces/<flow_id>/{inputs,output}`, materializes attachments, and derives `state.project_key` via `history.project_key_from(...)`. **Do not** mutate `CREWAI_STORAGE_DIR` here (or anywhere at runtime): crewai uses that env var as the `app_name` input to `appdirs.user_data_dir(...)`, which determines where `SQLiteFlowPersistence()` writes pending-feedback rows. `Flow.from_pending(flow_id)` always constructs a default `SQLiteFlowPersistence()`, so drift between save-time and resume-time breaks HITL resume with "No pending feedback found for flow_id" (AMP hit this). Per-project memory scoping, if reintroduced, must go through Crew-level storage config — not this env var.
 2. `plan` (`@listen(ingest)` + `@human_feedback`) — runs `PlannerCrew`, then pauses for human review. The `@human_feedback` decorator emits one of `approved | amend | rejected`.
 3. `revise_plan` (`@listen("amend")`) — loops the plan back through `PlannerCrew` with prior plan + user amendments, re-gating on another `@human_feedback`.
 4. `build` (`@listen("approved")`) — chooses `build_dir` based on `plan.mode` (`patch_existing` writes into the cloned repo under `inputs/repo`; `new_project` writes into `output/` and `git init`s it), then loops over `plan.subtasks` running the Writer→Reviewer loop.
@@ -91,7 +91,7 @@ Markdown files loaded as `StringKnowledgeSource` via each crew's `_load_knowledg
 ## Conventions specific to this repo
 
 - Workspace root is `$CODEBUILDER_WORKSPACE_ROOT` (defaults to `./workspaces`). Each job lives in `<root>/<flow_id>/` with `inputs/` and `output/` subdirs. Never let tools touch anything outside this root.
-- Crew memory is isolated per project at `<workspace_root>/_memory/<project_key>/`. `ingest()` sets `CREWAI_STORAGE_DIR` to this path for the lifetime of the process; don't override it from tools or crews.
+- Crew memory currently uses crewai's default global storage location (the `CREWAI_STORAGE_DIR` app-dirs path). We previously scoped it per-project by mutating that env var in `ingest()`, but that collided with flow pending-feedback persistence and broke HITL resume — see the `ingest` note above. Treat per-project memory isolation as an open item.
 - The stable project identifier is `state.project_key`, not `state.project_name`. Always derive via `history.project_key_from(state)` — never reconstruct ad-hoc from the name (it loses the git-URL canonicalisation that makes two users hitting the same repo share context).
 - All agents use `llm: openai/gpt-5.4` in the YAML configs. Keep this consistent when adding new agents unless there's a reason to diverge.
 - Planner and writer YAMLs set `reasoning: true`, `multimodal: true`, `inject_date: true` — keep these for any new reasoning-heavy agent.

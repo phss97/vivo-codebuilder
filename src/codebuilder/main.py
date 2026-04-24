@@ -125,15 +125,21 @@ class CodebuilderFlow(Flow[CodebuilderState]):
         if not project_key:
             log.warning(
                 "job %s has no project_name and no git attachment; "
-                "falling back to flow_id for memory/history keying",
+                "falling back to flow_id for history keying",
                 self.state.id,
             )
             project_key = self.state.id
         self.state.project_key = project_key
 
-        memory_dir = WORKSPACE_ROOT / "_memory" / project_key
-        memory_dir.mkdir(parents=True, exist_ok=True)
-        os.environ["CREWAI_STORAGE_DIR"] = str(memory_dir)
+        # NOTE: do not mutate CREWAI_STORAGE_DIR here. crewai treats that env
+        # var as the `app_name` input to `appdirs.user_data_dir(...)`, which
+        # determines where `SQLiteFlowPersistence()` (with no db_path) stores
+        # pending-feedback rows. `Flow.from_pending(flow_id)` always constructs
+        # a default SQLiteFlowPersistence, so any drift in the env var between
+        # save-time and resume-time breaks HITL resume with "No pending
+        # feedback found for flow_id". Per-project memory scoping — if we want
+        # it back — needs to go through Crew-level storage config, not this
+        # env var.
 
         self.state.status = "planning"
         log.info(

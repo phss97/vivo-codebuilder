@@ -102,7 +102,7 @@ src/codebuilder/
 └── knowledge/              # Markdown knowledge sources loaded into each crew
 ```
 
-Memory is isolated per project at `workspaces/_memory/<project_key>/` so planner/reviewer recall stays scoped to one repo or project name. History from past runs is summarised and fed to the planner on every new run against the same project.
+History from past runs is summarised and fed to the planner on every new run against the same project. (Crew memory itself currently uses crewai's default global storage; per-project memory isolation was removed because mutating `CREWAI_STORAGE_DIR` at runtime collides with the flow's pending-feedback persistence and broke HITL resume — see `CLAUDE.md`.)
 
 ## Dev commands
 
