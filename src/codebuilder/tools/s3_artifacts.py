@@ -17,7 +17,7 @@ log = logging.getLogger(__name__)
 PRESIGN_TTL_SECONDS = 7 * 24 * 3600
 
 # Files we never upload (noise, potentially sensitive).
-SKIP_DIRS = {".git", "__pycache__", ".venv", "node_modules", ".pytest_cache", ".mypy_cache"}
+SKIP_DIRS = {".git", "__pycache__", ".venv", "node_modules", ".pytest_cache", ".ruff_cache", ".mypy_cache"}
 SKIP_FILES = {".DS_Store"}
 _SKIP_DIRS = SKIP_DIRS
 _SKIP_FILES = SKIP_FILES

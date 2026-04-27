@@ -12,6 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+import requests
 from crewai.flow import Flow, HumanFeedbackPending, listen, persist, start
 from crewai.flow.human_feedback import human_feedback
 
@@ -40,6 +41,7 @@ WORKSPACE_ROOT = Path(os.environ.get("CODEBUILDER_WORKSPACE_ROOT", "./workspaces
 DEFAULT_MAX_SUBTASK_RETRIES = 1
 DEFAULT_MAX_FINAL_QA_REPAIRS = 1
 MAX_QA_OUTPUT_CHARS = 12000
+PROGRESS_WEBHOOK_TIMEOUT_SECONDS = 5
 
 
 _ZIP_NAME_RE = re.compile(r"[^a-zA-Z0-9._-]+")
@@ -84,6 +86,32 @@ def _truncate(value: str, limit: int = MAX_QA_OUTPUT_CHARS) -> str:
 
 def _append_note(report: QAReport, note: str) -> None:
     report.integration_notes = " ".join(part for part in (report.integration_notes, note) if part)
+
+
+def _emit_progress(state: CodebuilderState, event_type: str, **payload: Any) -> None:
+    """Best-effort progress callback for UIs that need finer updates than AMP provides."""
+    webhook = os.environ.get("CODEBUILDER_PROGRESS_WEBHOOK")
+    if not webhook:
+        return
+
+    body = {
+        "event_type": event_type,
+        "job_id": state.id,
+        "project_name": state.project_name,
+        "project_key": state.project_key,
+        **payload,
+    }
+    headers = {"Content-Type": "application/json"}
+    secret = os.environ.get("CODEBUILDER_PROGRESS_WEBHOOK_SECRET")
+    if secret:
+        headers["X-Codebuilder-Progress-Secret"] = secret
+
+    try:
+        resp = requests.post(webhook, json=body, headers=headers, timeout=PROGRESS_WEBHOOK_TIMEOUT_SECONDS)
+        if resp.status_code >= 400:
+            log.warning("progress webhook POST for %s returned %s", event_type, resp.status_code)
+    except requests.RequestException as exc:
+        log.warning("progress webhook POST failed for %s: %s", event_type, exc)
 
 
 def _zip_build(build_dir: str, out_dir: Path, project_name: str) -> Path:
@@ -428,8 +456,9 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             Path(build_dir).mkdir(parents=True, exist_ok=True)
             git_tool.init_and_commit(build_dir)
 
-        for subtask in plan.subtasks:
-            self._build_subtask(subtask, build_dir)
+        total_subtasks = len(plan.subtasks)
+        for index, subtask in enumerate(plan.subtasks, start=1):
+            self._build_subtask(subtask, build_dir, index=index, total=total_subtasks)
 
         self._build_dir = build_dir
 
@@ -443,8 +472,16 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                 log.warning("history.record on build failure failed: %s", exc)
             return self._completion_payload(build_dir)
 
+        _emit_progress(self.state, "final_qa_started")
         self.state.qa_report = run_final_qa(build_dir)
         self._repair_final_qa_if_needed(build_dir)
+        _emit_progress(
+            self.state,
+            "final_qa_completed",
+            passed=bool(self.state.qa_report and self.state.qa_report.passed),
+            repair_attempts=self.state.final_qa_repair_attempts,
+            integration_notes=self.state.qa_report.integration_notes if self.state.qa_report else "",
+        )
 
         if self.state.plan and self.state.plan.mode == "patch_existing":
             try:
@@ -587,6 +624,12 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                 attempt,
                 attempts,
             )
+            _emit_progress(
+                self.state,
+                "final_qa_repair_started",
+                repair_attempt=attempt,
+                max_repair_attempts=attempts,
+            )
             try:
                 artifact = self._repair_final_qa_once(build_dir, report)
             except Exception as exc:  # noqa: BLE001 — repair is best-effort; still deliver artifacts
@@ -638,7 +681,7 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             payload["patch"] = self.state.patch
         return payload
 
-    def _build_subtask(self, subtask: SubTask, build_dir: str) -> None:
+    def _build_subtask(self, subtask: SubTask, build_dir: str, *, index: int, total: int) -> None:
         writer = WriterCrew(workspace_dir=build_dir)
         reviewer = ReviewerCrew(workspace_dir=build_dir)
         listing_tool = WorkspaceListTool(workspace_dir=build_dir)
@@ -646,8 +689,20 @@ class CodebuilderFlow(Flow[CodebuilderState]):
         prior_issues = ""
         artifact: CodeArtifact | None = None
         review: ReviewResult | None = None
+        attempts = 0
+
+        _emit_progress(
+            self.state,
+            "subtask_started",
+            subtask_id=subtask.id,
+            title=subtask.title,
+            file_path=subtask.file_path,
+            index=index,
+            total=total,
+        )
 
         for attempt in range(_max_subtask_retries() + 1):
+            attempts = attempt + 1
             write_result = writer.crew().kickoff(
                 inputs={
                     "subtask": subtask.model_dump_json(indent=2),
@@ -699,6 +754,30 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             self.state.artifacts.append(artifact)
         if review is not None:
             self.state.review_results.append(review)
+
+        if review and review.passed:
+            _emit_progress(
+                self.state,
+                "subtask_completed",
+                subtask_id=subtask.id,
+                title=subtask.title,
+                file_path=subtask.file_path,
+                index=index,
+                total=total,
+                attempts=attempts,
+            )
+        else:
+            _emit_progress(
+                self.state,
+                "subtask_failed",
+                subtask_id=subtask.id,
+                title=subtask.title,
+                file_path=subtask.file_path,
+                index=index,
+                total=total,
+                attempts=attempts,
+                issues=review.issues if review else ["Writer did not return a valid artifact."],
+            )
 
 
 # --- Entrypoints for CLI + Flask ---------------------------------------------

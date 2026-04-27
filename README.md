@@ -44,6 +44,8 @@ Optional environment variables (see `.env.example`):
 | `CODEBUILDER_WRITER_REASONING` | `true` | Set to `false` for a faster but less careful writer. |
 | `CODEBUILDER_MAX_SUBTASK_RETRIES` | `1` | Per-file writer retry count after deterministic review failure. |
 | `CODEBUILDER_MAX_FINAL_QA_REPAIRS` | `1` | Whole-workspace repair attempts after final QA failure. |
+| `CODEBUILDER_PROGRESS_WEBHOOK` | *(unset)* | Optional best-effort progress callback after subtasks and final QA. |
+| `CODEBUILDER_PROGRESS_WEBHOOK_SECRET` | *(unset)* | Optional shared secret sent as `X-Codebuilder-Progress-Secret`. |
 
 ## Running a job
 

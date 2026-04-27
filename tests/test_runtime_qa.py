@@ -1,3 +1,4 @@
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -184,6 +185,57 @@ def test_final_qa_builds_report_and_preserves_artifact_refs() -> None:
         ArtifactRef(file_path="hello.py", size=12, url="https://example.test/hello.py")
     ]
     assert "Deterministic QA" in qa.integration_notes
+
+
+def test_emit_progress_posts_configured_webhook(monkeypatch) -> None:
+    flow = CodebuilderFlow()
+    flow.state.project_name = "demo"
+    flow.state.project_key = "demo-key"
+    calls: list[dict] = []
+
+    def fake_post(url: str, json: dict, headers: dict, timeout: int):
+        calls.append({"url": url, "json": json, "headers": headers, "timeout": timeout})
+        return SimpleNamespace(status_code=200)
+
+    monkeypatch.setenv("CODEBUILDER_PROGRESS_WEBHOOK", "https://example.test/progress")
+    monkeypatch.setenv("CODEBUILDER_PROGRESS_WEBHOOK_SECRET", "secret")
+    monkeypatch.setattr(main.requests, "post", fake_post)
+
+    main._emit_progress(flow.state, "subtask_started", subtask_id="s1")
+
+    assert calls == [
+        {
+            "url": "https://example.test/progress",
+            "json": {
+                "event_type": "subtask_started",
+                "job_id": flow.state.id,
+                "project_name": "demo",
+                "project_key": "demo-key",
+                "subtask_id": "s1",
+            },
+            "headers": {
+                "Content-Type": "application/json",
+                "X-Codebuilder-Progress-Secret": "secret",
+            },
+            "timeout": main.PROGRESS_WEBHOOK_TIMEOUT_SECONDS,
+        }
+    ]
+
+
+def test_zip_build_excludes_tool_cache_dirs(tmp_path: Path) -> None:
+    build_dir = tmp_path / "build"
+    build_dir.mkdir()
+    (build_dir / "app.py").write_text("print('ok')\n", encoding="utf-8")
+    cache_dir = build_dir / ".ruff_cache"
+    cache_dir.mkdir()
+    (cache_dir / "CACHEDIR.TAG").write_text("cache", encoding="utf-8")
+
+    zip_path = main._zip_build(str(build_dir), tmp_path, "demo")
+
+    with zipfile.ZipFile(zip_path) as zf:
+        names = zf.namelist()
+    assert "demo/app.py" in names
+    assert all(".ruff_cache" not in name for name in names)
 
 
 def test_finalize_repairs_failed_final_qa_and_returns_payload(monkeypatch, tmp_path: Path) -> None:
