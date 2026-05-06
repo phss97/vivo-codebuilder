@@ -37,7 +37,6 @@ Optional environment variables (see `.env.example`):
 |---|---|---|
 | `OPENAI_API_KEY` | — | Required for the default OpenAI models and the embedder. |
 | `ANTHROPIC_API_KEY` | — | Required when overriding any LLM env var below to an `anthropic/...` model. |
-| `MODEL` | `gpt-5.4` | Override the default model. |
 | `CODEBUILDER_WORKSPACE_ROOT` | `./workspaces` | Where each job's `inputs/`/`output/` lives. |
 | `CODEBUILDER_HISTORY_DB` | `./data/codebuilder_history.db` | Per-project history SQLite log. |
 | `CODEBUILDER_APPROVAL_WEBHOOK` | *(unset)* | POST target for HITL plan approvals. Falls back to a console prompt when unset. |
