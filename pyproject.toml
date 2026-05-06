@@ -5,7 +5,7 @@ description = "codebuilder using crewAI"
 authors = [{ name = "Pedro Silva", email = "pedro.silva@crewai.com" }]
 requires-python = ">=3.10,<3.14"
 dependencies = [
-    "crewai[tools]==1.14.2",
+    "crewai[anthropic,tools]==1.14.2",
     "requests>=2.31",
     "gitpython>=3.1",
     "pypdf>=4.0",
@@ -15,10 +15,9 @@ dependencies = [
 ]
 
 [project.scripts]
-kickoff = "codebuilder.main:kickoff_cli"
-resume = "codebuilder.main:resume_cli"
-run_crew = "codebuilder.main:kickoff_cli"
-plot = "codebuilder.main:plot"
+kickoff  = "codebuilder.main:kickoff"
+run_crew = "codebuilder.main:kickoff"
+plot     = "codebuilder.main:plot"
 
 [build-system]
 requires = ["hatchling"]

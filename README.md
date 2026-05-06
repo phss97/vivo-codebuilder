@@ -35,13 +35,20 @@ Optional environment variables (see `.env.example`):
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `OPENAI_API_KEY` | — | Required. Used by all agents. |
+| `OPENAI_API_KEY` | — | Required for the default OpenAI models and the embedder. |
+| `ANTHROPIC_API_KEY` | — | Required when overriding any LLM env var below to an `anthropic/...` model. |
 | `MODEL` | `gpt-5.4` | Override the default model. |
 | `CODEBUILDER_WORKSPACE_ROOT` | `./workspaces` | Where each job's `inputs/`/`output/` lives. |
 | `CODEBUILDER_HISTORY_DB` | `./data/codebuilder_history.db` | Per-project history SQLite log. |
 | `CODEBUILDER_APPROVAL_WEBHOOK` | *(unset)* | POST target for HITL plan approvals. Falls back to a console prompt when unset. |
+| `CODEBUILDER_PLANNER_LLM` | `openai/gpt-5.4` | Override the planner model without editing YAML. |
 | `CODEBUILDER_WRITER_LLM` | `openai/gpt-5.4` | Override the writer model without editing YAML. |
 | `CODEBUILDER_WRITER_REASONING` | `true` | Set to `false` for a faster but less careful writer. |
+| `CODEBUILDER_REVIEWER_LLM` | `openai/gpt-5.4-mini` | Override the per-subtask reviewer model. |
+| `CODEBUILDER_QA_LLM` | `openai/gpt-5.4-mini` | Override the integration-QA agent model. |
+| `CODEBUILDER_GUARDRAIL_LLM` | `openai/gpt-5.4-mini` | Override the model used by the `@human_feedback` guardrail when classifying user replies. |
+| `CODEBUILDER_EMBEDDER_PROVIDER` | `openai` | Embedder provider for planner / QA memory (e.g. `openai`, `voyageai`, `cohere`). |
+| `CODEBUILDER_EMBEDDER_MODEL` | `text-embedding-3-small` | Embedder model name passed to the provider. |
 | `CODEBUILDER_MAX_SUBTASK_RETRIES` | `1` | Per-file writer retry count after deterministic review failure. |
 | `CODEBUILDER_MAX_FINAL_QA_REPAIRS` | `1` | Whole-workspace repair attempts after final QA failure. |
 | `CODEBUILDER_PROGRESS_WEBHOOK` | *(unset)* | Optional best-effort progress callback after subtasks and final QA. |
@@ -49,41 +56,34 @@ Optional environment variables (see `.env.example`):
 
 ## Running a job
 
-The brief is a JSON payload describing the project. See `brief.json` locally or the example below:
+Inputs are passed as top-level keys to `CodebuilderFlow().kickoff(inputs={...})`. The flow expects:
 
-```json
-{
-  "project_name": "invoice_folder_sorter",
-  "brief": "Build a Python RPA script that watches an 'inbox' folder for PDF invoices…",
-  "goals": ["Single-file stdlib-first script", "Pytest unit tests", "Structured logging"],
-  "tech_stack": ["python", "pypdf", "pytest", "ruff"],
-  "attachments": []
-}
-```
-
-`attachments[]` entries can be `git` URLs (cloned), `zip` / `pdf` / `image` (base64 or path).
+| Input | Type | Notes |
+|---|---|---|
+| `id` | str | Caller-controlled session id. Becomes `state.id`, the workspace dir name, the history `job_id`, and the resume token. Use a uuid per user session. |
+| `project_name` | str | Display name; also keys per-project history when no git attachment is present. |
+| `brief` | str | Free-text description of the project. |
+| `goals` | list[str] | High-level goals. |
+| `tech_stack` | list[str] | Languages / libraries. |
+| `attachments` | list[Attachment] | Each entry is `git` (cloned), `zip` / `pdf` / `image` (base64 or path). |
 
 ### Entrypoints
 
 ```bash
-# Start a new job (accepts a JSON string or a path to a JSON file)
-uv run kickoff brief.json
-uv run kickoff '{"project_name": "...", "brief": "...", "goals": [], "tech_stack": [], "attachments": []}'
-
-# Resume a paused flow after HITL review
-uv run resume <job_id> "approved"
-uv run resume <job_id> "amend: swap pypdf for pdfplumber and add --verbose"
-uv run resume <job_id> "rejected: out of scope"
+# Start a new job with the hardcoded test inputs from src/codebuilder/main.py::kickoff()
+uv run kickoff
 
 # Render the flow graph
 uv run plot          # writes codebuilder_flow.html
 ```
 
+For programmatic kickoff (HTTP handlers, codebuilder-web, AMP), call `codebuilder.main.kickoff()` after editing the inputs in that function, or call `CodebuilderFlow().kickoff(inputs={...})` directly with your own dict.
+
 ### HITL approval
 
 After the planner runs, the flow pauses and either:
 
-- POSTs the plan to `$CODEBUILDER_APPROVAL_WEBHOOK` and returns — your webhook later calls `uv run resume <job_id> <feedback>` once a human responds, **or**
+- POSTs the plan to `$CODEBUILDER_APPROVAL_WEBHOOK` and returns — your webhook later calls `codebuilder.main.resume(job_id, feedback)` (e.g. `from codebuilder.main import resume; resume("…", "approved")`) once a human responds, **or**
 - (no webhook configured) prompts on the console for `approved` / `amend: …` / `rejected: …`.
 
 `amend` loops back through the planner with the prior plan + the amendment and gates again.

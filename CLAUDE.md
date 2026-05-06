@@ -17,13 +17,11 @@ uv sync                        # install deps
 uv add <pkg>                   # add a dep (don't hand-edit pyproject)
 
 # Entrypoints (defined in pyproject [project.scripts]; all map to src/codebuilder/main.py)
-uv run kickoff '<json>'        # start a new job; JSON payload or a path to a JSON file
-uv run kickoff path/to/brief.json
-uv run resume <job_id> "<feedback>"   # resume a paused flow after human review
+uv run kickoff                 # start a new job with the hardcoded test inputs in main.py::kickoff()
 uv run plot                    # render codebuilder_flow.html (flow graph)
 uv run run_crew                # alias for kickoff
 
-crewai run                     # equivalent to `uv run kickoff` with no payload
+crewai run                     # same as `uv run kickoff`
 ```
 
 Lint / test use `ruff` and `pytest` via the in-repo `LintRunnerTool` / `TestRunnerTool`. To run them directly:
@@ -40,7 +38,7 @@ uv run pytest -q tests/test_foo.py::test_name   # single test
 
 `CodebuilderFlow` is a single `Flow[CodebuilderState]` with five methods wired by decorators:
 
-1. `ingest` (`@start`) — reads `crewai_trigger_payload`, creates `workspaces/<flow_id>/{inputs,output}`, materializes attachments, and derives `state.project_key` via `history.project_key_from(...)`. **Do not** mutate `CREWAI_STORAGE_DIR` here (or anywhere at runtime): crewai uses that env var as the `app_name` input to `appdirs.user_data_dir(...)`, which determines where `SQLiteFlowPersistence()` writes pending-feedback rows. `Flow.from_pending(flow_id)` always constructs a default `SQLiteFlowPersistence()`, so drift between save-time and resume-time breaks HITL resume with "No pending feedback found for flow_id" (AMP hit this). Per-project memory scoping, if reintroduced, must go through Crew-level storage config — not this env var.
+1. `ingest` (`@start`) — relies on CrewAI Flow auto-merging top-level `inputs={...}` keys into `self.state` (so `id`, `brief`, `project_name`, `goals`, `tech_stack`, `attachments` are already populated when `ingest` runs). Coerces attachment dicts → `Attachment`, creates `workspaces/<state.id>/{inputs,output}`, materializes attachments, and derives `state.project_key` via `history.project_key_from(...)`. The caller-supplied `id` is the canonical session identifier — workspace dir, history `job_id`, progress webhook `job_id`, and `from_pending(job_id)` all key off it. **Do not** mutate `CREWAI_STORAGE_DIR` here (or anywhere at runtime): crewai uses that env var as the `app_name` input to `appdirs.user_data_dir(...)`, which determines where `SQLiteFlowPersistence()` writes pending-feedback rows. `Flow.from_pending(flow_id)` always constructs a default `SQLiteFlowPersistence()`, so drift between save-time and resume-time breaks HITL resume with "No pending feedback found for flow_id" (AMP hit this). Per-project memory scoping, if reintroduced, must go through Crew-level storage config — not this env var.
 2. `plan` (`@listen(ingest)` + `@human_feedback`) — runs `PlannerCrew`, then pauses for human review. The `@human_feedback` decorator emits one of `approved | amend | rejected`.
 3. `revise_plan` (`@listen("amend")`) — loops the plan back through `PlannerCrew` with prior plan + user amendments, re-gating on another `@human_feedback`.
 4. `build` (`@listen("approved")`) — chooses `build_dir` based on `plan.mode` (`patch_existing` writes into the cloned repo under `inputs/repo`; `new_project` writes into `output/` and `git init`s it), then loops over `plan.subtasks` running the Writer→Reviewer loop.
@@ -93,7 +91,7 @@ Markdown files loaded as `StringKnowledgeSource` via each crew's `_load_knowledg
 - Workspace root is `$CODEBUILDER_WORKSPACE_ROOT` (defaults to `./workspaces`). Each job lives in `<root>/<flow_id>/` with `inputs/` and `output/` subdirs. Never let tools touch anything outside this root.
 - Crew memory currently uses crewai's default global storage location (the `CREWAI_STORAGE_DIR` app-dirs path). We previously scoped it per-project by mutating that env var in `ingest()`, but that collided with flow pending-feedback persistence and broke HITL resume — see the `ingest` note above. Treat per-project memory isolation as an open item.
 - The stable project identifier is `state.project_key`, not `state.project_name`. Always derive via `history.project_key_from(state)` — never reconstruct ad-hoc from the name (it loses the git-URL canonicalisation that makes two users hitting the same repo share context).
-- All agents use `llm: openai/gpt-5.4` in the YAML configs. `WriterCrew` also supports `CODEBUILDER_WRITER_LLM` and `CODEBUILDER_WRITER_REASONING` overrides for benchmark/tuning runs without editing YAML.
+- Default models live in each crew's `agents.yaml`. Every crew agent and the `@human_feedback` guardrails accept a per-role env override (no YAML edit needed): `CODEBUILDER_PLANNER_LLM`, `CODEBUILDER_WRITER_LLM` (+ `CODEBUILDER_WRITER_REASONING`), `CODEBUILDER_REVIEWER_LLM`, `CODEBUILDER_QA_LLM`, `CODEBUILDER_GUARDRAIL_LLM`. To switch the whole stack to Anthropic, set the relevant `ANTHROPIC_API_KEY` and point each var at e.g. `anthropic/claude-sonnet-4-6`. The embedder used by planner + QA memory is configured via `CODEBUILDER_EMBEDDER_PROVIDER` / `CODEBUILDER_EMBEDDER_MODEL` (defaults: `openai` / `text-embedding-3-small`) — Anthropic doesn't ship embeddings, so leave these on OpenAI (or another provider like `voyageai`) even on an Anthropic-primary run.
 - Planner and writer YAMLs set `reasoning: true`, `multimodal: true`, `inject_date: true` — keep these for any new reasoning-heavy agent.
 - When adding a task that returns structured data, set `output_pydantic=<Schema>` and, where correctness matters, a string `guardrail=...` on the `Task`. See `plan_task` and `write_task` for examples.
 - `_planner_inputs()` in `main.py` is the single source of truth for the dict passed to `PlannerCrew`. Add new template variables here **and** in `crews/planner_crew/config/tasks.yaml` together — the YAML uses `{var_name}` interpolation and will raise on missing keys.

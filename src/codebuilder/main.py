@@ -6,14 +6,13 @@ import json
 import logging
 import os
 import re
-import sys
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import requests
-from crewai.flow import Flow, HumanFeedbackPending, listen, persist, start
+from crewai.flow import Flow, listen, persist, start
 from crewai.flow.human_feedback import human_feedback
 
 from codebuilder import history
@@ -42,6 +41,8 @@ DEFAULT_MAX_SUBTASK_RETRIES = 1
 DEFAULT_MAX_FINAL_QA_REPAIRS = 1
 MAX_QA_OUTPUT_CHARS = 12000
 PROGRESS_WEBHOOK_TIMEOUT_SECONDS = 5
+
+GUARDRAIL_LLM = os.environ.get("CODEBUILDER_GUARDRAIL_LLM", "openai/gpt-5.4-mini")
 
 
 _ZIP_NAME_RE = re.compile(r"[^a-zA-Z0-9._-]+")
@@ -340,24 +341,16 @@ class CodebuilderFlow(Flow[CodebuilderState]):
     """Single flow: ingest → plan (HITL) → build → finalize."""
 
     @start()
-    def ingest(self, crewai_trigger_payload: dict | str | None = None):
-        # AMP sends `inputs` as a flat KV of strings; accept a JSON string
-        # here so both local CLI (dict) and AMP (str) paths work.
-        if isinstance(crewai_trigger_payload, str):
-            try:
-                crewai_trigger_payload = json.loads(crewai_trigger_payload)
-            except json.JSONDecodeError:
-                log.warning("crewai_trigger_payload was a non-JSON string; ignoring")
-                crewai_trigger_payload = None
-        payload = crewai_trigger_payload or {}
-        self.state.brief = payload.get("brief", "") or self.state.brief
-        self.state.project_name = payload.get("project_name", "") or self.state.project_name
-        self.state.goals = payload.get("goals") or self.state.goals
-        self.state.tech_stack = payload.get("tech_stack") or self.state.tech_stack
+    def ingest(self):
+        # CrewAI Flow auto-merges `inputs={...}` keys into self.state before
+        # this method runs. Each declared CodebuilderState field (id, brief,
+        # project_name, goals, tech_stack, attachments) is already populated
+        # by the time we get here. Only normalize attachments — they may
+        # arrive as list[dict] (AMP / JSON inputs) instead of list[Attachment].
         self.state.attachments = [
-            Attachment(**a) if not isinstance(a, Attachment) else a
-            for a in (payload.get("attachments") or [])
-        ] or self.state.attachments
+            a if isinstance(a, Attachment) else Attachment(**a)
+            for a in self.state.attachments
+        ]
 
         workspace_dir = WORKSPACE_ROOT / self.state.id
         workspace_dir.mkdir(parents=True, exist_ok=True)
@@ -403,7 +396,7 @@ class CodebuilderFlow(Flow[CodebuilderState]):
     @human_feedback(
         message="Review the generated plan. Reply 'approve' to start coding, describe changes to amend, or 'reject' to cancel.",
         emit=["approved", "amend", "rejected"],
-        llm="openai/gpt-5.4-mini",
+        llm=GUARDRAIL_LLM,
         default_outcome="amend",
     )
     def plan(self) -> dict:
@@ -417,7 +410,7 @@ class CodebuilderFlow(Flow[CodebuilderState]):
     @human_feedback(
         message="Revised plan — please review again. Approve, amend further, or reject.",
         emit=["approved", "amend", "rejected"],
-        llm="openai/gpt-5.4-mini",
+        llm=GUARDRAIL_LLM,
         default_outcome="amend",
     )
     def revise_plan(self, prior) -> dict:
@@ -780,63 +773,21 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             )
 
 
-# --- Entrypoints for CLI + Flask ---------------------------------------------
+def kickoff() -> Any:
+    return CodebuilderFlow().kickoff(
+        inputs={
+            "id": "local-dev-session",
+            "project_name": "criador-de-piada",
+            "brief": "Um projeto python extremamente simples que cria piadas usando OpenAI",
+            "goals": ["Criar piadas"],
+            "tech_stack": ["python", "openai"],
+            "attachments": [],
+        }
+    )
 
 
-def _parse_payload() -> dict:
-    if len(sys.argv) < 2:
-        return {}
-    raw = sys.argv[1]
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        path = Path(raw)
-        if path.is_file():
-            return json.loads(path.read_text(encoding="utf-8"))
-        raise
-
-
-def kickoff(payload: dict | None = None) -> Any:
-    payload = payload if payload is not None else _parse_payload()
-    flow = CodebuilderFlow()
-    result = flow.kickoff(inputs={"crewai_trigger_payload": payload})
-    if isinstance(result, HumanFeedbackPending):
-        print(json.dumps({"status": "pending", "job_id": result.context.flow_id}))
-    else:
-        print(json.dumps(_cli_summary(flow)))
-    return result
-
-
-def kickoff_cli() -> None:
-    kickoff()
-
-
-def _cli_summary(flow: "CodebuilderFlow") -> dict:
-    out = {"status": flow.state.status, "job_id": flow.state.id}
-    if flow.state.zip_path:
-        out["zip_path"] = flow.state.zip_path
-    if flow.state.zip_url:
-        out["zip_url"] = flow.state.zip_url
-    return out
-
-
-def resume(job_id: str | None = None, feedback: str | None = None) -> Any:
-    if job_id is None:
-        if len(sys.argv) < 2:
-            raise SystemExit("Usage: resume <job_id> [feedback]")
-        job_id = sys.argv[1]
-        feedback = sys.argv[2] if len(sys.argv) > 2 else ""
-    flow = CodebuilderFlow.from_pending(job_id)
-    result = flow.resume(feedback or "")
-    if isinstance(result, HumanFeedbackPending):
-        print(json.dumps({"status": "pending", "job_id": result.context.flow_id}))
-    else:
-        print(json.dumps(_cli_summary(flow)))
-    return result
-
-
-def resume_cli() -> None:
-    resume()
+def resume(job_id: str, feedback: str = "") -> Any:
+    return CodebuilderFlow.from_pending(job_id).resume(feedback)
 
 
 def plot():
@@ -845,4 +796,4 @@ def plot():
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    kickoff_cli()
+    kickoff()
