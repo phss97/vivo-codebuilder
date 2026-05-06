@@ -34,8 +34,16 @@ class WebhookFeedbackProvider(HumanFeedbackProvider):
             )
             return self._fallback.request_feedback(context, flow)
 
+        # Caller-supplied session_id (decoupled from flow_id so AMP OTel
+        # traces correlate — see CON-101). May be empty when running locally
+        # via the console fallback; the frontend correlates by session_id
+        # when present and falls back to flow_id otherwise.
+        session_id = getattr(getattr(flow, "state", None), "session_id", "") or ""
+
         payload = {
-            "job_id": context.flow_id,
+            "session_id": session_id,
+            "flow_id": context.flow_id,
+            "job_id": context.flow_id,  # backward-compat alias for flow_id
             "flow_class": context.flow_class,
             "method_name": context.method_name,
             "message": context.message,
@@ -50,5 +58,10 @@ class WebhookFeedbackProvider(HumanFeedbackProvider):
 
         raise HumanFeedbackPending(
             context=context,
-            callback_info={"job_id": context.flow_id, "webhook": webhook},
+            callback_info={
+                "session_id": session_id,
+                "flow_id": context.flow_id,
+                "job_id": context.flow_id,
+                "webhook": webhook,
+            },
         )

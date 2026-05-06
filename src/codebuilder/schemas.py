@@ -75,6 +75,13 @@ class QAReport(StrictOutputModel):
 
 
 class CodebuilderState(FlowState):
+    # Caller-supplied session identifier. Decoupled from `id` (= flow_id) on
+    # purpose: passing `id` in kickoff inputs would override the auto-generated
+    # flow_id used by AMP's OTel traces (see CON-101 / COR-48 — AMP can't fetch
+    # traces from Wharf when execution_id and flow_id disagree). The frontend
+    # uses session_id for its URL slug, in-memory registry, and to correlate
+    # incoming progress / HITL webhooks back to the right session.
+    session_id: str = ""
     brief: str = ""
     project_name: str = ""
     project_key: str = ""

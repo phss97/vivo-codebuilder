@@ -97,7 +97,9 @@ def _emit_progress(state: CodebuilderState, event_type: str, **payload: Any) -> 
 
     body = {
         "event_type": event_type,
-        "job_id": state.id,
+        "session_id": state.session_id,
+        "flow_id": state.id,
+        "job_id": state.id,  # backward-compat alias for flow_id
         "project_name": state.project_name,
         "project_key": state.project_key,
         **payload,
@@ -373,16 +375,24 @@ class CodebuilderFlow(Flow[CodebuilderState]):
     @start()
     def ingest(self):
         # CrewAI Flow auto-merges `inputs={...}` keys into self.state before
-        # this method runs. Each declared CodebuilderState field (id, brief,
-        # project_name, goals, tech_stack, attachments) is already populated
-        # by the time we get here. Only normalize attachments — they may
-        # arrive as list[dict] (AMP / JSON inputs) instead of list[Attachment].
+        # this method runs. Declared CodebuilderState fields (session_id,
+        # brief, project_name, goals, tech_stack, attachments) are populated
+        # by the time we get here. Do NOT pass `id` in inputs — overriding
+        # state.id breaks AMP OTel trace correlation (CON-101 / COR-48):
+        # OTel emits under the auto-generated flow_id, AMP looks up traces
+        # under the overridden state.id, and the two disagree, so traces from
+        # the pre-resume phase are stranded on Wharf. Use `session_id` for
+        # the caller's identity and let `state.id` stay as the flow's UUID.
         self.state.attachments = [
             a if isinstance(a, Attachment) else Attachment(**a)
             for a in self.state.attachments
         ]
 
-        workspace_dir = WORKSPACE_ROOT / self.state.id
+        # Caller's session_id keys workspace dir, project_key fallback, and
+        # webhook payloads so the frontend can correlate. If unset (e.g. local
+        # `uv run kickoff`), fall back to the flow_id so paths remain unique.
+        session_key = self.state.session_id or self.state.id
+        workspace_dir = WORKSPACE_ROOT / session_key
         workspace_dir.mkdir(parents=True, exist_ok=True)
         (workspace_dir / "inputs").mkdir(exist_ok=True)
         (workspace_dir / "output").mkdir(exist_ok=True)
@@ -397,11 +407,11 @@ class CodebuilderFlow(Flow[CodebuilderState]):
         project_key = history.project_key_from(self.state)
         if not project_key:
             log.warning(
-                "job %s has no project_name and no git attachment; "
-                "falling back to flow_id for history keying",
-                self.state.id,
+                "session %s has no project_name and no git attachment; "
+                "falling back to session_id for history keying",
+                session_key,
             )
-            project_key = self.state.id
+            project_key = session_key
         self.state.project_key = project_key
 
         # NOTE: do not mutate CREWAI_STORAGE_DIR here. crewai treats that env
@@ -416,7 +426,8 @@ class CodebuilderFlow(Flow[CodebuilderState]):
 
         self.state.status = "planning"
         log.info(
-            "job %s ingested; workspace=%s project_key=%s",
+            "session %s ingested (flow_id=%s); workspace=%s project_key=%s",
+            self.state.session_id or "(unset)",
             self.state.id,
             self.state.workspace_dir,
             self.state.project_key,
@@ -526,7 +537,8 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                 log.warning("zip generation failed: %s", exc)
 
         try:
-            prefix = f"{self.state.project_key or self.state.id}/{self.state.id}"
+            session_segment = self.state.project_key or self.state.session_id or self.state.id
+            prefix = f"{session_segment}/{self.state.id}"
             self.state.qa_report.artifact_urls = _artifact_refs(upload_workspace(build_dir, prefix=prefix))
             if self.state.zip_path:
                 zip_ref = upload_file(
@@ -675,7 +687,9 @@ class CodebuilderFlow(Flow[CodebuilderState]):
     def _completion_payload(self, build_dir: str | None = None) -> dict:
         payload: dict[str, Any] = {
             "status": self.state.status,
-            "job_id": self.state.id,
+            "session_id": self.state.session_id,
+            "flow_id": self.state.id,
+            "job_id": self.state.id,  # backward-compat alias for flow_id
             "project_name": self.state.project_name,
             "final_qa_repair_attempts": self.state.final_qa_repair_attempts,
         }
@@ -801,7 +815,7 @@ class CodebuilderFlow(Flow[CodebuilderState]):
 def kickoff() -> Any:
     return CodebuilderFlow().kickoff(
         inputs={
-            "id": "local-dev-session",
+            "session_id": "local-dev-session",
             "project_name": "criador-de-piada",
             "brief": "Um projeto python extremamente simples que cria piadas usando OpenAI",
             "goals": ["Criar piadas"],

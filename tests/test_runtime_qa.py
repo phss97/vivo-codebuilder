@@ -208,6 +208,8 @@ def test_emit_progress_posts_configured_webhook(monkeypatch) -> None:
             "url": "https://example.test/progress",
             "json": {
                 "event_type": "subtask_started",
+                "session_id": flow.state.session_id,
+                "flow_id": flow.state.id,
                 "job_id": flow.state.id,
                 "project_name": "demo",
                 "project_key": "demo-key",
