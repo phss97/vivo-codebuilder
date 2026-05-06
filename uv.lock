@@ -552,7 +552,7 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "boto3", specifier = ">=1.34" },
-    { name = "crewai", extras = ["anthropic", "tools"], specifier = "==1.14.2" },
+    { name = "crewai", extras = ["anthropic", "tools"], specifier = "==1.14.4" },
     { name = "gitpython", specifier = ">=3.1" },
     { name = "pypdf", specifier = ">=4.0" },
     { name = "pytest", specifier = ">=8.0" },
@@ -571,7 +571,7 @@ wheels = [
 
 [[package]]
 name = "crewai"
-version = "1.14.2"
+version = "1.14.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiofiles" },
@@ -605,9 +605,9 @@ dependencies = [
     { name = "tomli-w" },
     { name = "uv" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/e6/22/7d7d2ddafcd9083f0aadb3ae2c3d70f14b9ecc8f04491a51c87197d99411/crewai-1.14.2.tar.gz", hash = "sha256:dd7a55d170d152549fbc56d19e5d3a175120a8ae04997b01c1782fac7e258357", size = 7825690, upload-time = "2026-04-17T14:09:32.839Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/d3/4b/7d99452533063c73701789bcc754185087c500a31b4007a30190c05b3cf3/crewai-1.14.4.tar.gz", hash = "sha256:384ac08cca3753ae27ad099ce629e4e8b783d72e364efa041121c7fed48be106", size = 7854110, upload-time = "2026-04-30T19:12:38.602Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/cc/ea/d870be20a7113744b3313fa633986975452c6a02adc3227871b28a0b54d4/crewai-1.14.2-py3-none-any.whl", hash = "sha256:fa273ba1e638e619210e1f90ab45e1a18b5f07c6e6f2e472a4bcd717dc6b770c", size = 1067069, upload-time = "2026-04-17T14:09:30.017Z" },
+    { url = "https://files.pythonhosted.org/packages/09/3a/2ec22e02bceae53153db2f3dd16e8a37c448d3b4a2d647a22bacb173e10c/crewai-1.14.4-py3-none-any.whl", hash = "sha256:a05f3cdcbcec624b532fe4acc601e553ef615dfd54f01d959f1cfeb1de718b0d", size = 1078973, upload-time = "2026-04-30T19:12:35.667Z" },
 ]
 
 [package.optional-dependencies]
@@ -620,7 +620,7 @@ tools = [
 
 [[package]]
 name = "crewai-tools"
-version = "1.14.2"
+version = "1.14.4"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "beautifulsoup4" },
@@ -632,9 +632,9 @@ dependencies = [
     { name = "tiktoken" },
     { name = "youtube-transcript-api" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/f7/58/420a5448bc606469637370b29390c75e064f916568c42cd5289500d35f82/crewai_tools-1.14.2.tar.gz", hash = "sha256:c2d7d2d6c90c142f6c79c06835e48d300a559e16f9b73eae8096fe5c00793c21", size = 874621, upload-time = "2026-04-17T14:09:40.79Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/b2/ea/97b6a0e61b2117f9bd2dc9adf1af1f190cd5e69cebf10c5f4fe51d5c82af/crewai_tools-1.14.4.tar.gz", hash = "sha256:fe257e63a6fbc80f834543e033b2e5799446e32d471177397496d44d73a5a7d6", size = 896834, upload-time = "2026-04-30T19:12:46.114Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/8f/94/1b8a43bf847b0d66b1f4a378edd4d9644e5f88f9b17de04d7abfb501a918/crewai_tools-1.14.2-py3-none-any.whl", hash = "sha256:4e14219e3123b8636166e0be30263af39e7ca3ce9afeff279d770c17e60d0cbe", size = 784214, upload-time = "2026-04-17T14:09:38.252Z" },
+    { url = "https://files.pythonhosted.org/packages/2f/3d/e6a15b9521b3127a1716fa56e83b65274b661871cd2d611c3655d54a8301/crewai_tools-1.14.4-py3-none-any.whl", hash = "sha256:675af68f85b4a8c5d958767d408970a30f3c19f2f8b727fb63ef72e649ea5970", size = 811057, upload-time = "2026-04-30T19:12:43.668Z" },
 ]
 
 [[package]]
@@ -2877,11 +2877,11 @@ wheels = [
 
 [[package]]
 name = "python-dotenv"
-version = "1.1.1"
+version = "1.2.2"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/f6/b0/4bc07ccd3572a2f9df7e6782f52b0c6c90dcbb803ac4a167702d7d0dfe1e/python_dotenv-1.1.1.tar.gz", hash = "sha256:a8a6399716257f45be6a007360200409fce5cda2661e3dec71d23dc15f6189ab", size = 41978, upload-time = "2025-06-24T04:21:07.341Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/82/ed/0301aeeac3e5353ef3d94b6ec08bbcabd04a72018415dcb29e588514bba8/python_dotenv-1.2.2.tar.gz", hash = "sha256:2c371a91fbd7ba082c2c1dc1f8bf89ca22564a087c2c287cd9b662adde799cf3", size = 50135, upload-time = "2026-03-01T16:00:26.196Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/5f/ed/539768cf28c661b5b068d66d96a2f155c4971a5d55684a514c1a0e0dec2f/python_dotenv-1.1.1-py3-none-any.whl", hash = "sha256:31f23644fe2602f88ff55e1f5c79ba497e01224ee7737937930c448e4d0e24dc", size = 20556, upload-time = "2025-06-24T04:21:06.073Z" },
+    { url = "https://files.pythonhosted.org/packages/0b/d7/1959b9648791274998a9c3526f6d0ec8fd2233e4d4acce81bbae76b44b2a/python_dotenv-1.2.2-py3-none-any.whl", hash = "sha256:1d8214789a24de455a8b8bd8ae6fe3c6b69a5e3d64aa8a8e5d68e694bbcb285a", size = 22101, upload-time = "2026-03-01T16:00:25.09Z" },
 ]
 
 [[package]]

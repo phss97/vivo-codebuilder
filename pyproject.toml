@@ -5,7 +5,7 @@ description = "codebuilder using crewAI"
 authors = [{ name = "Pedro Silva", email = "pedro.silva@crewai.com" }]
 requires-python = ">=3.10,<3.14"
 dependencies = [
-    "crewai[anthropic,tools]==1.14.2",
+    "crewai[anthropic,tools]==1.14.4",
     "requests>=2.31",
     "gitpython>=3.1",
     "pypdf>=4.0",
