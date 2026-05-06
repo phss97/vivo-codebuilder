@@ -198,6 +198,36 @@ def _artifact_refs(refs: list[dict] | list[ArtifactRef] | None) -> list[Artifact
     return converted
 
 
+def _persist_artifact(artifact: CodeArtifact, build_dir: str) -> str:
+    """Ensure ``artifact.content`` lives on disk under ``build_dir``.
+
+    Returns "" on success, or an error message describing why the file
+    could not be persisted. The orchestrator owns the write so we don't
+    depend on the writer LLM remembering to call ``workspace_write``.
+    If the writer DID already persist the file (artifact.content empty
+    but file present), we backfill ``artifact.content`` from disk so
+    downstream consumers see the same bytes.
+    """
+    try:
+        target = resolve_within(build_dir, artifact.file_path)
+    except ValueError as exc:
+        return str(exc)
+
+    if artifact.content:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(artifact.content, encoding="utf-8")
+        return ""
+
+    if target.is_file():
+        artifact.content = target.read_text(encoding="utf-8", errors="replace")
+        return ""
+
+    return (
+        f"Writer returned empty content and did not write {artifact.file_path}; "
+        "include the full file text in CodeArtifact.content."
+    )
+
+
 def _validate_plan(plan: Plan | None) -> Plan:
     if not isinstance(plan, Plan):
         raise ValueError("Planner did not return a valid Plan object.")
@@ -561,21 +591,11 @@ class CodebuilderFlow(Flow[CodebuilderState]):
         return json.dumps(payload, indent=2)
 
     def _validate_repair_artifact(self, artifact: CodeArtifact, build_dir: str) -> bool:
-        try:
-            target = resolve_within(build_dir, artifact.file_path)
-        except ValueError as exc:
-            log.warning("final QA repair returned invalid path: %s", exc)
+        persist_error = _persist_artifact(artifact, build_dir)
+        if persist_error:
+            log.warning("final QA repair could not be persisted: %s", persist_error)
             return False
-        if not target.is_file():
-            log.warning("final QA repair did not write returned artifact: %s", artifact.file_path)
-            return False
-        content = target.read_text(encoding="utf-8", errors="replace")
-        if artifact.content and artifact.content != content:
-            log.warning(
-                "final QA repair artifact content differs from workspace file: %s",
-                artifact.file_path,
-            )
-        if _looks_like_placeholder(content):
+        if _looks_like_placeholder(artifact.content):
             log.warning("final QA repair produced placeholder content: %s", artifact.file_path)
             return False
         return True
@@ -708,6 +728,11 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             artifact = write_result.pydantic if isinstance(write_result.pydantic, CodeArtifact) else None
             if artifact is None:
                 prior_issues = "Writer did not return a valid CodeArtifact; try again and emit the schema exactly."
+                continue
+
+            persist_error = _persist_artifact(artifact, build_dir)
+            if persist_error:
+                prior_issues = persist_error
                 continue
 
             deterministic = run_deterministic_review(subtask, artifact, build_dir)

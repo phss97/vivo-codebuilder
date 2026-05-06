@@ -23,12 +23,14 @@ write_task:
       `tests/` file, which the planner schedules as its own subtask. If
       `file_path` is under `tests/`, write tests there; otherwise write
       production code only.
-    - Persist the file via the `workspace_write` tool before finalizing.
-      The downstream Reviewer will run lint and tests against it.
+    - Return the FULL file text in CodeArtifact.content. The orchestrator
+      persists it to the workspace — you do NOT need to call
+      `workspace_write` to save the final file. Use `workspace_read` and
+      `workspace_list` to inspect adjacent files first when helpful.
   expected_output: >
     A CodeArtifact JSON object with: subtask_id, file_path (must match the
-    subtask), content (may be empty because the file was already persisted
-    with workspace_write), language, tests_included.
+    subtask), content set to the COMPLETE file text (non-empty), language,
+    tests_included.
   agent: writer
 
 repair_task:
@@ -51,13 +53,14 @@ repair_task:
     Rules:
     - Use workspace_read and workspace_list to inspect the failing code before
       choosing the file to change.
-    - Use workspace_write to persist exactly one complete file.
+    - Return the FULL repaired file text in CodeArtifact.content. The
+      orchestrator persists it — you do NOT need to call `workspace_write`.
     - Prefer fixing production code when tests reveal a product bug; only edit
       tests when the tests themselves are clearly wrong or incomplete.
     - Do not add placeholders, TODOs, or `...`.
     - Do not create broad rewrites unrelated to the QA failure.
   expected_output: >
     A CodeArtifact JSON object with: subtask_id set to "final_qa_repair",
-    file_path set to the repaired file path, content optionally set to the
-    full file text, language, and tests_included.
+    file_path set to the repaired file path, content set to the COMPLETE
+    repaired file text (non-empty), language, and tests_included.
   agent: writer

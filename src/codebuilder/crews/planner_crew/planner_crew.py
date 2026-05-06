@@ -13,6 +13,13 @@ from codebuilder.schemas import Plan
 KNOWLEDGE_DIR = Path(__file__).resolve().parents[2] / "knowledge"
 
 
+def _env_bool(name: str) -> bool | None:
+    raw = os.environ.get(name)
+    if raw is None:
+        return None
+    return raw.strip().lower() not in {"0", "false", "no", "off"}
+
+
 def _load_knowledge(*names: str) -> list[StringKnowledgeSource]:
     sources = []
     for name in names:
@@ -35,6 +42,12 @@ class PlannerCrew:
         llm_override = os.environ.get("CODEBUILDER_PLANNER_LLM")
         if llm_override:
             config["llm"] = llm_override
+        reasoning_override = _env_bool("CODEBUILDER_PLANNER_REASONING")
+        if reasoning_override is not None:
+            config["reasoning"] = reasoning_override
+        planning_override = _env_bool("CODEBUILDER_PLANNER_PLANNING")
+        if planning_override is not None:
+            config["planning"] = planning_override
         return Agent(
             config=config,
             tools=[FileReadTool(), DirectoryReadTool()],
