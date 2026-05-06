@@ -43,12 +43,20 @@ plan_task:
            module that imports from the package.
         2. Shared primitives (schemas, types, constants) before the modules
            that consume them.
-        3. Feature modules next, with their dedicated test file as the
-           immediately following subtask so failures surface close to the
-           code that caused them.
-        4. Integration glue (CLI entry point, `__main__.py`) after the
+        3. Feature modules next. Do not create a dedicated test subtask for
+           every module by default; use risk-based testing instead.
+        4. Add standalone `tests/` subtasks only for non-trivial business
+           logic, regression-prone behavior, parsers, persistence, API
+           contracts, or user-facing workflows. For simple config, package
+           init files, thin adapters, README, and glue code, express the
+           acceptance check in `test_criteria` and rely on reviewer inspection
+           plus final lint/QA instead of creating a test file.
+        5. When tests are needed, group them after the related production
+           slice is complete, preferably as a small late QA/testing block
+           before documentation.
+        6. Integration glue (CLI entry point, `__main__.py`) after the
            features it wires together.
-        5. `README.md` LAST. It documents what actually shipped — entry
+        7. `README.md` LAST. It documents what actually shipped — entry
            points, flags, install steps — and can only be accurate once the
            rest of the plan has executed.
     - Populate `open_questions` with anything the user must clarify later.

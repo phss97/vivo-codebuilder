@@ -22,8 +22,14 @@
 - Prefer stdlib when equivalent (`pathlib`, `dataclasses`, `subprocess`, `argparse`).
 
 ## Testing
-- Each new module gets a minimal pytest test file.
-- Test the public API, not internals. Use fixtures for shared setup.
+- Use risk-based tests. Add pytest files for non-trivial business logic,
+  regression-prone behavior, parsers, persistence, API contracts, or
+  user-facing workflows.
+- Do not create a test file just because a source module exists. Simple config,
+  package init files, thin adapters, documentation, and glue code can be
+  covered by reviewer inspection, lint, and final QA acceptance criteria.
+- Test the public API, not internals. Use fixtures for shared setup when tests
+  are warranted.
 - Assert on outcomes, not on log lines.
 
 ## Packaging
