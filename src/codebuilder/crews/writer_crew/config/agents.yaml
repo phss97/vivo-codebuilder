@@ -12,7 +12,7 @@ writer:
     workspace before writing so your code integrates cleanly. You trust the
     planner to schedule a separate test subtask when tests are needed; you
     do not embed tests inside production modules.
-  llm: openai/gpt-5.4
+  llm: anthropic/claude-sonnet-4-6
   reasoning: true
   max_iter: 8
   max_retry_limit: 1
