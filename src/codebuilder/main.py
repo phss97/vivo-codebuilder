@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 
 import requests
-from crewai.flow import Flow, listen, persist, start
+from crewai.flow import Flow, listen, start
 from crewai.flow.human_feedback import human_feedback
 
 from codebuilder import history
@@ -148,7 +148,6 @@ def _planner_inputs(state: CodebuilderState) -> dict:
         "amendments": state.amendments,
     }
 
-@persist()
 class CodebuilderFlow(Flow[CodebuilderState]):
     """Single flow: ingest → plan (HITL) → build → finalize."""
 
