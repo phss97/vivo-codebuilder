@@ -1,10 +1,19 @@
+import base64
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
 import codebuilder.main as main
-from codebuilder.main import CodebuilderFlow, run_deterministic_review, run_final_qa
-from codebuilder.schemas import ArtifactRef, CodeArtifact, QAReport, SubTask
+from codebuilder.main import CodebuilderFlow
+from codebuilder.runtime_qa import (
+    run_deterministic_review,
+    run_final_qa,
+    run_full_architecture_gate,
+    run_rpa_deterministic_gate,
+)
+from codebuilder.schemas import ArtifactRef, CodeArtifact, Plan, QAReport, SubTask
+from codebuilder.tools import attachment_tool
+from codebuilder.tools.lint_runner_tool import LintRunnerTool, TestRunnerTool as CodebuilderTestRunnerTool
 
 
 class FakeTool:
@@ -136,6 +145,21 @@ def test_deterministic_review_rejects_lint_failure(tmp_path: Path) -> None:
     assert "ruff failed" in "\n".join(review.result.issues)
 
 
+def test_deterministic_review_rejects_lint_skip_for_production_file(tmp_path: Path) -> None:
+    artifact = _artifact(tmp_path, "hello.py", 'print("hello")\n')
+
+    review = run_deterministic_review(
+        _subtask("hello.py"),
+        artifact,
+        str(tmp_path),
+        lint_runner=FakeTool("SKIP: ruff not installed in the runtime"),
+    )
+
+    assert review.needs_fallback is False
+    assert review.result.passed is False
+    assert "required quality gate skipped" in "\n".join(review.result.issues)
+
+
 def test_deterministic_review_rejects_test_file_pytest_failure(tmp_path: Path) -> None:
     artifact = _artifact(
         tmp_path,
@@ -157,19 +181,86 @@ def test_deterministic_review_rejects_test_file_pytest_failure(tmp_path: Path) -
     assert "pytest failed" in "\n".join(review.result.issues)
 
 
-def test_deterministic_review_marks_skip_for_fallback(tmp_path: Path) -> None:
-    artifact = _artifact(tmp_path, "hello.py", 'print("hello")\n')
+def test_deterministic_review_rejects_test_skip_for_test_file(tmp_path: Path) -> None:
+    artifact = _artifact(tmp_path, "tests/test_ok.py", "def test_ok():\n    assert True\n")
 
     review = run_deterministic_review(
-        _subtask("hello.py"),
+        _subtask("tests/test_ok.py"),
         artifact,
         str(tmp_path),
-        lint_runner=FakeTool("SKIP: ruff not installed in the runtime"),
+        lint_runner=FakeTool("PASS"),
+        test_runner=FakeTool("SKIP: no tests collected under this path."),
     )
 
-    assert review.needs_fallback is True
+    assert review.needs_fallback is False
     assert review.result.passed is False
-    assert "SKIP:" in "\n".join(review.result.issues)
+    assert "required quality gate skipped" in "\n".join(review.result.issues)
+
+
+def test_final_qa_fails_when_pytest_collects_no_tests() -> None:
+    qa = run_final_qa(
+        "/unused",
+        lint_runner=FakeTool("PASS"),
+        test_runner=FakeTool("SKIP: no tests collected under this path."),
+    )
+
+    assert qa.passed is False
+    assert "Tests were not executed" in qa.integration_notes
+
+
+def test_architecture_gate_fails_missing_rpa_structure(tmp_path: Path) -> None:
+    (tmp_path / "pyproject.toml").write_text("[project]\nname = 'demo'\n", encoding="utf-8")
+    (tmp_path / "src/demo").mkdir(parents=True)
+    (tmp_path / "src/demo/__init__.py").write_text("", encoding="utf-8")
+
+    result = run_rpa_deterministic_gate(str(tmp_path))
+
+    assert result.passed is False
+    assert "orchestrator" in "\n".join(result.issues)
+    assert "producer" in "\n".join(result.issues)
+    assert "consumer" in "\n".join(result.issues)
+
+
+def _empty_plan(domain: str = "") -> Plan:
+    return Plan(
+        project_name="demo",
+        mode="new_project",
+        tech_stack=["python"],
+        subtasks=[
+            SubTask(
+                id="s1",
+                title="t",
+                description="d",
+                file_path="src/demo/__init__.py",
+                test_criteria="exists",
+            )
+        ],
+        domain=domain,
+    )
+
+
+def test_full_architecture_gate_skips_when_plan_has_no_domain(tmp_path: Path) -> None:
+    result = run_full_architecture_gate(str(tmp_path), _empty_plan(domain=""))
+
+    assert result.passed is True
+    assert result.subtask_id == "architecture_gate"
+    assert any("did not declare a domain" in s for s in result.suggestions)
+
+
+def test_full_architecture_gate_skips_unknown_domain(tmp_path: Path) -> None:
+    result = run_full_architecture_gate(str(tmp_path), _empty_plan(domain="python-package"))
+
+    assert result.passed is True
+    assert any("No architecture gate registered" in s for s in result.suggestions)
+
+
+def test_full_architecture_gate_runs_rpa_when_domain_matches(tmp_path: Path) -> None:
+    # Empty workspace + rpa domain → deterministic gate runs and fails fast.
+    result = run_full_architecture_gate(str(tmp_path), _empty_plan(domain="rpa"))
+
+    assert result.passed is False
+    assert result.subtask_id == "architecture_gate"
+    assert any("orchestrator" in issue for issue in result.issues)
 
 
 def test_final_qa_builds_report_and_preserves_artifact_refs() -> None:
@@ -238,6 +329,47 @@ def test_zip_build_excludes_tool_cache_dirs(tmp_path: Path) -> None:
         names = zf.namelist()
     assert "demo/app.py" in names
     assert all(".ruff_cache" not in name for name in names)
+
+
+def test_attachment_zip_rejects_path_traversal(tmp_path: Path) -> None:
+    archive = tmp_path / "bad.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("../escape.py", "print('bad')\n")
+
+    attachment = {
+        "kind": "zip",
+        "name": "bad.zip",
+        "content_b64": base64.b64encode(archive.read_bytes()).decode(),
+    }
+
+    try:
+        attachment_tool.materialize([attachment], str(tmp_path))
+    except ValueError as exc:
+        assert "Unsafe zip member" in str(exc)
+    else:
+        raise AssertionError("zip traversal attachment was accepted")
+
+
+def test_attachment_file_name_cannot_escape_inputs_dir(tmp_path: Path) -> None:
+    attachment = {
+        "kind": "image",
+        "name": "../escape.png",
+        "content_b64": base64.b64encode(b"not really png").decode(),
+    }
+
+    records = attachment_tool.materialize([attachment], str(tmp_path))
+
+    assert records[0]["path"] == "inputs/escape.png"
+    assert (tmp_path / "inputs/escape.png").is_file()
+    assert not (tmp_path / "escape.png").exists()
+
+
+def test_lint_and_test_runner_reject_paths_outside_workspace(tmp_path: Path) -> None:
+    lint = LintRunnerTool(workspace_dir=str(tmp_path))
+    tests = CodebuilderTestRunnerTool(workspace_dir=str(tmp_path))
+
+    assert "escapes workspace" in lint._run("../outside.py")
+    assert "escapes workspace" in tests._run("../outside.py")
 
 
 def test_finalize_repairs_failed_final_qa_and_returns_payload(monkeypatch, tmp_path: Path) -> None:
@@ -353,7 +485,7 @@ def test_finalize_returns_artifacts_when_final_qa_still_fails(monkeypatch, tmp_p
 
     payload = flow.finalize(None)
 
-    assert flow.state.status == "done"
+    assert flow.state.status == "failed"
     assert flow.state.final_qa_repair_attempts == 1
     assert payload["qa_report"]["passed"] is False
     assert "still failing after 1 writer repair attempt" in payload["qa_report"]["integration_notes"]

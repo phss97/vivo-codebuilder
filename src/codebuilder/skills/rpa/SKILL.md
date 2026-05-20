@@ -1,3 +1,8 @@
+---
+name: rpa
+description: Apply the required Python RPA project architecture, packaging, configuration, and testing standards (orchestrator/producer/consumer, Clean Architecture, CCM-backed config, pytest coverage).
+---
+
 # Guia de Onboarding — Projetos RPA em Python
 
 > Material de apoio para novos membros do time. Reúne as premissas técnicas e arquiteturais que todo projeto novo deve seguir desde o primeiro commit.

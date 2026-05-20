@@ -1,9 +1,8 @@
-import os
 from pathlib import Path
 
 from crewai import Agent, Crew, Process, Task
-from crewai.knowledge.source.string_knowledge_source import StringKnowledgeSource
 from crewai.project import CrewBase, agent, crew, task
+from crewai.skills import activate_skill, discover_skills
 
 from codebuilder.schemas import CodeArtifact
 from codebuilder.tools import (
@@ -12,24 +11,10 @@ from codebuilder.tools import (
     WorkspaceWriteTool,
 )
 
-
-KNOWLEDGE_DIR = Path(__file__).resolve().parents[2] / "knowledge"
-
-
-def _env_bool(name: str) -> bool | None:
-    raw = os.environ.get(name)
-    if raw is None:
-        return None
-    return raw.strip().lower() not in {"0", "false", "no", "off"}
-
-
-def _load_knowledge(*names: str) -> list[StringKnowledgeSource]:
-    sources = []
-    for name in names:
-        path = KNOWLEDGE_DIR / name
-        if path.is_file():
-            sources.append(StringKnowledgeSource(content=path.read_text(encoding="utf-8")))
-    return sources
+_SKILLS = {
+    s.name: activate_skill(s)
+    for s in discover_skills(Path(__file__).resolve().parents[2] / "skills")
+}
 
 
 @CrewBase
@@ -51,21 +36,10 @@ class WriterCrew:
 
     @agent
     def writer(self) -> Agent:
-        config = dict(self.agents_config["writer"])  # type: ignore[index]
-        llm_override = os.environ.get("CODEBUILDER_WRITER_LLM")
-        if llm_override:
-            config["llm"] = llm_override
-        reasoning_override = _env_bool("CODEBUILDER_WRITER_REASONING")
-        if reasoning_override is not None:
-            config["reasoning"] = reasoning_override
-
         return Agent(
-            config=config,
+            config=self.agents_config["writer"],  # type: ignore[index]
             tools=self._workspace_tools(),
-            knowledge_sources=_load_knowledge(
-                "python_best_practices.md",
-                "rpa_patterns.md",
-            ),
+            skills=[_SKILLS["rpa"]],
         )
 
     @task

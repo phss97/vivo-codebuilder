@@ -43,6 +43,10 @@ class Plan(StrictOutputModel):
     subtasks: list[SubTask]
     open_questions: list[str] = Field(default_factory=list)
     assumptions: list[str] = Field(default_factory=list)
+    # Optional slug matching an activated architecture-defining skill
+    # (e.g. "rpa"). When set, finalize dispatches the matching
+    # architecture gate; when empty, no domain gate runs.
+    domain: str = ""
 
 
 class CodeArtifact(StrictOutputModel):

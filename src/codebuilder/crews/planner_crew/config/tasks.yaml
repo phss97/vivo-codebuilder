@@ -30,6 +30,23 @@ plan_task:
     Rules:
     - Decide whether `mode` is "new_project" or "patch_existing" based on whether
       a git repo or zipped existing code was attached.
+    - Apply the conventions described in your activated skills (project layout,
+      required components, layering, testing strategy, naming, …) when shaping
+      the plan. Activated skills are authoritative for project-type rules; do
+      not invent extra structure when no skill calls for it.
+    - If one of your activated skills defines the project's overall architecture
+      (e.g. `rpa`), set the plan's `domain` field to that skill's slug.
+      Leave `domain` as an empty string when no architecture-defining skill
+      applies — `domain` drives the post-build architecture gate.
+    - Prefer a distributable package over a loose script when the tech stack
+      and brief expect it. Include configuration, tests, and docs at the
+      project root.
+    - Runtime configuration must come from explicit config files, env-backed
+      settings, or a secret-store boundary. Never plan hardcoded credentials,
+      tokens, or machine-specific paths.
+    - Include tests for core business behavior, at least one failure path, and
+      any retry/error semantics implied by the brief. Use the test runner that
+      matches the chosen tech stack.
     - Break the work into atomic subtasks. Each subtask must map to exactly one
       file the Writer will create or modify. Max 15 subtasks total.
     - Every subtask must include: id, title, description, file_path, depends_on,
@@ -70,5 +87,6 @@ plan_task:
   expected_output: >
     A Plan JSON object matching the Plan schema: project_name, mode,
     tech_stack (list), subtasks (list of SubTask), open_questions (list),
-    assumptions (list).
+    assumptions (list), domain (slug of the architecture-defining skill or
+    empty string).
   agent: planner

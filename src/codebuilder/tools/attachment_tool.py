@@ -6,6 +6,26 @@ from pathlib import Path
 from pypdf import PdfReader
 
 from . import git_tool
+from .workspace_tool import resolve_within
+
+
+def _safe_name(name: str) -> str:
+    return Path(name).name or "attachment"
+
+
+def _extract_zip_safely(data: bytes, extract_to: Path) -> None:
+    with zipfile.ZipFile(BytesIO(data)) as zf:
+        for info in zf.infolist():
+            try:
+                target = resolve_within(str(extract_to), info.filename)
+            except ValueError as exc:
+                raise ValueError(f"Unsafe zip member {info.filename!r}: {exc}") from exc
+            if info.is_dir():
+                target.mkdir(parents=True, exist_ok=True)
+                continue
+            target.parent.mkdir(parents=True, exist_ok=True)
+            with zf.open(info) as source, target.open("wb") as dest:
+                dest.write(source.read())
 
 
 def materialize(attachments: list[dict], workspace_dir: str) -> list[dict]:
@@ -21,7 +41,7 @@ def materialize(attachments: list[dict], workspace_dir: str) -> list[dict]:
 
     for att in attachments:
         kind = att.get("kind")
-        name = att.get("name") or f"attachment_{len(records)}"
+        name = _safe_name(att.get("name") or f"attachment_{len(records)}")
         if kind == "git":
             url = att.get("uri") or ""
             if not url:
@@ -34,10 +54,9 @@ def materialize(attachments: list[dict], workspace_dir: str) -> list[dict]:
             records.append({"kind": "git", "name": name, "path": str(dest.relative_to(workspace_dir)), "summary": f"git repo cloned from {url}"})
         elif kind == "zip":
             data = base64.b64decode(att.get("content_b64", ""))
-            with zipfile.ZipFile(BytesIO(data)) as zf:
-                extract_to = inputs_dir / Path(name).stem
-                extract_to.mkdir(parents=True, exist_ok=True)
-                zf.extractall(extract_to)
+            extract_to = inputs_dir / (Path(name).stem or "archive")
+            extract_to.mkdir(parents=True, exist_ok=True)
+            _extract_zip_safely(data, extract_to)
             records.append({"kind": "zip", "name": name, "path": str(extract_to.relative_to(workspace_dir)), "summary": f"extracted {name}"})
         elif kind == "pdf":
             data = base64.b64decode(att.get("content_b64", ""))

@@ -12,8 +12,8 @@ review_task:
 
     Use the `workspace_read` and `workspace_list` tools to read the file at
     `artifact.file_path` and any related files in the workspace. Run the
-    `lint_runner` tool against the artifact path. Apply the review_checklist
-    criteria from your knowledge sources.
+    `lint_runner` tool against the artifact path. Apply the acceptance
+    criteria from the `code-review-gate` skill.
   expected_output: >
     A ReviewResult JSON object with: subtask_id (matching the artifact),
     passed (bool), issues (list of concrete problems), suggestions (list of
@@ -38,4 +38,30 @@ qa_task:
   expected_output: >
     A QAReport JSON object with: passed (bool), lint_output (raw), test_output
     (raw), integration_notes (narrative summary of what you checked).
+  agent: qa_agent
+
+architecture_gate_task:
+  description: >
+    Run the final architecture acceptance gate for the generated workspace
+    at {workspace_dir}. The gate is keyed on the project's declared domain.
+
+    Domain: {domain}
+
+    Plan metadata:
+    {plan_summary}
+
+    Current workspace files:
+    {workspace_listing}
+
+    Apply the activated domain skill (matching the `domain` slug above) plus
+    the `code-review-gate` skill. Inspect the generated project against the
+    architecture, layering, configuration boundary, traceability, and testing
+    requirements defined by those skills.
+
+    Set passed=False if any required quality from the domain skill is missing,
+    even if ruff and pytest passed.
+  expected_output: >
+    A ReviewResult JSON object with subtask_id set to "architecture_gate",
+    passed (bool), issues (concrete missing or incorrect items), and
+    suggestions (targeted remediation steps).
   agent: qa_agent

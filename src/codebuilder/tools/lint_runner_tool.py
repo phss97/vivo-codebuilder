@@ -1,10 +1,11 @@
 import subprocess
 import sys
-from pathlib import Path
 from typing import Type
 
 from crewai.tools import BaseTool
 from pydantic import BaseModel, Field
+
+from codebuilder.tools.workspace_tool import resolve_within
 
 
 def _run(cmd: list[str], cwd: str, timeout: int = 120) -> tuple[int, str]:
@@ -44,7 +45,10 @@ class LintRunnerTool(BaseTool):
     workspace_dir: str
 
     def _run(self, path: str = ".") -> str:
-        target = (Path(self.workspace_dir) / path).resolve()
+        try:
+            target = resolve_within(self.workspace_dir, path)
+        except ValueError as exc:
+            return f"ERROR: {exc}"
         code, out = _run(
             [sys.executable, "-m", "ruff", "check", str(target)],
             cwd=self.workspace_dir,
@@ -69,7 +73,10 @@ class TestRunnerTool(BaseTool):
     workspace_dir: str
 
     def _run(self, path: str = ".") -> str:
-        target = (Path(self.workspace_dir) / path).resolve()
+        try:
+            target = resolve_within(self.workspace_dir, path)
+        except ValueError as exc:
+            return f"ERROR: {exc}"
         code, out = _run(
             [sys.executable, "-m", "pytest", "-q", "--no-header", str(target)],
             cwd=self.workspace_dir,

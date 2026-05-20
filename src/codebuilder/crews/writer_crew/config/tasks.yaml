@@ -19,6 +19,13 @@ write_task:
     Rules:
     - Write ONE file whose path is exactly `file_path` from the subtask.
     - Include complete, runnable code — no placeholders, no `...`.
+    - Follow the conventions in your activated skills (project structure,
+      layering, naming, testing patterns) when implementing this file.
+      Activated skills are authoritative for domain-specific rules; do not
+      mix concerns the skill says should be separated.
+    - Runtime configuration must come from explicit config objects, env-backed
+      settings, or secret-store adapter boundaries. Never hardcode secrets,
+      credentials, tokens, or local absolute paths.
     - Do NOT embed tests inside a production module. Tests belong in a
       `tests/` file, which the planner schedules as its own subtask. If
       `file_path` is under `tests/`, write tests there; otherwise write

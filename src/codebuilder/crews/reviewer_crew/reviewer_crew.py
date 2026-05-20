@@ -1,11 +1,9 @@
-import os
 from pathlib import Path
 
 from crewai import Agent, Crew, Process, Task
-from crewai.knowledge.source.string_knowledge_source import StringKnowledgeSource
 from crewai.project import CrewBase, agent, crew, task
+from crewai.skills import activate_skill, discover_skills
 
-from codebuilder.llm_config import embedder_config
 from codebuilder.schemas import QAReport, ReviewResult
 from codebuilder.tools import (
     LintRunnerTool,
@@ -14,17 +12,10 @@ from codebuilder.tools import (
     WorkspaceReadTool,
 )
 
-
-KNOWLEDGE_DIR = Path(__file__).resolve().parents[2] / "knowledge"
-
-
-def _load_knowledge(*names: str) -> list[StringKnowledgeSource]:
-    sources = []
-    for name in names:
-        path = KNOWLEDGE_DIR / name
-        if path.is_file():
-            sources.append(StringKnowledgeSource(content=path.read_text(encoding="utf-8")))
-    return sources
+_SKILLS = {
+    s.name: activate_skill(s)
+    for s in discover_skills(Path(__file__).resolve().parents[2] / "skills")
+}
 
 
 @CrewBase
@@ -47,26 +38,18 @@ class ReviewerCrew:
 
     @agent
     def reviewer(self) -> Agent:
-        config = dict(self.agents_config["reviewer"])  # type: ignore[index]
-        llm_override = os.environ.get("CODEBUILDER_REVIEWER_LLM")
-        if llm_override:
-            config["llm"] = llm_override
         return Agent(
-            config=config,
+            config=self.agents_config["reviewer"],  # type: ignore[index]
             tools=self._shared_tools(),
-            knowledge_sources=_load_knowledge("review_checklist.md"),
+            skills=[_SKILLS["rpa"], _SKILLS["code-review-gate"]],
         )
 
     @agent
     def qa_agent(self) -> Agent:
-        config = dict(self.agents_config["qa_agent"])  # type: ignore[index]
-        llm_override = os.environ.get("CODEBUILDER_QA_LLM")
-        if llm_override:
-            config["llm"] = llm_override
         return Agent(
-            config=config,
+            config=self.agents_config["qa_agent"],  # type: ignore[index]
             tools=self._shared_tools(),
-            knowledge_sources=_load_knowledge("review_checklist.md"),
+            skills=[_SKILLS["rpa"], _SKILLS["code-review-gate"]],
         )
 
     @task
@@ -81,6 +64,13 @@ class ReviewerCrew:
         return Task(
             config=self.tasks_config["qa_task"],  # type: ignore[index]
             output_pydantic=QAReport,
+        )
+
+    @task
+    def architecture_gate_task(self) -> Task:
+        return Task(
+            config=self.tasks_config["architecture_gate_task"],  # type: ignore[index]
+            output_pydantic=ReviewResult,
         )
 
     @crew
@@ -103,7 +93,14 @@ class ReviewerCrew:
             agents=[self.qa_agent()],
             tasks=[self.qa_task()],
             process=Process.sequential,
-            memory=True,
-            embedder=embedder_config(),
+            verbose=True,
+        )
+
+    def architecture_gate_crew(self) -> Crew:
+        """Final domain architecture acceptance gate (dispatched on plan.domain)."""
+        return Crew(
+            agents=[self.qa_agent()],
+            tasks=[self.architecture_gate_task()],
+            process=Process.sequential,
             verbose=True,
         )
