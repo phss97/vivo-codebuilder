@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from crewai import Agent, Crew, Process, Task
+from crewai import Agent, Crew, LLM, Process, Task
 from crewai.project import CrewBase, agent, crew, task
 from crewai.skills import activate_skill, discover_skills
 
@@ -38,18 +38,22 @@ class ReviewerCrew:
 
     @agent
     def reviewer(self) -> Agent:
+        cfg = self.agents_config["reviewer"]  # type: ignore[index]
         return Agent(
-            config=self.agents_config["reviewer"],  # type: ignore[index]
+            config=cfg,
             tools=self._shared_tools(),
             skills=[_SKILLS["rpa"], _SKILLS["code-review-gate"]],
+            llm=LLM(model=cfg["llm"], max_tokens=8192),
         )
 
     @agent
     def qa_agent(self) -> Agent:
+        cfg = self.agents_config["qa_agent"]  # type: ignore[index]
         return Agent(
-            config=self.agents_config["qa_agent"],  # type: ignore[index]
+            config=cfg,
             tools=self._shared_tools(),
             skills=[_SKILLS["rpa"], _SKILLS["code-review-gate"]],
+            llm=LLM(model=cfg["llm"], max_tokens=8192),
         )
 
     @task

@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from crewai import Agent, Crew, Process, Task
+from crewai import Agent, Crew, LLM, Process, Task
 from crewai.project import CrewBase, agent, crew, task
 from crewai.skills import activate_skill, discover_skills
 
@@ -36,10 +36,14 @@ class WriterCrew:
 
     @agent
     def writer(self) -> Agent:
+        cfg = self.agents_config["writer"]  # type: ignore[index]
+        # max_tokens=16384 so CodeArtifact.content (full file body) isn't
+        # truncated against AnthropicCompletion's 4096 default.
         return Agent(
-            config=self.agents_config["writer"],  # type: ignore[index]
+            config=cfg,
             tools=self._workspace_tools(),
             skills=[_SKILLS["rpa"]],
+            llm=LLM(model=cfg["llm"], max_tokens=16384),
         )
 
     @task
