@@ -43,7 +43,7 @@ class ReviewerCrew:
             config=cfg,
             tools=self._shared_tools(),
             skills=[_SKILLS["rpa"], _SKILLS["code-review-gate"]],
-            llm=LLM(model=cfg["llm"], max_tokens=8192),
+            llm=LLM(model=cfg["llm"], max_tokens=16384),
         )
 
     @agent
@@ -53,7 +53,7 @@ class ReviewerCrew:
             config=cfg,
             tools=self._shared_tools(),
             skills=[_SKILLS["rpa"], _SKILLS["code-review-gate"]],
-            llm=LLM(model=cfg["llm"], max_tokens=8192),
+            llm=LLM(model=cfg["llm"], max_tokens=16384),
         )
 
     @task

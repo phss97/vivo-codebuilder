@@ -31,7 +31,7 @@ class PlannerCrew:
             config=cfg,
             tools=[FileReadTool(), DirectoryReadTool()],
             skills=[_SKILLS["rpa"]],
-            llm=LLM(model=cfg["llm"], max_tokens=16384),
+            llm=LLM(model=cfg["llm"], max_tokens=32768),
         )
 
     @task
