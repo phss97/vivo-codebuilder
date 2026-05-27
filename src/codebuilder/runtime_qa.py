@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 import json
 import logging
 import re
@@ -109,8 +110,8 @@ def validate_plan(plan: Plan | None) -> Plan:
         raise ValueError("Planner did not return a valid Plan object.")
 
     issues: list[str] = []
-    if not 1 <= len(plan.subtasks) <= 15:
-        issues.append("plan must contain between 1 and 15 subtasks")
+    if not 1 <= len(plan.subtasks) <= 60:
+        issues.append("plan must contain between 1 and 60 subtasks")
     for subtask in plan.subtasks:
         if not subtask.file_path.strip():
             issues.append(f"subtask {subtask.id} has an empty file_path")
@@ -155,6 +156,7 @@ def run_deterministic_review(
     artifact: CodeArtifact,
     build_dir: str,
     *,
+    existing_snapshot: str = "",
     lint_runner: Any | None = None,
     test_runner: Any | None = None,
 ) -> DeterministicReview:
@@ -188,6 +190,18 @@ def run_deterministic_review(
             issues.append(
                 f"Workspace file '{artifact.file_path}' does not match CodeArtifact.content."
             )
+
+    if (
+        subtask.change_type == "modify"
+        and existing_snapshot
+        and actual
+        and actual.strip() == existing_snapshot.strip()
+    ):
+        issues.append(
+            f"Modify subtask '{subtask.id}' produced no change: "
+            f"'{artifact.file_path}' is identical to the pre-existing file. "
+            "Re-read the file, apply the described transformation, and return the modified content."
+        )
 
     content_to_check = actual or artifact.content
     if looks_like_placeholder(content_to_check):
@@ -370,6 +384,137 @@ def _rpa_full_gate(build_dir: str, plan: Plan | None) -> ReviewResult:
 _ARCHITECTURE_GATES: dict[str, Any] = {
     "rpa": _rpa_full_gate,
 }
+
+
+def _own_top_packages(build_dir: Path) -> list[str]:
+    """Return top-level Python package names that belong to *this* project.
+
+    Looks under ``build_dir/src/<pkg>/__init__.py`` first (src layout) and
+    falls back to ``build_dir/<pkg>/__init__.py`` for flat layouts. Anything
+    outside this list is treated as external by the import-completeness gate.
+    """
+    candidates: list[str] = []
+    src_dir = build_dir / "src"
+    roots = [src_dir, build_dir] if src_dir.is_dir() else [build_dir]
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for child in root.iterdir():
+            if child.is_dir() and (child / "__init__.py").is_file():
+                candidates.append(child.name)
+    return candidates
+
+
+def _resolve_local_module(
+    module: str, build_dir: Path, own_packages: set[str]
+) -> Path | None:
+    """Return the candidate file path for a module if it should resolve here.
+
+    Returns ``None`` when the module's top-level package is not one of the
+    project's own packages (stdlib / third-party / external lib reference).
+    Otherwise returns the *expected* file Path even if it does not exist —
+    the caller decides what to do with a missing file.
+    """
+    if not module:
+        return None
+    top = module.split(".")[0]
+    if top not in own_packages:
+        return None
+    rel = Path(*module.split("."))
+    src_dir = build_dir / "src"
+    for root in (src_dir, build_dir):
+        if not root.is_dir():
+            continue
+        candidate_file = (root / rel).with_suffix(".py")
+        candidate_pkg = root / rel / "__init__.py"
+        if candidate_file.is_file() or candidate_pkg.is_file():
+            return candidate_file if candidate_file.exists() else candidate_pkg
+        if (root / top).is_dir():
+            return candidate_file
+    return None
+
+
+def run_import_completeness_gate(
+    build_dir: str, plan: Plan | None
+) -> tuple[list[str], list[SubTask]]:
+    """Detect project-local imports that point to modules that were never generated.
+
+    Walks every ``.py`` under ``build_dir`` and parses imports with ``ast``.
+    Only flags imports whose top-level package matches one of the project's
+    own packages AND that does not appear in ``plan.external_packages``.
+    Returns ``(missing_paths, stub_subtasks)`` where ``stub_subtasks`` has at
+    most :data:`_MAX_STUB_SUBTASKS` entries the caller can feed back through
+    ``_build_subtask``.
+    """
+    root = Path(build_dir)
+    if not root.is_dir():
+        return [], []
+
+    own_packages = set(_own_top_packages(root))
+    if not own_packages:
+        return [], []
+
+    external = {pkg for pkg in (plan.external_packages if plan else []) if pkg}
+    own_packages -= external
+
+    missing: dict[str, set[str]] = {}
+    for py_file in root.rglob("*.py"):
+        try:
+            tree = ast.parse(py_file.read_text(encoding="utf-8", errors="replace"))
+        except SyntaxError:
+            continue
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.ImportFrom) or not node.module:
+                continue
+            if node.level:
+                continue  # relative imports — skip, they resolve at runtime
+            resolved = _resolve_local_module(node.module, root, own_packages)
+            if resolved is None or resolved.exists():
+                continue
+            try:
+                rel_path = resolved.relative_to(root)
+            except ValueError:
+                continue
+            symbols = {alias.name for alias in node.names if alias.name != "*"}
+            missing.setdefault(str(rel_path), set()).update(symbols)
+
+    if not missing:
+        return [], []
+
+    missing_paths = sorted(missing.keys())
+    stub_subtasks: list[SubTask] = []
+    for i, rel_path in enumerate(missing_paths):
+        if i >= _MAX_STUB_SUBTASKS:
+            break
+        symbols = sorted(missing[rel_path])
+        symbol_list = ", ".join(symbols) if symbols else "(no specific symbols requested)"
+        stub_subtasks.append(
+            SubTask(
+                id=f"stub_{i:02d}",
+                title=f"Generate missing module {rel_path}",
+                description=(
+                    f"Module '{rel_path}' is imported by other project files but was "
+                    f"never generated. Create it now with the symbols importers expect: "
+                    f"{symbol_list}."
+                ),
+                file_path=rel_path,
+                change_type="create",
+                tech_notes=(
+                    f"Required exported symbols: {symbol_list}. "
+                    "Use workspace_read on importers (search the workspace) "
+                    "to confirm signatures before writing."
+                ),
+                test_criteria=(
+                    "File exists, exports the named symbols, passes ruff, and "
+                    "does not cause ModuleNotFoundError at pytest collection."
+                ),
+            )
+        )
+
+    return missing_paths, stub_subtasks
+
+
+_MAX_STUB_SUBTASKS = 8
 
 
 def run_full_architecture_gate(build_dir: str, plan: Plan | None) -> ReviewResult:

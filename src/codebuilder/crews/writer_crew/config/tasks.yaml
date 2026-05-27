@@ -5,6 +5,8 @@ write_task:
     Subtask:
     {subtask}
 
+    Change type: {change_type}
+
     Workspace root: {workspace_dir}
     Relative paths already present in the workspace you should consult before
     writing:
@@ -16,8 +18,25 @@ write_task:
     Prior review feedback to incorporate (only populated on retry; may be empty):
     {prior_review_issues}
 
+    Existing file contents (only populated when change_type == "modify"; empty
+    block means the file is new):
+    -----BEGIN EXISTING FILE-----
+    {existing_contents}
+    -----END EXISTING FILE-----
+
     Rules:
     - Write ONE file whose path is exactly `file_path` from the subtask.
+    - When `change_type` is `modify`:
+        * The file already exists. The block above shows its current contents.
+        * Apply the transformation described in the subtask
+          (`description`/`tech_notes`/amendments) to that content.
+        * Return the COMPLETE modified file in CodeArtifact.content. The
+          returned content MUST differ materially from the existing block.
+          Returning the file unchanged will fail review.
+        * If the existing block looks truncated or stale, call `workspace_read`
+          on `file_path` to confirm the latest content before writing.
+    - When `change_type` is `create`:
+        * The file does not yet exist. Write it from scratch.
     - Include complete, runnable code — no placeholders, no `...`.
     - Follow the conventions in your activated skills (project structure,
       layering, naming, testing patterns) when implementing this file.

@@ -5,7 +5,7 @@ from crewai.project import CrewBase, agent, crew, task
 from crewai.skills import activate_skill, discover_skills
 from crewai_tools import DirectoryReadTool, FileReadTool
 
-from codebuilder.schemas import Plan
+from codebuilder.schemas import Plan, PlanSkeleton
 
 _SKILLS = {
     s.name: activate_skill(s)
@@ -35,9 +35,25 @@ class PlannerCrew:
         )
 
     @task
-    def plan_task(self) -> Task:
+    def skeleton_task(self) -> Task:
         return Task(
-            config=self.tasks_config["plan_task"],  # type: ignore[index]
+            config=self.tasks_config["skeleton_task"],  # type: ignore[index]
+            output_pydantic=PlanSkeleton,
+        )
+
+    @task
+    def review_skeleton_task(self) -> Task:
+        return Task(
+            config=self.tasks_config["review_skeleton_task"],  # type: ignore[index]
+            context=[self.skeleton_task()],
+            output_pydantic=PlanSkeleton,
+        )
+
+    @task
+    def expand_task(self) -> Task:
+        return Task(
+            config=self.tasks_config["expand_task"],  # type: ignore[index]
+            context=[self.review_skeleton_task()],
             output_pydantic=Plan,
         )
 

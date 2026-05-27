@@ -26,14 +26,42 @@ class StrictOutputModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+ChangeType = Literal["create", "modify"]
+
+
 class SubTask(StrictOutputModel):
     id: str
     title: str
     description: str
     file_path: str
+    # "create" for new files, "modify" for files that already exist in the
+    # workspace. Drives the writer prompt branch and the deterministic no-op
+    # guard in run_deterministic_review.
+    change_type: ChangeType = "create"
     depends_on: list[str] = Field(default_factory=list)
     tech_notes: str = ""
     test_criteria: str = ""
+
+
+class FileSkeleton(StrictOutputModel):
+    path: str
+    purpose: str
+    change_type: ChangeType = "create"
+
+
+class PlanSkeleton(StrictOutputModel):
+    project_name: str
+    mode: JobMode
+    domain: str = ""
+    tech_stack: list[str]
+    files: list[FileSkeleton]
+    # Top-level Python package names belonging to reference libraries the user
+    # attached for the writer to consume (not reimplement). The import
+    # completeness gate uses this whitelist to skip "missing module" errors
+    # for these packages.
+    external_packages: list[str] = Field(default_factory=list)
+    open_questions: list[str] = Field(default_factory=list)
+    assumptions: list[str] = Field(default_factory=list)
 
 
 class Plan(StrictOutputModel):
@@ -47,6 +75,8 @@ class Plan(StrictOutputModel):
     # (e.g. "rpa"). When set, finalize dispatches the matching
     # architecture gate; when empty, no domain gate runs.
     domain: str = ""
+    # Carried over from PlanSkeleton — see FileSkeleton/PlanSkeleton docstrings.
+    external_packages: list[str] = Field(default_factory=list)
 
 
 class CodeArtifact(StrictOutputModel):

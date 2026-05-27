@@ -26,8 +26,10 @@ from codebuilder.runtime_qa import (
     run_deterministic_review,
     run_final_qa,
     run_full_architecture_gate,
+    run_import_completeness_gate,
     validate_plan,
 )
+from codebuilder.tools.workspace_tool import WorkspaceListTool, resolve_within
 from codebuilder.schemas import (
     Attachment,
     ArtifactRef,
@@ -39,7 +41,6 @@ from codebuilder.schemas import (
 )
 from codebuilder.tools import attachment_tool, git_tool
 from codebuilder.tools.s3_artifacts import SKIP_DIRS, SKIP_FILES, upload_file, upload_workspace
-from codebuilder.tools.workspace_tool import WorkspaceListTool
 
 
 log = logging.getLogger(__name__)
@@ -290,7 +291,16 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             return self._completion_payload(build_dir)
 
         _emit_progress(self.state, "final_qa_started")
+        self._import_gate_overflow: list[str] = []
+        self._run_import_completeness_pass(build_dir)
         self.state.qa_report = run_final_qa(build_dir)
+        if self._import_gate_overflow and self.state.qa_report:
+            self.state.qa_report.passed = False
+            _append_note(
+                self.state.qa_report,
+                "Import completeness gate found more missing modules than the auto-stub cap "
+                f"could cover. Unresolved paths: {', '.join(self._import_gate_overflow)}.",
+            )
         self._repair_final_qa_if_needed(build_dir)
         if self.state.plan and self.state.plan.mode == "new_project":
             architecture_review = run_full_architecture_gate(build_dir, self.state.plan)
@@ -357,6 +367,50 @@ class CodebuilderFlow(Flow[CodebuilderState]):
         return self._completion_payload(build_dir)
 
     # --- helpers ---------------------------------------------------------
+
+    def _run_import_completeness_pass(self, build_dir: str) -> None:
+        """Detect missing project-local modules and run stub subtasks for them.
+
+        Runs before final QA so cascading ModuleNotFoundError failures during
+        pytest collection get resolved by one writer pass per missing file
+        (capped at 8 stubs). If more than the cap are missing, attaches a
+        note to the QA report once it's generated.
+        """
+        plan = self.state.plan
+        if plan is None:
+            return
+        try:
+            missing_paths, stubs = run_import_completeness_gate(build_dir, plan)
+        except Exception as exc:  # noqa: BLE001 — gate is best-effort, never fatal
+            log.warning("import completeness gate failed: %s", exc)
+            return
+
+        if not missing_paths:
+            return
+
+        log.warning(
+            "import completeness gate found %d missing modules; running %d stub subtask(s)",
+            len(missing_paths),
+            len(stubs),
+        )
+        _emit_progress(
+            self.state,
+            "import_completeness_started",
+            missing_count=len(missing_paths),
+            stub_count=len(stubs),
+        )
+        for i, stub in enumerate(stubs, start=1):
+            self._build_subtask(stub, build_dir, index=i, total=len(stubs))
+
+        overflow = missing_paths[len(stubs):]
+        if overflow:
+            self._import_gate_overflow = overflow
+        _emit_progress(
+            self.state,
+            "import_completeness_completed",
+            stub_count=len(stubs),
+            overflow_count=len(overflow),
+        )
 
     def _repair_final_qa_once(self, build_dir: str, report: QAReport) -> CodeArtifact | None:
         writer = WriterCrew(workspace_dir=build_dir)
@@ -464,6 +518,23 @@ class CodebuilderFlow(Flow[CodebuilderState]):
         reviewer = ReviewerCrew(workspace_dir=build_dir)
         listing_tool = WorkspaceListTool(workspace_dir=build_dir)
 
+        existing_snapshot = ""
+        if subtask.change_type == "modify":
+            try:
+                target = resolve_within(build_dir, subtask.file_path)
+            except ValueError:
+                target = None
+            if target is not None and target.is_file():
+                raw = target.read_text(encoding="utf-8", errors="replace")
+                limit = 12000
+                if len(raw) > limit:
+                    omitted = len(raw) - limit
+                    existing_snapshot = (
+                        f"{raw[:limit]}\n\n[truncated {omitted} chars — call workspace_read for full file]"
+                    )
+                else:
+                    existing_snapshot = raw
+
         prior_issues = ""
         artifact: CodeArtifact | None = None
         review: ReviewResult | None = None
@@ -484,6 +555,8 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             write_result = writer.crew().kickoff(
                 inputs={
                     "subtask": subtask.model_dump_json(indent=2),
+                    "change_type": subtask.change_type,
+                    "existing_contents": existing_snapshot or "(file does not exist yet)",
                     "workspace_dir": build_dir,
                     "workspace_listing": listing_tool._run("."),
                     "amendments": self.state.amendments or "(none)",
@@ -500,7 +573,9 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                 prior_issues = persist_error
                 continue
 
-            deterministic = run_deterministic_review(subtask, artifact, build_dir)
+            deterministic = run_deterministic_review(
+                subtask, artifact, build_dir, existing_snapshot=existing_snapshot
+            )
             review = deterministic.result
             if deterministic.needs_fallback:
                 review_result = reviewer.crew().kickoff(

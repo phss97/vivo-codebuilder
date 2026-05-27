@@ -266,3 +266,28 @@ app-meu-projeto/
 ├── README.md
 └── uv.lock
 ```
+
+### Regra: um módulo = uma responsabilidade
+
+Cada arquivo `.py` deve conter **exatamente uma** classe pública principal
+(entidade, Protocol, caso de uso, service ou adapter). Exemplos concretos:
+
+- `domain/entities/job.py` → `class Job`
+- `domain/entities/work_queue_item.py` → `class WorkQueueItem`
+- `domain/exceptions/job_locked_error.py` → `class JobLockedError(Exception)`
+- `domain/repositories/job_repository.py` → `class JobRepository(Protocol)`
+- `domain/repositories/sap_client.py` → `class SapClient(Protocol)`
+- `domain/repositories/excel_reader.py` → `class ExcelReader(Protocol)`
+- `application/use_cases/process_job.py` → `class ProcessJobUseCase`
+- `application/use_cases/acquire_job_lock.py` → `class AcquireJobLockUseCase`
+- `infrastructure/integrations/excel/excel_invoice_reader.py` → `class ExcelInvoiceReader`
+- `infrastructure/integrations/sap/sap_client_impl.py` → `class SapClientImpl`
+
+Nunca agrupe múltiplas entidades, múltiplos Protocols, múltiplas exceções, nem
+múltiplos casos de uso em um único arquivo. O planner deve emitir um subtask
+separado por arquivo, e o writer deve gerar exatamente um arquivo por
+subtask. Helpers privados (funções `_foo`) ficam no mesmo arquivo da classe
+que os usa — não fragmente por fragmentar. Configuração, logging e glue de
+CLI podem viver em um arquivo coeso por concern; a regra de um-por-arquivo
+vale apenas para entidades, Protocols, exceções, casos de uso, services e
+adapters.
