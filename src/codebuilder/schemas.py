@@ -29,24 +29,26 @@ class StrictOutputModel(BaseModel):
 ChangeType = Literal["create", "modify"]
 
 
-class SubTask(StrictOutputModel):
-    id: str
-    title: str
-    description: str
-    file_path: str
-    # "create" for new files, "modify" for files that already exist in the
-    # workspace. Drives the writer prompt branch and the deterministic no-op
-    # guard in run_deterministic_review.
-    change_type: ChangeType = "create"
-    depends_on: list[str] = Field(default_factory=list)
-    tech_notes: str = ""
-    test_criteria: str = ""
-
-
 class FileSkeleton(StrictOutputModel):
     path: str
     purpose: str
     change_type: ChangeType = "create"
+
+
+class SubTask(StrictOutputModel):
+    id: str
+    title: str
+    description: str
+    # A work package can contain multiple files. The writer returns a
+    # CodeBundleArtifact with one CodeArtifact per planned file.
+    files: list[FileSkeleton]
+    depends_on: list[str] = Field(default_factory=list)
+    tech_notes: str = ""
+    test_criteria: str = ""
+
+    @property
+    def file_paths(self) -> list[str]:
+        return [f.path for f in self.files]
 
 
 class PlanSkeleton(StrictOutputModel):
@@ -85,6 +87,11 @@ class CodeArtifact(StrictOutputModel):
     content: str = ""
     language: str
     tests_included: bool = False
+
+
+class CodeBundleArtifact(StrictOutputModel):
+    subtask_id: str
+    artifacts: list[CodeArtifact]
 
 
 class ReviewResult(StrictOutputModel):

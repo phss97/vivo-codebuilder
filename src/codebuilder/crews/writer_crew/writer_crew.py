@@ -4,7 +4,7 @@ from crewai import Agent, Crew, LLM, Process, Task
 from crewai.project import CrewBase, agent, crew, task
 from crewai.skills import activate_skill, discover_skills
 
-from codebuilder.schemas import CodeArtifact
+from codebuilder.schemas import CodeArtifact, CodeBundleArtifact
 from codebuilder.tools import (
     WorkspaceListTool,
     WorkspaceReadTool,
@@ -19,7 +19,7 @@ _SKILLS = {
 
 @CrewBase
 class WriterCrew:
-    """Writes one file per subtask. Verification happens downstream in the flow."""
+    """Writes one bundle of planned files per subtask."""
 
     agents_config = "config/agents.yaml"
     tasks_config = "config/tasks.yaml"
@@ -37,7 +37,7 @@ class WriterCrew:
     @agent
     def writer(self) -> Agent:
         cfg = self.agents_config["writer"]  # type: ignore[index]
-        # max_tokens=16384 so CodeArtifact.content (full file body) isn't
+        # max_tokens=32768 so CodeBundleArtifact content (full file bodies) isn't
         # truncated against AnthropicCompletion's 4096 default.
         return Agent(
             config=cfg,
@@ -50,7 +50,7 @@ class WriterCrew:
     def write_task(self) -> Task:
         return Task(
             config=self.tasks_config["write_task"],  # type: ignore[index]
-            output_pydantic=CodeArtifact,
+            output_pydantic=CodeBundleArtifact,
         )
 
     def repair_task(self) -> Task:

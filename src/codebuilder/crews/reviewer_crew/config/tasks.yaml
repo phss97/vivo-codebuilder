@@ -1,21 +1,22 @@
 review_task:
   description: >
-    Review this CodeArtifact and decide whether it passes.
+    Review this CodeBundleArtifact and decide whether it passes.
 
     Subtask:
     {subtask}
 
-    Artifact to review:
+    Artifact bundle to review:
     {artifact}
 
     Workspace root: {workspace_dir}
 
-    Use the `workspace_read` and `workspace_list` tools to read the file at
-    `artifact.file_path` and any related files in the workspace. Run the
-    `lint_runner` tool against the artifact path. Apply the acceptance
-    criteria from the `code-review-gate` skill.
+    Use the `workspace_read` and `workspace_list` tools to read every file
+    listed in the bundle and any related files in the workspace. Run the
+    `lint_runner` tool against each artifact path, and run `test_runner` for
+    paths under `tests/`. Apply the acceptance criteria from the
+    `code-review-gate` skill.
   expected_output: >
-    A ReviewResult JSON object with: subtask_id (matching the artifact),
+    A ReviewResult JSON object with: subtask_id (matching the bundle),
     passed (bool), issues (list of concrete problems), suggestions (list of
     recommended improvements).
   agent: reviewer

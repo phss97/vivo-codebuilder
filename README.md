@@ -87,12 +87,12 @@ After the planner runs, the flow pauses and either:
 src/codebuilder/
 ├── main.py                 # CodebuilderFlow: ingest → plan → build → finalize
 ├── runtime_qa.py           # Deterministic review, final QA, and domain architecture gate registry
-├── schemas.py              # Plan, SubTask, CodeArtifact, ReviewResult, QAReport, …
+├── schemas.py              # Plan, SubTask, CodeBundleArtifact, CodeArtifact, ReviewResult, QAReport, …
 ├── history.py              # Per-project SQLite history (observability only)
 ├── feedback_provider.py    # WebhookFeedbackProvider + ConsoleProvider fallback
 ├── crews/
 │   ├── planner_crew/       # FileRead + DirectoryRead; produces a Plan
-│   ├── writer_crew/        # Workspace tools only; produces a CodeArtifact
+│   ├── writer_crew/        # Workspace tools only; produces CodeBundleArtifact bundles
 │   └── reviewer_crew/      # Lint/test + read/list; fallback review + QA task
 ├── tools/
 │   ├── workspace_tool.py   # Sandboxed read/write/list within a job workspace
@@ -118,4 +118,4 @@ uv add <pkg>                 # prefer this over hand-editing pyproject
 - All file I/O from agents is routed through `Workspace*Tool`, which enforces that relative paths cannot escape the job workspace. Never give agents a raw `FileReadTool` pointed at a real filesystem path.
 - Final QA runs deterministic `ruff` + `pytest` across the whole workspace. Skipped lint/tests are failures. If QA fails, the writer gets one repair pass by default, QA reruns, and artifacts are still returned with the final QA status.
 - New-project jobs whose plan declares a `domain` (e.g. `rpa`) also run that domain's architecture gate before completion. For `rpa`, missing orchestrator/producer/consumer, Clean Architecture layers, `.env.example`/CCM config, tests, or traceability marks the job failed even if lint/tests pass. Plans without a registered `domain` finalize on lint/test alone.
-- Crew outputs are validated through pydantic schemas with guardrails (e.g. the planner's `Plan` must have 1–15 subtasks with non-empty `file_path` and `test_criteria`; deterministic review rejects placeholder/TODO-only files).
+- Crew outputs are validated through pydantic schemas with guardrails (e.g. the planner's `Plan` must have 1–24 bundled work packages, each with 1–6 planned files and non-empty `test_criteria`; deterministic review rejects missing/extra bundle paths and placeholder/TODO-only files).

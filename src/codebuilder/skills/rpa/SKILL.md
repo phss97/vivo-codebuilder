@@ -284,10 +284,11 @@ Cada arquivo `.py` deve conter **exatamente uma** classe pública principal
 - `infrastructure/integrations/sap/sap_client_impl.py` → `class SapClientImpl`
 
 Nunca agrupe múltiplas entidades, múltiplos Protocols, múltiplas exceções, nem
-múltiplos casos de uso em um único arquivo. O planner deve emitir um subtask
-separado por arquivo, e o writer deve gerar exatamente um arquivo por
-subtask. Helpers privados (funções `_foo`) ficam no mesmo arquivo da classe
-que os usa — não fragmente por fragmentar. Configuração, logging e glue de
-CLI podem viver em um arquivo coeso por concern; a regra de um-por-arquivo
-vale apenas para entidades, Protocols, exceções, casos de uso, services e
-adapters.
+múltiplos casos de uso em um único arquivo. O planner deve manter um arquivo
+por responsabilidade pública, mas pode agrupar vários arquivos relacionados em
+um mesmo subtask de execução. O writer deve gerar exatamente um artefato por
+arquivo planejado dentro do subtask. Helpers privados (funções `_foo`) ficam no
+mesmo arquivo da classe que os usa — não fragmente por fragmentar.
+Configuração, logging e glue de CLI podem viver em um arquivo coeso por
+concern; a regra de um-por-arquivo vale apenas para entidades, Protocols,
+exceções, casos de uso, services e adapters.

@@ -1,9 +1,8 @@
 skeleton_task:
   description: >
     Produce a flat file-level skeleton for this project. You will NOT write
-    code here — only enumerate the files the Writer agent must create or
-    modify. A separate downstream task will expand each file into a detailed
-    subtask.
+    code here. Enumerate the files the Writer agent must create or modify;
+    a downstream task will bundle those files into cohesive work packages.
 
     Project name: {project_name}
 
@@ -40,26 +39,26 @@ skeleton_task:
       shaping the file list. Activated skills are authoritative for
       project-type rules; do not invent extra structure when no skill calls
       for it.
-    - **Use the MINIMUM number of files that still respects the activated
-      skill's structural rules.** If the skill mandates one class per file
+    - Use the MINIMUM number of files that still respects the activated
+      skill's structural rules. If the skill mandates one class per file
       for a layer (e.g. RPA domain entities, repository Protocols, use
       cases), each such class MUST be its own file. For things the skill
       does NOT mandate splitting (configuration, logging, CLI glue, package
       `__init__.py` files), keep cohesive code in one file. Do not fragment
-      for fragmentation's sake — every extra file is extra latency and
-      surface area for failure. Reasonable RPA project size: 25–45 files.
-      Hard upper bound enforced downstream: 60 subtasks total.
+      for fragmentation's sake.
+    - Do not create package `__init__.py` files for every nested folder by
+      default. Add them only when imports/exports need them or when the
+      target package layout requires them.
     - For each file, emit a FileSkeleton entry: {{path, purpose (1-2
       sentences), change_type}}.
     - `change_type` is "modify" for any file already present in an attached
       repo / zip (only legal in `patch_existing` mode), and "create" for
       every new file. Mixed plans are normal in `patch_existing` mode.
-    - **Identify reference libraries.** If the user attached a library (zip
+    - Identify reference libraries. If the user attached a library (zip
       or git materialized under `inputs/`) clearly intended for the writer
-      to *import from* rather than *reimplement*, record each top-level
-      Python package name in `external_packages`. The import-completeness
-      gate uses this list to stop treating those packages as missing
-      modules.
+      to import from rather than reimplement, record each top-level Python
+      package name in `external_packages`. The import-completeness gate uses
+      this list to stop treating those packages as missing modules.
     - Runtime configuration must come from explicit config files, env-backed
       settings, or a secret-store boundary. Never plan hardcoded
       credentials, tokens, or machine-specific paths.
@@ -77,52 +76,12 @@ skeleton_task:
     (list), open_questions (list), assumptions (list).
   agent: planner
 
-review_skeleton_task:
-  description: >
-    Critique the skeleton produced by the previous task and decide whether
-    to revise it or pass it through. You receive the previous task's output
-    as context.
-
-    Project name: {project_name}
-
-    Brief:
-    {brief}
-
-    Rules:
-    - Cross-check the skeleton against the activated skill's required
-      structure. For the `rpa` domain specifically: every domain entity,
-      every repository Protocol, every application use case MUST be its own
-      file under the layered directory (`domain/entities/<name>.py`,
-      `domain/repositories/<name>.py`, `application/use_cases/<name>.py`).
-      Adapters live under `infrastructure/integrations/<vendor>/<name>.py`.
-      Tests are organised under `tests/unit/<layer>/test_<name>.py`.
-      Scaffolding (`pyproject.toml`, `.env.example`, `README.md`,
-      `src/<pkg>/__main__.py`) must be present.
-    - Flag and fix these common failure modes:
-        * A single `repositories.py` containing multiple Protocols — split
-          into one file per Protocol.
-        * A single `entities.py` or `use_cases.py` containing multiple
-          classes — split into one file per class.
-        * Missing `__init__.py` for any package directory the rest of the
-          plan imports from.
-        * Missing entity / Protocol files that other files in the skeleton
-          appear to import (consumers reference a class that has no file).
-        * Over-fragmentation: one file per private helper function. Keep
-          private helpers in the file that uses them.
-    - If everything looks correct, output the original skeleton UNCHANGED.
-      No bias toward editing — only revise when there is a concrete problem
-      to fix.
-    - When revising: keep `project_name`, `mode`, `domain`, `tech_stack`,
-      `external_packages`, `open_questions`, `assumptions` intact unless
-      the change is genuinely required by the skill. Modify `files` only.
-  expected_output: >
-    A PlanSkeleton JSON object (possibly identical to the input).
-  agent: planner
-
 expand_task:
   description: >
-    Expand the (possibly revised) skeleton into a full Plan with one
-    SubTask per file. You receive the reviewed skeleton as context.
+    Expand the skeleton into a full Plan whose subtasks are bundled work
+    packages. A SubTask is NOT a single file anymore; each SubTask contains
+    `files`, a list of 1 to 6 FileSkeleton entries that should be written
+    together in one Writer kickoff.
 
     Project name: {project_name}
 
@@ -144,59 +103,47 @@ expand_task:
     {amendments}
 
     Rules:
-    - Emit exactly one SubTask per FileSkeleton entry from the reviewed
-      skeleton. Preserve `path` (as `file_path`) and `change_type` exactly
-      as in the skeleton.
+    - Every FileSkeleton entry from the skeleton MUST appear exactly once
+      across the final Plan's `subtasks[*].files`.
     - Copy `mode`, `domain`, `tech_stack`, and `external_packages` from the
       skeleton onto the Plan unchanged.
-    - For each subtask, fill in: id (stable, e.g. `s01`, `s02`, …), title
-      (short), description (what the writer should produce; mention
-      neighbours it will need to coordinate with), tech_notes
-      (implementation specifics — for `modify` subtasks this MUST name the
-      exact symbol to extract / rename / add / remove; the writer has no
-      other way to know what change is required), test_criteria (the
-      acceptance check for this file), depends_on (list of prior SubTask
-      ids).
-    - Include tests for core business behaviour, at least one failure path,
-      and any retry/error semantics implied by the brief. Use the test
-      runner that matches the chosen tech stack. Do not create a dedicated
-      test file for every module by default — use risk-based testing.
-    - Cap: max 60 SubTasks total. Prefer fewer when the skeleton allows.
-    - Subtasks execute in list order. Order them so each subtask has a
-      fair chance to pass lint + tests when it runs:
-        1. Project scaffolding first for `new_project` mode: `pyproject.toml`
-           / package layout files (`src/<pkg>/__init__.py` chain) come
-           before any module that imports from the package.
-        2. Shared primitives (schemas, types, constants, exceptions, base
-           entities) before the modules that consume them.
-        3. Feature modules next (entities → Protocols → adapters → use
-           cases).
-        4. Standalone `tests/` subtasks only for non-trivial business
-           logic, regression-prone behaviour, parsers, persistence, API
-           contracts, or user-facing workflows. For simple config, package
-           init files, thin adapters, README, and glue code, express the
-           acceptance check in `test_criteria` and rely on reviewer
-           inspection plus final lint/QA instead of creating a test file.
-        5. When tests are needed, group them after the related production
-           slice is complete, preferably as a small late QA/testing block
-           before documentation.
-        6. Integration glue (CLI entry point, `__main__.py`) after the
-           features it wires together.
-        7. `README.md` LAST. It documents what actually shipped and can
-           only be accurate once the rest of the plan has executed.
-    - Use `depends_on` only when one subtask truly cannot start before
+    - Target 12-20 work packages for standard RPA projects. Hard cap:
+      max 24 SubTasks total, max 6 files in any one SubTask. Prefer fewer
+      work packages when the files are cohesive and can be safely written
+      together.
+    - Bundle by cohesive engineering slice, not by arbitrary folder count.
+      Good RPA bundles are usually: project scaffold, domain entities,
+      domain exceptions, domain Protocols, application DTOs/services, core
+      use cases, persistence adapters, external integration adapters,
+      producer/consumer/orchestrator wiring, grouped unit tests, grouped
+      integration tests, and README/docs.
+    - Keep tests in dedicated test work packages unless the user explicitly
+      asks otherwise. Group tests by behavior/risk; do not mirror every
+      production file with its own test file.
+    - For each SubTask, fill in: id (stable, e.g. `s01`, `s02`, ...),
+      title (short), description (what the writer should produce across all
+      files), files (the exact FileSkeleton entries), tech_notes
+      (implementation specifics; for `modify` files this MUST name the exact
+      symbol to extract / rename / add / remove), test_criteria (acceptance
+      checks for the whole bundle), depends_on (list of prior SubTask ids).
+    - Order work packages so each package has a fair chance to pass lint
+      and tests when written:
+        1. Project scaffolding and package roots first.
+        2. Shared primitives before modules that consume them.
+        3. Domain files before application use cases.
+        4. Ports/Protocols before infrastructure adapters.
+        5. Use cases before orchestrator/producer/consumer wiring.
+        6. Tests after related production behavior exists.
+        7. README.md last.
+    - Use `depends_on` only when one work package truly cannot start before
       another completes.
-    - For `patch_existing` mode: every `modify` subtask's tech_notes MUST
-      describe the exact transformation: name the symbol to extract, the
-      class to rename, the method to add or remove. The writer has no
-      other way to know what change is required.
     - If the user submitted amendments, fold them into the revised plan.
-      Keep unchanged subtasks stable; only modify what the feedback
+      Keep unchanged work package ids stable; only modify what the feedback
       requires.
   expected_output: >
     A Plan JSON object matching the Plan schema: project_name, mode,
     tech_stack (list), subtasks (list of SubTask, each with id, title,
-    description, file_path, change_type, depends_on, tech_notes,
+    description, files (list of FileSkeleton), depends_on, tech_notes,
     test_criteria), open_questions (list), assumptions (list), domain
     (slug of the architecture-defining skill or empty string),
     external_packages (list).

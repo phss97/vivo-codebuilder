@@ -15,7 +15,7 @@ _SKILLS = {
 
 @CrewBase
 class PlannerCrew:
-    """Plans a project from a brief into atomic Writer-ready subtasks."""
+    """Plans a project from a brief into bundled Writer-ready work packages."""
 
     agents_config = "config/agents.yaml"
     tasks_config = "config/tasks.yaml"
@@ -42,18 +42,10 @@ class PlannerCrew:
         )
 
     @task
-    def review_skeleton_task(self) -> Task:
-        return Task(
-            config=self.tasks_config["review_skeleton_task"],  # type: ignore[index]
-            context=[self.skeleton_task()],
-            output_pydantic=PlanSkeleton,
-        )
-
-    @task
     def expand_task(self) -> Task:
         return Task(
             config=self.tasks_config["expand_task"],  # type: ignore[index]
-            context=[self.review_skeleton_task()],
+            context=[self.skeleton_task()],
             output_pydantic=Plan,
         )
 

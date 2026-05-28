@@ -12,7 +12,9 @@ from typing import Any
 
 from codebuilder.schemas import (
     ArtifactRef,
+    CodeBundleArtifact,
     CodeArtifact,
+    FileSkeleton,
     Plan,
     QAReport,
     ReviewResult,
@@ -24,6 +26,8 @@ from codebuilder.tools.workspace_tool import resolve_within
 log = logging.getLogger(__name__)
 
 MAX_QA_OUTPUT_CHARS = 12000
+MAX_WORK_PACKAGES = 24
+MAX_FILES_PER_WORK_PACKAGE = 6
 
 _TODO_TOKEN_RE = re.compile(r"\b(todo|fixme|placeholder|stub)\b", re.IGNORECASE)
 _PLACEHOLDER_LINE_RE = re.compile(
@@ -105,16 +109,80 @@ def persist_artifact(artifact: CodeArtifact, build_dir: str) -> str:
     )
 
 
+def _bundle_path_issues(bundle: CodeBundleArtifact, subtask: SubTask) -> list[str]:
+    issues: list[str] = []
+    if bundle.subtask_id != subtask.id:
+        issues.append(
+            f"Bundle subtask_id '{bundle.subtask_id}' does not match planned subtask '{subtask.id}'."
+        )
+
+    expected_paths = [f.path for f in subtask.files]
+    actual_paths = [a.file_path for a in bundle.artifacts]
+    expected_set = set(expected_paths)
+    actual_set = set(actual_paths)
+
+    duplicate_expected = sorted({p for p in expected_paths if expected_paths.count(p) > 1})
+    duplicate_actual = sorted({p for p in actual_paths if actual_paths.count(p) > 1})
+    for path in duplicate_expected:
+        issues.append(f"duplicate planned file path: {path}")
+    for path in duplicate_actual:
+        issues.append(f"duplicate artifact path: {path}")
+    for path in sorted(expected_set - actual_set):
+        issues.append(f"missing planned artifact: {path}")
+    for path in sorted(actual_set - expected_set):
+        issues.append(f"unexpected artifact path: {path}")
+
+    for artifact in bundle.artifacts:
+        if artifact.subtask_id != subtask.id:
+            issues.append(
+                f"Artifact {artifact.file_path} subtask_id '{artifact.subtask_id}' "
+                f"does not match planned subtask '{subtask.id}'."
+            )
+    return issues
+
+
+def persist_bundle_artifact(
+    bundle: CodeBundleArtifact,
+    subtask: SubTask,
+    build_dir: str,
+) -> list[str]:
+    """Persist a writer bundle only when its paths exactly match the plan."""
+    issues = _bundle_path_issues(bundle, subtask)
+    if issues:
+        return issues
+
+    errors: list[str] = []
+    for artifact in bundle.artifacts:
+        error = persist_artifact(artifact, build_dir)
+        if error:
+            errors.append(error)
+    return errors
+
+
 def validate_plan(plan: Plan | None) -> Plan:
     if not isinstance(plan, Plan):
         raise ValueError("Planner did not return a valid Plan object.")
 
     issues: list[str] = []
-    if not 1 <= len(plan.subtasks) <= 60:
-        issues.append("plan must contain between 1 and 60 subtasks")
+    if not 1 <= len(plan.subtasks) <= MAX_WORK_PACKAGES:
+        issues.append(f"plan must contain between 1 and {MAX_WORK_PACKAGES} work packages")
+    seen_paths: set[str] = set()
     for subtask in plan.subtasks:
-        if not subtask.file_path.strip():
-            issues.append(f"subtask {subtask.id} has an empty file_path")
+        if not subtask.files:
+            issues.append(f"subtask {subtask.id} must contain at least one file")
+        if len(subtask.files) > MAX_FILES_PER_WORK_PACKAGE:
+            issues.append(
+                f"subtask {subtask.id} contains {len(subtask.files)} files; "
+                f"work packages may contain at most {MAX_FILES_PER_WORK_PACKAGE} files"
+            )
+        for planned_file in subtask.files:
+            if not planned_file.path.strip():
+                issues.append(f"subtask {subtask.id} has an empty file path")
+            if not planned_file.purpose.strip():
+                issues.append(f"subtask {subtask.id} file {planned_file.path!r} has empty purpose")
+            if planned_file.path in seen_paths:
+                issues.append(f"duplicate planned file path: {planned_file.path}")
+            seen_paths.add(planned_file.path)
         if not subtask.test_criteria.strip():
             issues.append(f"subtask {subtask.id} has empty test_criteria")
     if issues:
@@ -134,7 +202,7 @@ def plan_summary(plan: Plan | None) -> str:
                 {
                     "id": s.id,
                     "title": s.title,
-                    "file_path": s.file_path,
+                    "files": [f.model_dump() for f in s.files],
                     "test_criteria": s.test_criteria,
                 }
                 for s in plan.subtasks
@@ -156,6 +224,7 @@ def run_deterministic_review(
     artifact: CodeArtifact,
     build_dir: str,
     *,
+    planned_file: FileSkeleton | None = None,
     existing_snapshot: str = "",
     lint_runner: Any | None = None,
     test_runner: Any | None = None,
@@ -168,9 +237,18 @@ def run_deterministic_review(
         issues.append(
             f"Artifact subtask_id '{artifact.subtask_id}' does not match planned subtask '{subtask.id}'."
         )
-    if artifact.file_path != subtask.file_path:
+    if planned_file is None:
+        matching = [f for f in subtask.files if f.path == artifact.file_path]
+        planned_file = matching[0] if matching else (subtask.files[0] if len(subtask.files) == 1 else None)
+
+    if planned_file is None:
         issues.append(
-            f"Artifact file_path '{artifact.file_path}' does not match planned path '{subtask.file_path}'."
+            f"Artifact file_path '{artifact.file_path}' is not one of planned paths: "
+            f"{', '.join(subtask.file_paths)}."
+        )
+    elif artifact.file_path != planned_file.path:
+        issues.append(
+            f"Artifact file_path '{artifact.file_path}' does not match planned path '{planned_file.path}'."
         )
 
     try:
@@ -192,7 +270,8 @@ def run_deterministic_review(
             )
 
     if (
-        subtask.change_type == "modify"
+        planned_file is not None
+        and planned_file.change_type == "modify"
         and existing_snapshot
         and actual
         and actual.strip() == existing_snapshot.strip()
@@ -233,6 +312,53 @@ def run_deterministic_review(
             subtask_id=subtask.id,
             passed=True,
             suggestions=["Deterministic path, content, lint, and test checks passed."],
+        )
+    )
+
+
+def run_bundle_deterministic_review(
+    subtask: SubTask,
+    bundle: CodeBundleArtifact,
+    build_dir: str,
+    *,
+    existing_snapshots: dict[str, str] | None = None,
+    lint_runner: Any | None = None,
+    test_runner: Any | None = None,
+) -> DeterministicReview:
+    """Review every artifact in a bundled work package."""
+    issues = _bundle_path_issues(bundle, subtask)
+    if issues:
+        return DeterministicReview(
+            ReviewResult(subtask_id=subtask.id, passed=False, issues=issues)
+        )
+
+    planned_by_path = {f.path: f for f in subtask.files}
+    snapshots = existing_snapshots or {}
+    suggestions: list[str] = []
+    for artifact in bundle.artifacts:
+        review = run_deterministic_review(
+            subtask,
+            artifact,
+            build_dir,
+            planned_file=planned_by_path[artifact.file_path],
+            existing_snapshot=snapshots.get(artifact.file_path, ""),
+            lint_runner=lint_runner,
+            test_runner=test_runner,
+        )
+        if not review.result.passed:
+            issues.extend(review.result.issues)
+        suggestions.extend(review.result.suggestions)
+
+    if issues:
+        return DeterministicReview(
+            ReviewResult(subtask_id=subtask.id, passed=False, issues=issues)
+        )
+    return DeterministicReview(
+        ReviewResult(
+            subtask_id=subtask.id,
+            passed=True,
+            suggestions=suggestions
+            or ["Deterministic bundle path, content, lint, and test checks passed."],
         )
     )
 
@@ -497,8 +623,13 @@ def run_import_completeness_gate(
                     f"never generated. Create it now with the symbols importers expect: "
                     f"{symbol_list}."
                 ),
-                file_path=rel_path,
-                change_type="create",
+                files=[
+                    FileSkeleton(
+                        path=rel_path,
+                        purpose=f"Missing module exporting: {symbol_list}.",
+                        change_type="create",
+                    )
+                ],
                 tech_notes=(
                     f"Required exported symbols: {symbol_list}. "
                     "Use workspace_read on importers (search the workspace) "

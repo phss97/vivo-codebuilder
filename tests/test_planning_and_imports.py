@@ -8,6 +8,7 @@ from codebuilder.runtime_qa import (
     validate_plan,
 )
 from codebuilder.schemas import (
+    CodeBundleArtifact,
     CodeArtifact,
     FileSkeleton,
     Plan,
@@ -29,8 +30,13 @@ def _modify_subtask(file_path: str = "src/pkg/svc.py") -> SubTask:
         id="s1",
         title="Modify file",
         description="Apply transformation.",
-        file_path=file_path,
-        change_type="modify",
+        files=[
+            FileSkeleton(
+                path=file_path,
+                purpose="Existing service module to modify.",
+                change_type="modify",
+            )
+        ],
         tech_notes="Extract method foo into helper.",
         test_criteria="Deterministic checks pass.",
     )
@@ -48,15 +54,39 @@ def _write_artifact(tmp_path: Path, path: str, content: str) -> CodeArtifact:
     )
 
 
-def test_subtask_default_change_type_is_create() -> None:
+def test_subtask_groups_planned_files() -> None:
     subtask = SubTask(
         id="s1",
         title="x",
         description="x",
-        file_path="x.py",
+        files=[FileSkeleton(path="x.py", purpose="x")],
         test_criteria="x",
     )
-    assert subtask.change_type == "create"
+    assert subtask.files[0].change_type == "create"
+
+
+def test_code_bundle_artifact_roundtrip() -> None:
+    bundle = CodeBundleArtifact(
+        subtask_id="s1",
+        artifacts=[
+            CodeArtifact(
+                subtask_id="s1",
+                file_path="src/pkg/a.py",
+                content="A = 1\n",
+                language="python",
+            ),
+            CodeArtifact(
+                subtask_id="s1",
+                file_path="src/pkg/b.py",
+                content="B = 2\n",
+                language="python",
+            ),
+        ],
+    )
+
+    restored = CodeBundleArtifact.model_validate_json(bundle.model_dump_json())
+
+    assert [a.file_path for a in restored.artifacts] == ["src/pkg/a.py", "src/pkg/b.py"]
 
 
 def test_deterministic_review_fails_when_modify_produces_noop(tmp_path: Path) -> None:
@@ -105,7 +135,13 @@ def test_import_gate_flags_missing_own_package_module(tmp_path: Path) -> None:
         mode="new_project",
         tech_stack=["python"],
         subtasks=[
-            SubTask(id="s1", title="t", description="d", file_path="src/myproj/use_cases.py", test_criteria="t")
+            SubTask(
+                id="s1",
+                title="t",
+                description="d",
+                files=[FileSkeleton(path="src/myproj/use_cases.py", purpose="Use cases.")],
+                test_criteria="t",
+            )
         ],
     )
 
@@ -114,8 +150,8 @@ def test_import_gate_flags_missing_own_package_module(tmp_path: Path) -> None:
     assert any("entities" in p for p in missing), missing
     assert len(stubs) >= 1
     stub = stubs[0]
-    assert "entities" in stub.file_path
-    assert stub.change_type == "create"
+    assert "entities" in stub.files[0].path
+    assert stub.files[0].change_type == "create"
     assert "Job" in stub.description
 
 
@@ -133,7 +169,13 @@ def test_import_gate_skips_external_packages(tmp_path: Path) -> None:
         mode="new_project",
         tech_stack=["python"],
         subtasks=[
-            SubTask(id="s1", title="t", description="d", file_path="src/myproj/foo.py", test_criteria="t")
+            SubTask(
+                id="s1",
+                title="t",
+                description="d",
+                files=[FileSkeleton(path="src/myproj/foo.py", purpose="Foo module.")],
+                test_criteria="t",
+            )
         ],
         external_packages=["app_internal_sdk"],
     )
@@ -157,7 +199,13 @@ def test_import_gate_ignores_unknown_top_packages(tmp_path: Path) -> None:
         mode="new_project",
         tech_stack=["python"],
         subtasks=[
-            SubTask(id="s1", title="t", description="d", file_path="src/myproj/foo.py", test_criteria="t")
+            SubTask(
+                id="s1",
+                title="t",
+                description="d",
+                files=[FileSkeleton(path="src/myproj/foo.py", purpose="Foo module.")],
+                test_criteria="t",
+            )
         ],
     )
 
@@ -180,7 +228,13 @@ def test_import_gate_caps_stubs_at_eight(tmp_path: Path) -> None:
         mode="new_project",
         tech_stack=["python"],
         subtasks=[
-            SubTask(id="s1", title="t", description="d", file_path="src/myproj/use_cases.py", test_criteria="t")
+            SubTask(
+                id="s1",
+                title="t",
+                description="d",
+                files=[FileSkeleton(path="src/myproj/use_cases.py", purpose="Use cases.")],
+                test_criteria="t",
+            )
         ],
     )
 
@@ -189,16 +243,16 @@ def test_import_gate_caps_stubs_at_eight(tmp_path: Path) -> None:
     assert len(stubs) == 8
 
 
-def test_validate_plan_accepts_up_to_60_subtasks() -> None:
+def test_validate_plan_accepts_up_to_24_work_packages() -> None:
     subtasks = [
         SubTask(
             id=f"s{i:02d}",
             title="t",
             description="d",
-            file_path=f"src/pkg/f{i}.py",
+            files=[FileSkeleton(path=f"src/pkg/f{i}.py", purpose="Module.")],
             test_criteria="t",
         )
-        for i in range(50)
+        for i in range(24)
     ]
     plan = Plan(
         project_name="x",
@@ -207,6 +261,58 @@ def test_validate_plan_accepts_up_to_60_subtasks() -> None:
         subtasks=subtasks,
     )
     assert validate_plan(plan) is plan
+
+
+def test_validate_plan_rejects_oversized_work_package() -> None:
+    subtask = SubTask(
+        id="s1",
+        title="Too large",
+        description="d",
+        files=[
+            FileSkeleton(path=f"src/pkg/f{i}.py", purpose="Module.")
+            for i in range(7)
+        ],
+        test_criteria="t",
+    )
+    plan = Plan(project_name="x", mode="new_project", tech_stack=["python"], subtasks=[subtask])
+
+    try:
+        validate_plan(plan)
+    except ValueError as exc:
+        assert "at most 6 files" in str(exc)
+    else:
+        raise AssertionError("oversized work package was accepted")
+
+
+def test_validate_plan_rejects_duplicate_planned_file_paths() -> None:
+    plan = Plan(
+        project_name="x",
+        mode="new_project",
+        tech_stack=["python"],
+        subtasks=[
+            SubTask(
+                id="s1",
+                title="a",
+                description="d",
+                files=[FileSkeleton(path="src/pkg/shared.py", purpose="Module.")],
+                test_criteria="t",
+            ),
+            SubTask(
+                id="s2",
+                title="b",
+                description="d",
+                files=[FileSkeleton(path="src/pkg/shared.py", purpose="Module.")],
+                test_criteria="t",
+            ),
+        ],
+    )
+
+    try:
+        validate_plan(plan)
+    except ValueError as exc:
+        assert "duplicate planned file path" in str(exc)
+    else:
+        raise AssertionError("duplicate planned path was accepted")
 
 
 def test_plan_skeleton_roundtrip() -> None:

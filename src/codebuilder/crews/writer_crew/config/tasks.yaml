@@ -1,6 +1,7 @@
 write_task:
   description: >
-    Implement this subtask by writing the full contents of a single file.
+    Implement this bundled work package by writing the full contents of every
+    planned file in the subtask.
 
     Subtask:
     {subtask}
@@ -18,45 +19,39 @@ write_task:
     Prior review feedback to incorporate (only populated on retry; may be empty):
     {prior_review_issues}
 
-    Existing file contents (only populated when change_type == "modify"; empty
-    block means the file is new):
-    -----BEGIN EXISTING FILE-----
+    Existing planned file contents (only populated for planned files whose
+    change_type is "modify"):
     {existing_contents}
-    -----END EXISTING FILE-----
 
     Rules:
-    - Write ONE file whose path is exactly `file_path` from the subtask.
-    - When `change_type` is `modify`:
-        * The file already exists. The block above shows its current contents.
+    - Return exactly one CodeArtifact per entry in `subtask.files`.
+    - Each CodeArtifact.file_path MUST exactly match one planned file path.
+      Do not create extra files, omit planned files, or rename paths.
+    - For each file with `change_type` = "modify":
         * Apply the transformation described in the subtask
-          (`description`/`tech_notes`/amendments) to that content.
-        * Return the COMPLETE modified file in CodeArtifact.content. The
-          returned content MUST differ materially from the existing block.
-          Returning the file unchanged will fail review.
+          (`description`/`tech_notes`/amendments) to that file.
+        * Return the COMPLETE modified file in CodeArtifact.content.
+        * The returned content MUST differ materially from the existing
+          content for that file. Returning the file unchanged will fail review.
         * If the existing block looks truncated or stale, call `workspace_read`
-          on `file_path` to confirm the latest content before writing.
-    - When `change_type` is `create`:
-        * The file does not yet exist. Write it from scratch.
+          on that file path to confirm the latest content before writing.
+    - For each file with `change_type` = "create", write it from scratch.
     - Include complete, runnable code — no placeholders, no `...`.
     - Follow the conventions in your activated skills (project structure,
-      layering, naming, testing patterns) when implementing this file.
-      Activated skills are authoritative for domain-specific rules; do not
-      mix concerns the skill says should be separated.
-    - Runtime configuration must come from explicit config objects, env-backed
-      settings, or secret-store adapter boundaries. Never hardcode secrets,
-      credentials, tokens, or local absolute paths.
-    - Do NOT embed tests inside a production module. Tests belong in a
-      `tests/` file, which the planner schedules as its own subtask. If
-      `file_path` is under `tests/`, write tests there; otherwise write
-      production code only.
-    - Return the FULL file text in CodeArtifact.content. The orchestrator
-      persists it to the workspace — you do NOT need to call
-      `workspace_write` to save the final file. Use `workspace_read` and
+      layering, naming, testing patterns). Activated skills are authoritative
+      for domain-specific rules.
+    - Do NOT embed tests inside a production module. If a planned file path is
+      under `tests/`, write tests there; otherwise write production or support
+      code only.
+    - Return the FULL file text for every artifact in CodeArtifact.content.
+      The orchestrator persists the bundle to disk — you do NOT need to call
+      `workspace_write` to save the final files. Use `workspace_read` and
       `workspace_list` to inspect adjacent files first when helpful.
   expected_output: >
-    A CodeArtifact JSON object with: subtask_id, file_path (must match the
-    subtask), content set to the COMPLETE file text (non-empty), language,
-    tests_included.
+    A CodeBundleArtifact JSON object with: subtask_id, artifacts (list of
+    CodeArtifact). Each CodeArtifact must include subtask_id, file_path
+    matching one planned path, content set to the COMPLETE file text,
+    language, and tests_included.
   agent: writer
 
 repair_task:

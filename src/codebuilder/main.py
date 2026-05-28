@@ -21,9 +21,10 @@ from codebuilder.runtime_qa import (
     artifact_refs,
     looks_like_placeholder,
     persist_artifact,
+    persist_bundle_artifact,
     plan_summary,
     qa_report_for_repair,
-    run_deterministic_review,
+    run_bundle_deterministic_review,
     run_final_qa,
     run_full_architecture_gate,
     run_import_completeness_gate,
@@ -33,6 +34,7 @@ from codebuilder.tools.workspace_tool import WorkspaceListTool, resolve_within
 from codebuilder.schemas import (
     Attachment,
     ArtifactRef,
+    CodeBundleArtifact,
     CodeArtifact,
     CodebuilderState,
     QAReport,
@@ -516,10 +518,12 @@ class CodebuilderFlow(Flow[CodebuilderState]):
         reviewer = ReviewerCrew(workspace_dir=build_dir)
         listing_tool = WorkspaceListTool(workspace_dir=build_dir)
 
-        existing_snapshot = ""
-        if subtask.change_type == "modify":
+        existing_snapshots: dict[str, str] = {}
+        for planned_file in subtask.files:
+            if planned_file.change_type != "modify":
+                continue
             try:
-                target = resolve_within(build_dir, subtask.file_path)
+                target = resolve_within(build_dir, planned_file.path)
             except ValueError:
                 target = None
             if target is not None and target.is_file():
@@ -527,23 +531,33 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                 limit = 12000
                 if len(raw) > limit:
                     omitted = len(raw) - limit
-                    existing_snapshot = (
+                    existing_snapshots[planned_file.path] = (
                         f"{raw[:limit]}\n\n[truncated {omitted} chars — call workspace_read for full file]"
                     )
                 else:
-                    existing_snapshot = raw
+                    existing_snapshots[planned_file.path] = raw
 
         prior_issues = ""
-        artifact: CodeArtifact | None = None
+        bundle: CodeBundleArtifact | None = None
         review: ReviewResult | None = None
         attempts = 0
+        file_paths = subtask.file_paths
+        primary_file_path = file_paths[0] if file_paths else ""
+        existing_contents = (
+            "\n\n".join(
+                f"-----BEGIN EXISTING FILE: {path}-----\n{content}\n-----END EXISTING FILE: {path}-----"
+                for path, content in existing_snapshots.items()
+            )
+            or "(no pre-existing planned files)"
+        )
 
         _emit_progress(
             self.state,
             "subtask_started",
             subtask_id=subtask.id,
             title=subtask.title,
-            file_path=subtask.file_path,
+            file_path=primary_file_path,
+            file_paths=file_paths,
             index=index,
             total=total,
         )
@@ -553,33 +567,43 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             write_result = writer.crew().kickoff(
                 inputs={
                     "subtask": subtask.model_dump_json(indent=2),
-                    "change_type": subtask.change_type,
-                    "existing_contents": existing_snapshot or "(file does not exist yet)",
+                    "change_type": "bundle",
+                    "existing_contents": existing_contents,
                     "workspace_dir": build_dir,
                     "workspace_listing": listing_tool._run("."),
                     "amendments": self.state.amendments or "(none)",
                     "prior_review_issues": prior_issues or "(none)",
                 }
             )
-            artifact = write_result.pydantic if isinstance(write_result.pydantic, CodeArtifact) else None
-            if artifact is None:
-                prior_issues = "Writer did not return a valid CodeArtifact; try again and emit the schema exactly."
+            bundle = (
+                write_result.pydantic
+                if isinstance(write_result.pydantic, CodeBundleArtifact)
+                else None
+            )
+            if bundle is None:
+                prior_issues = (
+                    "Writer did not return a valid CodeBundleArtifact; "
+                    "try again and emit the schema exactly."
+                )
                 continue
 
-            persist_error = persist_artifact(artifact, build_dir)
-            if persist_error:
-                prior_issues = persist_error
+            persist_errors = persist_bundle_artifact(bundle, subtask, build_dir)
+            if persist_errors:
+                prior_issues = "\n".join(persist_errors)
                 continue
 
-            deterministic = run_deterministic_review(
-                subtask, artifact, build_dir, existing_snapshot=existing_snapshot
+            deterministic = run_bundle_deterministic_review(
+                subtask,
+                bundle,
+                build_dir,
+                existing_snapshots=existing_snapshots,
             )
             review = deterministic.result
             if deterministic.needs_fallback:
                 review_result = reviewer.crew().kickoff(
                     inputs={
                         "subtask": subtask.model_dump_json(indent=2),
-                        "artifact": artifact.model_dump_json(indent=2),
+                        "artifact": bundle.model_dump_json(indent=2),
                         "workspace_dir": build_dir,
                     }
                 )
@@ -606,8 +630,8 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                 break
             prior_issues = next_issues
 
-        if artifact is not None:
-            self.state.artifacts.append(artifact)
+        if bundle is not None:
+            self.state.artifacts.extend(bundle.artifacts)
         if review is not None:
             self.state.review_results.append(review)
 
@@ -617,7 +641,8 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                 "subtask_completed",
                 subtask_id=subtask.id,
                 title=subtask.title,
-                file_path=subtask.file_path,
+                file_path=primary_file_path,
+                file_paths=file_paths,
                 index=index,
                 total=total,
                 attempts=attempts,
@@ -628,7 +653,8 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                 "subtask_failed",
                 subtask_id=subtask.id,
                 title=subtask.title,
-                file_path=subtask.file_path,
+                file_path=primary_file_path,
+                file_paths=file_paths,
                 index=index,
                 total=total,
                 attempts=attempts,

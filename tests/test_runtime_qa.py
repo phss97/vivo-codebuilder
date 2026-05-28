@@ -6,12 +6,22 @@ from types import SimpleNamespace
 import codebuilder.main as main
 from codebuilder.main import CodebuilderFlow
 from codebuilder.runtime_qa import (
+    persist_bundle_artifact,
     run_deterministic_review,
+    run_bundle_deterministic_review,
     run_final_qa,
     run_full_architecture_gate,
     run_rpa_deterministic_gate,
 )
-from codebuilder.schemas import ArtifactRef, CodeArtifact, Plan, QAReport, SubTask
+from codebuilder.schemas import (
+    ArtifactRef,
+    CodeArtifact,
+    CodeBundleArtifact,
+    FileSkeleton,
+    Plan,
+    QAReport,
+    SubTask,
+)
 from codebuilder.tools import attachment_tool
 from codebuilder.tools.lint_runner_tool import LintRunnerTool, TestRunnerTool as CodebuilderTestRunnerTool
 
@@ -31,7 +41,7 @@ def _subtask(path: str = "hello.py") -> SubTask:
         id="s1",
         title="Write file",
         description="Create the requested file.",
-        file_path=path,
+        files=[FileSkeleton(path=path, purpose="Requested file.")],
         test_criteria="Deterministic checks pass.",
     )
 
@@ -197,6 +207,98 @@ def test_deterministic_review_rejects_test_skip_for_test_file(tmp_path: Path) ->
     assert "required quality gate skipped" in "\n".join(review.result.issues)
 
 
+def test_persist_bundle_rejects_missing_extra_and_duplicate_paths(tmp_path: Path) -> None:
+    subtask = SubTask(
+        id="s1",
+        title="Bundle",
+        description="Create bundle.",
+        files=[
+            FileSkeleton(path="hello.py", purpose="Hello module."),
+            FileSkeleton(path="goodbye.py", purpose="Goodbye module."),
+        ],
+        test_criteria="Deterministic checks pass.",
+    )
+    bundle = CodeBundleArtifact(
+        subtask_id="s1",
+        artifacts=[
+            CodeArtifact(
+                subtask_id="s1",
+                file_path="hello.py",
+                content='print("hello")\n',
+                language="python",
+            ),
+            CodeArtifact(
+                subtask_id="s1",
+                file_path="hello.py",
+                content='print("dupe")\n',
+                language="python",
+            ),
+            CodeArtifact(
+                subtask_id="s1",
+                file_path="extra.py",
+                content='print("extra")\n',
+                language="python",
+            ),
+        ],
+    )
+
+    issues = persist_bundle_artifact(bundle, subtask, str(tmp_path))
+
+    joined = "\n".join(issues)
+    assert "missing planned artifact" in joined
+    assert "unexpected artifact path" in joined
+    assert "duplicate artifact path" in joined
+    assert not (tmp_path / "hello.py").exists()
+    assert not (tmp_path / "extra.py").exists()
+
+
+def test_bundle_deterministic_review_passes_each_file(tmp_path: Path) -> None:
+    subtask = SubTask(
+        id="s1",
+        title="Bundle",
+        description="Create bundle.",
+        files=[
+            FileSkeleton(path="hello.py", purpose="Hello module."),
+            FileSkeleton(path="tests/test_hello.py", purpose="Hello tests."),
+        ],
+        test_criteria="Deterministic checks pass.",
+    )
+    bundle = CodeBundleArtifact(
+        subtask_id="s1",
+        artifacts=[
+            CodeArtifact(
+                subtask_id="s1",
+                file_path="hello.py",
+                content='def greet() -> str:\n    return "hello"\n',
+                language="python",
+            ),
+            CodeArtifact(
+                subtask_id="s1",
+                file_path="tests/test_hello.py",
+                content="from hello import greet\n\n\ndef test_greet():\n    assert greet() == 'hello'\n",
+                language="python",
+                tests_included=True,
+            ),
+        ],
+    )
+    persist_issues = persist_bundle_artifact(bundle, subtask, str(tmp_path))
+    assert persist_issues == []
+    lint = FakeTool("PASS")
+    tests = FakeTool("PASS\n1 passed")
+
+    review = run_bundle_deterministic_review(
+        subtask,
+        bundle,
+        str(tmp_path),
+        lint_runner=lint,
+        test_runner=tests,
+    )
+
+    assert review.result.passed is True, review.result.issues
+    assert lint.calls == ["hello.py", "tests/test_hello.py"]
+    assert tests.calls == ["tests/test_hello.py"]
+
+
 def test_final_qa_fails_when_pytest_collects_no_tests() -> None:
     qa = run_final_qa(
         "/unused",
@@ -231,7 +333,7 @@ def _empty_plan(domain: str = "") -> Plan:
                 id="s1",
                 title="t",
                 description="d",
-                file_path="src/demo/__init__.py",
+                files=[FileSkeleton(path="src/demo/__init__.py", purpose="Package init.")],
                 test_criteria="exists",
             )
         ],
@@ -313,6 +415,64 @@ def test_emit_progress_posts_configured_webhook(monkeypatch) -> None:
             "timeout": main.PROGRESS_WEBHOOK_TIMEOUT_SECONDS,
         }
     ]
+
+
+def test_build_subtask_persists_bundle_artifacts(monkeypatch, tmp_path: Path) -> None:
+    flow = CodebuilderFlow()
+    flow.state.workspace_dir = str(tmp_path)
+    subtask = SubTask(
+        id="s1",
+        title="Bundle",
+        description="Create bundle.",
+        files=[
+            FileSkeleton(path="a.py", purpose="A module."),
+            FileSkeleton(path="b.py", purpose="B module."),
+        ],
+        test_criteria="Deterministic checks pass.",
+    )
+
+    class FakeWriterCrew:
+        def __init__(self, workspace_dir: str):
+            self.workspace_dir = workspace_dir
+
+        def crew(self):
+            class FakeCrew:
+                def kickoff(self, inputs: dict):
+                    return SimpleNamespace(
+                        pydantic=CodeBundleArtifact(
+                            subtask_id="s1",
+                            artifacts=[
+                                CodeArtifact(
+                                    subtask_id="s1",
+                                    file_path="a.py",
+                                    content="A = 1\n",
+                                    language="python",
+                                ),
+                                CodeArtifact(
+                                    subtask_id="s1",
+                                    file_path="b.py",
+                                    content="B = 2\n",
+                                    language="python",
+                                ),
+                            ],
+                        )
+                    )
+
+            return FakeCrew()
+
+    class FakeReviewerCrew:
+        def __init__(self, workspace_dir: str):
+            self.workspace_dir = workspace_dir
+
+    monkeypatch.setattr(main, "WriterCrew", FakeWriterCrew)
+    monkeypatch.setattr(main, "ReviewerCrew", FakeReviewerCrew)
+
+    flow._build_subtask(subtask, str(tmp_path), index=1, total=1)
+
+    assert (tmp_path / "a.py").read_text(encoding="utf-8") == "A = 1\n"
+    assert (tmp_path / "b.py").read_text(encoding="utf-8") == "B = 2\n"
+    assert [a.file_path for a in flow.state.artifacts] == ["a.py", "b.py"]
+    assert flow.state.review_results[-1].passed is True
 
 
 def test_zip_build_excludes_tool_cache_dirs(tmp_path: Path) -> None:
