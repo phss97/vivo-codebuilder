@@ -34,16 +34,6 @@ class PlannerCrew:
             llm=LLM(model=cfg["llm"], max_tokens=32768),
         )
 
-    @agent
-    def planner_lite(self) -> Agent:
-        cfg = self.agents_config["planner_lite"]  # type: ignore[index]
-        return Agent(
-            config=cfg,
-            tools=[FileReadTool(), DirectoryReadTool()],
-            skills=[_SKILLS["rpa"]],
-            llm=LLM(model=cfg["llm"], max_tokens=32768),
-        )
-
     @task
     def skeleton_task(self) -> Task:
         return Task(

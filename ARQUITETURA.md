@@ -786,3 +786,43 @@ especificado pelo planner.
 - Cachear a listagem do workspace entre subtasks (`workspace_listing`
   hoje é recomputada por iteração).
 
+### 2026-05-28 (b) — Reverter `planner_lite` Sonnet
+
+A primeira corrida em produção depois da introdução do `planner_lite`
+(Sonnet 4.6 cobrindo `review_skeleton_task` + `expand_task`) falhou em
+`runtime_qa.validate_plan` com `ValueError: Invalid plan: plan must
+contain between 1 and 60 subtasks`. O `result.pydantic` da crew (output
+da última task — o `expand_task`) chegou com `subtasks` vazio.
+
+Hipótese mais provável: Sonnet 4.6 sob `output_pydantic=Plan` com
+contexto via `Task(context=[…])` colapsou a lista de subtasks. Não
+consegui reproduzir localmente (sem chave AMP) e a próxima
+demonstração com a Vivo é amanhã, então o pragmático foi reverter o
+roteamento Sonnet e manter os outros ganhos.
+
+**O que reverteu**
+
+- `planner_lite` removido de `planner_crew/config/agents.yaml` e de
+  `planner_crew.py`.
+- `review_skeleton_task` e `expand_task` voltaram a `agent: planner`
+  (Opus 4.7).
+
+**O que ficou (e por quê)**
+
+- Writer ainda sem `reasoning`/`planning` — é o ganho mais limpo
+  (correção é forçada pelo loop determinístico, não há motivo para
+  re-planning).
+- Planner em `planning: true` (em vez de `reasoning: true`) — sem
+  mudança de comportamento, só silencia o warning de deprecation.
+- `prior_history` continua fora do `expand_task` — a skeleton já
+  consome esse contexto e o reviewed skeleton chega via
+  `Task.context=[…]`.
+
+**Próxima tentativa de Sonnet no planner (deferida)**
+
+Antes de re-introduzir Sonnet em qualquer task que produza o `Plan`
+final, adicionar um `guardrail=` deterministic no Task que assegure
+`len(subtasks) >= 1` e cubra os campos obrigatórios. Sem isso,
+qualquer drift de structured-output do Sonnet derruba o flow inteiro
+em vez de só retentar a task.
+
