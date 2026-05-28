@@ -200,9 +200,7 @@ class CodebuilderFlow(Flow[CodebuilderState]):
         # pending-feedback rows. `Flow.from_pending(flow_id)` always constructs
         # a default SQLiteFlowPersistence, so any drift in the env var between
         # save-time and resume-time breaks HITL resume with "No pending
-        # feedback found for flow_id". Per-project memory scoping — if we want
-        # it back — needs to go through Crew-level storage config, not this
-        # env var.
+        # feedback found for flow_id".
 
         self.state.status = "planning"
         log.info(

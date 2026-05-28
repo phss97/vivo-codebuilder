@@ -59,7 +59,7 @@ codebuilder/
 │   ├── main.py                 # CodebuilderFlow + entrypoints
 │   ├── schemas.py              # Pydantic: Plan, SubTask, CodeArtifact, ReviewResult, QAReport, CodebuilderState
 │   ├── runtime_qa.py           # QA determinístico + gates de arquitetura
-│   ├── history.py              # SQLite project_history (cross-run memory)
+│   ├── history.py              # SQLite project_history (contexto entre runs)
 │   ├── feedback_provider.py    # WebhookFeedbackProvider (HITL)
 │   ├── crews/
 │   │   ├── planner_crew/       # @CrewBase + agents.yaml + tasks.yaml
@@ -533,7 +533,7 @@ Permita um retry com o erro como input. Mas adicione **circuit breaker** ("se a 
 Use o `SQLiteFlowPersistence` default. Exponha `from_pending(id).resume(feedback)` num endpoint HTTP. Garanta que `CREWAI_STORAGE_DIR` é estável em runtime.
 
 ### Passo 10 — Histórico cross-run
-Mantenha uma tabela leve (independente da persistence do CrewAI) com o resumo de runs anteriores. Injete-o como `{prior_history}` no prompt do planner. É memória de projeto sem reativar `crew.memory=True` (que tem custo e complexidade extra).
+Mantenha uma tabela leve (independente da persistence do CrewAI) com o resumo de runs anteriores. Injete-o como `{prior_history}` no prompt do planner.
 
 ### Passo 11 — Gates de domínio plugáveis
 Use um registry (`dict[str, callable]`) indexado pelo slug do domínio. O planner emite o slug, o finalize despacha. Adicionar um novo domínio = 1 skill + 1 entrada no registry.
@@ -717,4 +717,72 @@ desconhecido / cap de 8 stubs), cap de 60 subtasks, roundtrip do
   `external_packages` (depende de como a Vivo estrutura a lib; decidir
   na próxima sessão).
 - Arquitetura gate para `patch_existing` (continua só em `new_project`).
+
+### 2026-05-28 — Performance: derrubar pre-passes de reasoning desnecessários
+
+Após o fix de 2026-05-27, o primeiro teste end-to-end mostrou ~6 min só
+na fase de planning, com o trace AMP exibindo um "Create Reasoning Plan"
+antes da execução de cada uma das 3 tasks do planner — tudo em Opus. O
+writer tinha o mesmo padrão (`reasoning: true`) e pagava pre-pass em
+Sonnet para cada subtask, mesmo recebendo um `SubTask` já totalmente
+especificado pelo planner.
+
+**O que mudou**
+
+1. **Writer perde `reasoning`.** `writer/config/agents.yaml` removeu
+   `reasoning: true`. O writer já tem `description`/`tech_notes`/
+   `test_criteria` por subtask e, em modo `modify`, o `existing_contents`
+   via side-channel. Correção fica por conta do loop determinístico
+   de review + retry — re-planning era puro desperdício de chamada LLM.
+   Economiza ~1 chamada Sonnet por subtask (×30 subtasks no caso RPA).
+
+2. **Planner: `reasoning: true` → `planning: true`.** No CrewAI
+   instalado o `reasoning: true` está deprecated e auto-converte
+   para `PlanningConfig(max_attempts=None)`. Trocamos para o toggle
+   legacy não-deprecated `planning: true` — mesmo comportamento
+   on/off, sem o warning de deprecation em cada instanciação de agent.
+
+3. **Novo agent `planner_lite` em Sonnet 4.6.** As tasks
+   `review_skeleton_task` (cheque mecânico contra o skill) e
+   `expand_task` (transcrição mecânica do skeleton revisado em
+   `SubTask`s) não precisam da criatividade arquitetural do Opus.
+   Skeleton continua no `planner` (Opus 4.7) com `planning: true`;
+   review e expand foram roteadas para `planner_lite` sem
+   `planning`/`reasoning`. Reduz custo (2 das 3 chamadas saem do
+   Opus) e latência (Sonnet TTFT/throughput muito maiores).
+
+4. **`prior_history` removido do prompt do `expand_task`.** A
+   skeleton já consome esse contexto e o expand recebe o skeleton
+   revisado via `context=[…]` — re-injetar o histórico no expand era
+   pagar tokens à toa em todas as runs subsequentes do mesmo projeto.
+
+5. **Linguagem de "memória" varrida da documentação.** O codebuilder
+   intencionalmente não usa `crew.memory=True`; o `project_history`
+   é o único mecanismo de contexto entre runs. `CLAUDE.md`, `README.md`
+   e `ARQUITETURA.md` foram limpos para refletir isso sem se referir
+   a "memória"/"memory" em contextos onde a palavra induzia erro.
+   Comentários inline obsoletos em `main.py` e `reviewer_crew.py`
+   também caíram.
+
+**Resultado esperado**
+
+- Planning chain meta: ~3 min típico (1 chamada Opus + 2 chamadas
+  Sonnet sequenciais), contra ~6 min no pior caso anterior.
+- Custo da fase de planning cai ~⅔ (2 das 3 chamadas saem do Opus).
+- Build loop: 1 chamada Sonnet por subtask em vez de 2 (sem
+  reasoning pre-pass). Para um plano de 30 subtasks isso é ~30
+  chamadas Sonnet a menos.
+- Warning `DeprecationWarning: The 'reasoning' parameter is
+  deprecated` some no startup da suíte de testes (verificado).
+- Suíte de testes existente (35 testes) continua verde.
+
+**Fora de escopo (deferido)**
+
+- Migrar `planning: true` → `planning_config: PlanningConfig(...)`
+  programaticamente. Esperar o CrewAI deprecar o toggle legacy.
+- Remover a construção dead-code de `ReviewerCrew.crew()` por
+  subtask em `_build_subtask` (objeto alocado mas nunca usado,
+  porque `needs_fallback` é sempre False).
+- Cachear a listagem do workspace entre subtasks (`workspace_listing`
+  hoje é recomputada por iteração).
 

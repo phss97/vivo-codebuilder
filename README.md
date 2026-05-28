@@ -102,7 +102,7 @@ src/codebuilder/
 └── skills/                 # CrewAI skills: rpa (canonical RPA standard) + code-review-gate (domain-agnostic)
 ```
 
-History from past runs is summarised and fed to the planner on every new run against the same project. Crew memory is disabled in the lean path; deterministic history is the cross-run context source.
+Cross-run context comes from a `project_history` SQLite table — a summary of past runs (mode, files touched, reviewer issues, QA notes) is fed to the planner on every new run against the same project.
 
 ## Dev commands
 

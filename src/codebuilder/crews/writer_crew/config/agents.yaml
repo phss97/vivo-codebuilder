@@ -13,7 +13,6 @@ writer:
     planner to schedule a separate test subtask when tests are needed; you
     do not embed tests inside production modules.
   llm: anthropic/claude-sonnet-4-6
-  reasoning: true
   max_iter: 8
   max_retry_limit: 1
   verbose: true

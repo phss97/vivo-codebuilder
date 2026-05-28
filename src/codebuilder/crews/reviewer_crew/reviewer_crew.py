@@ -79,11 +79,7 @@ class ReviewerCrew:
 
     @crew
     def crew(self) -> Crew:
-        """Fallback crew runs review_task only for ambiguous deterministic checks.
-
-        Memory is intentionally disabled here because fallback reviews should
-        be rare and per-file. Project-level learning lives on planner memory.
-        """
+        """Fallback crew runs review_task only for ambiguous deterministic checks."""
         return Crew(
             agents=[self.reviewer()],
             tasks=[self.review_task()],

@@ -117,7 +117,7 @@ review_skeleton_task:
       the change is genuinely required by the skill. Modify `files` only.
   expected_output: >
     A PlanSkeleton JSON object (possibly identical to the input).
-  agent: planner
+  agent: planner_lite
 
 expand_task:
   description: >
@@ -139,9 +139,6 @@ expand_task:
     {attachment_records}
 
     Workspace root (read-only for you): {workspace_dir}
-
-    Prior work on this project (most recent first):
-    {prior_history}
 
     User amendments (only populated on revision; empty on first pass):
     {amendments}
@@ -203,4 +200,4 @@ expand_task:
     test_criteria), open_questions (list), assumptions (list), domain
     (slug of the architecture-defining skill or empty string),
     external_packages (list).
-  agent: planner
+  agent: planner_lite

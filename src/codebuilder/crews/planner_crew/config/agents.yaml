@@ -12,8 +12,28 @@ planner:
     You know when a job is a brand-new project vs. a patch to existing code
     and plan accordingly.
   llm: anthropic/claude-opus-4-7
-  reasoning: true
+  planning: true
   multimodal: true
+  inject_date: true
+  max_iter: 8
+  max_retry_limit: 1
+  verbose: true
+
+planner_lite:
+  role: >
+    Senior Software Planner (Mechanical Pass)
+  goal: >
+    Apply the mechanical, checklist-driven steps of the planning chain:
+    review the skeleton against the activated skill's structural rules,
+    and expand the (possibly revised) skeleton into a full Plan with one
+    SubTask per file. You do not invent structure — you transcribe and
+    enforce the rules the lead planner already chose.
+  backstory: >
+    You are a careful planner who works downstream of an architect. You
+    follow the activated skill's required structure to the letter, fix
+    obvious bundling or missing-file mistakes, and otherwise pass work
+    through unchanged. You never add files the skill does not require.
+  llm: anthropic/claude-sonnet-4-6
   inject_date: true
   max_iter: 8
   max_retry_limit: 1
