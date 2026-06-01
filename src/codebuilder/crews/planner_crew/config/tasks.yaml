@@ -148,3 +148,58 @@ expand_task:
     (slug of the architecture-defining skill or empty string),
     external_packages (list).
   agent: planner
+
+amend_task:
+  description: >
+    Revise an EXISTING plan to fold in the user's amendments. You are NOT
+    re-planning the project from scratch — start from the prior plan below and
+    change ONLY what the amendments require. This is a surgical edit, not a
+    rewrite.
+
+    Project name: {project_name}
+
+    Brief (for reference only — do not re-plan from it):
+    {brief}
+
+    Prior plan (your base — edit this, keep everything else byte-for-byte):
+    {prior_plan}
+
+    User amendments to fold in:
+    {amendments}
+
+    Rules:
+    - Treat the prior plan as authoritative. Carry every existing work package
+      forward UNCHANGED unless an amendment specifically requires editing it.
+    - Keep stable `id`s. Do not renumber or reorder existing work packages.
+      Only edit the `files`, `description`, `tech_notes`, `test_criteria`, or
+      `depends_on` of a package that an amendment actually touches.
+    - Add new work packages only when the amendments introduce work that does
+      not fit an existing package. Give new packages fresh ids that continue
+      the existing sequence (e.g. if the plan ends at `s21`, add `s22`).
+    - Remove a work package only when an amendment makes it obsolete.
+    - Copy `mode`, `domain`, `tech_stack`, and `external_packages` from the
+      prior plan unchanged unless an amendment changes them (e.g. the user
+      confirms internal packages that should now appear in `external_packages`,
+      or names concrete SAP transactions / queue names that belong in the
+      relevant work package's `tech_notes`).
+    - Resolve any `open_questions` that the amendments answer: move the decided
+      detail into the affected work package's `tech_notes`/`description` and
+      drop the answered question. Record any new decision you made on the
+      user's behalf in `assumptions`.
+    - Respect the same structural caps as the original plan: at most 24 work
+      packages total and at most 6 files in any one package. If folding in the
+      amendments would exceed a cap, consolidate cohesive files rather than
+      dropping required work.
+    - Return the COMPLETE plan: every work package, not just the changed ones.
+      The downstream build iterates the full `subtasks` list, so an omitted
+      package is a dropped feature.
+  expected_output: >
+    A Plan JSON object matching the Plan schema: project_name, mode,
+    tech_stack (list), subtasks (list of SubTask, each with id, title,
+    description, files (list of FileSkeleton), depends_on, tech_notes,
+    test_criteria), open_questions (list), assumptions (list), domain
+    (slug of the architecture-defining skill or empty string),
+    external_packages (list). It must contain EVERY work package from the
+    prior plan (edited or carried forward unchanged), plus any new ones the
+    amendments require.
+  agent: planner

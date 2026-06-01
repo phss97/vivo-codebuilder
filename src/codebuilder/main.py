@@ -37,6 +37,7 @@ from codebuilder.schemas import (
     CodeBundleArtifact,
     CodeArtifact,
     CodebuilderState,
+    Plan,
     QAReport,
     ReviewResult,
     SubTask,
@@ -237,11 +238,48 @@ class CodebuilderFlow(Flow[CodebuilderState]):
     def revise_plan(self, prior) -> dict:
         self.state.amendments = getattr(prior, "feedback", "") or ""
         self.state.amend_cycles += 1
-        result = PlannerCrew().crew().kickoff(inputs=_planner_inputs(self.state))
-        plan_obj = validate_plan(result.pydantic)
+        # revise_plan runs DURING resume, AFTER resume_async has already cleared
+        # the pending-feedback row. If anything here raised, the exception would
+        # propagate out of resume() with no pending row left, and any later
+        # from_pending(job_id) would fail with "No pending feedback found" — the
+        # job would be permanently unresumable. So a revision failure must NEVER
+        # raise: fall back to the prior plan, surface the failure as an
+        # open_question, and let @human_feedback re-gate (re-pause + re-persist)
+        # so the user can retry or approve the prior plan as-is.
+        try:
+            result = PlannerCrew().amend_crew().kickoff(inputs=_planner_inputs(self.state))
+            plan_obj = validate_plan(result.pydantic)
+        except Exception as exc:  # noqa: BLE001 — a revise failure must never brick the job
+            fallback = self._prior_plan_snapshot(prior)
+            if fallback is None:
+                # Pathological: no prior plan to show. A plan must have existed to
+                # reach the amend gate, so this should not happen; re-raise rather
+                # than fabricate one.
+                raise
+            log.warning("plan revision failed (%s); re-gating with the prior plan", exc)
+            fallback.open_questions = [
+                f"Automatic plan revision failed ({exc}). The previous plan is shown "
+                "unchanged — re-state your changes to try again, or approve to build it as-is.",
+                *fallback.open_questions,
+            ]
+            plan_obj = fallback
         self.state.plan = plan_obj
         self.state.status = "awaiting_approval"
         return plan_obj.model_dump()
+
+    def _prior_plan_snapshot(self, prior) -> Plan | None:
+        """Best-effort recovery of the plan the human last reviewed, for re-gating
+        when a revision fails. Prefers the live state plan; falls back to the
+        feedback result's `output` (the dict that was shown to the human)."""
+        if self.state.plan is not None:
+            return self.state.plan.model_copy(deep=True)  # StrictOutputModel is not frozen
+        prior_output = getattr(prior, "output", None)
+        if isinstance(prior_output, dict):
+            try:
+                return Plan.model_validate(prior_output)
+            except Exception:  # noqa: BLE001 — fall through to None
+                return None
+        return None
 
     @listen("rejected")
     def on_rejected(self, prior):
