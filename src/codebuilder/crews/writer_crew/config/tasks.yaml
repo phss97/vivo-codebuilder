@@ -8,6 +8,14 @@ write_task:
 
     Change type: {change_type}
 
+    Output language for ALL comments, docstrings, log messages, and
+    user-facing strings: {language}
+
+    Project symbol contract — the EXACT public names every file in this
+    project exports. When you import from or call into another project file,
+    use these names verbatim. Never invent a synonym:
+    {dependency_contracts}
+
     Workspace root: {workspace_dir}
     Relative paths already present in the workspace you should consult before
     writing:
@@ -24,6 +32,18 @@ write_task:
     {existing_contents}
 
     Rules:
+    - LANGUAGE: Write ALL code comments, docstrings, log messages, and
+      user-facing string literals in {language}. This OVERRIDES any other
+      language present in your activated skills or context. Identifiers
+      (function/class/variable names) follow the project's conventions and the
+      symbol contract — do NOT translate them; only natural-language text
+      follows {language}.
+    - NAMES: Each file MUST export EXACTLY the symbols listed in its own
+      `public_api` (same names and signatures — no renames, abbreviations, or
+      synonyms). When importing from or calling another project file, use the
+      EXACT name given in the project symbol contract above (if the contract
+      says `create_registro`, never call it `build_registro`). Mismatched
+      names break imports and fail review.
     - Return exactly one CodeArtifact per entry in `subtask.files`.
     - Each CodeArtifact.file_path MUST exactly match one planned file path.
       Do not create extra files, omit planned files, or rename paths.
@@ -62,6 +82,13 @@ repair_task:
 
     Workspace root: {workspace_dir}
 
+    Output language for ALL comments, docstrings, log messages, and
+    user-facing strings: {language}
+
+    Project symbol contract — the EXACT public names every file exports; use
+    them verbatim when importing or calling, never a synonym:
+    {dependency_contracts}
+
     Plan summary:
     {plan_summary}
 
@@ -72,6 +99,10 @@ repair_task:
     {qa_report}
 
     Rules:
+    - LANGUAGE: write all comments, docstrings, log messages, and user-facing
+      strings in {language}; do not translate identifiers.
+    - NAMES: when fixing imports or calls, use the EXACT names in the project
+      symbol contract above — never substitute a synonym.
     - Use workspace_read and workspace_list to inspect the failing code before
       choosing the file to change.
     - Return the FULL repaired file text in CodeArtifact.content. The

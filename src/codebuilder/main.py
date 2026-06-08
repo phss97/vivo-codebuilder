@@ -150,6 +150,11 @@ def _planner_inputs(state: CodebuilderState) -> dict:
         "prior_plan": state.plan.model_dump_json(indent=2) if state.plan else "",
         "prior_history": prior_history or "(no prior runs for this project)",
         "amendments": state.amendments,
+        # Override-or-detect hint: a concrete language name when the caller
+        # supplied one (the planner must honor it), else an instruction to
+        # infer the language from the brief. The planner is the only crew that
+        # runs before state.language is resolved, so it gets the hint form.
+        "language": state.language or "(detect the language from the brief and goals and use it)",
     }
 
 class CodebuilderFlow(Flow[CodebuilderState]):
@@ -225,6 +230,9 @@ class CodebuilderFlow(Flow[CodebuilderState]):
         result = PlannerCrew().crew().kickoff(inputs=_planner_inputs(self.state))
         plan_obj = validate_plan(result.pydantic)
         self.state.plan = plan_obj
+        # Resolve the output language for every downstream crew: caller override
+        # wins, else the planner's detection, else English.
+        self.state.language = self.state.language or plan_obj.language or "English"
         self.state.status = "awaiting_approval"
         return plan_obj.model_dump()
 
@@ -264,6 +272,9 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             ]
             plan_obj = fallback
         self.state.plan = plan_obj
+        # Normally a no-op (amend carries plan.language forward), but guards the
+        # edge case where the first plan emitted an empty language.
+        self.state.language = self.state.language or plan_obj.language or "English"
         self.state.status = "awaiting_approval"
         return plan_obj.model_dump()
 
@@ -341,7 +352,9 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             )
         self._repair_final_qa_if_needed(build_dir)
         if self.state.plan and self.state.plan.mode == "new_project":
-            architecture_review = run_full_architecture_gate(build_dir, self.state.plan)
+            architecture_review = run_full_architecture_gate(
+                build_dir, self.state.plan, self.state.language or "English"
+            )
             self.state.review_results.append(architecture_review)
             if self.state.qa_report and not architecture_review.passed:
                 self.state.qa_report.passed = False
@@ -459,6 +472,8 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                 "workspace_listing": listing_tool._run("."),
                 "plan_summary": plan_summary(self.state.plan),
                 "qa_report": qa_report_for_repair(report),
+                "dependency_contracts": self._symbol_contract(),
+                "language": self.state.language or "English",
             }
         )
         artifact = result.pydantic if isinstance(result.pydantic, CodeArtifact) else None
@@ -551,6 +566,27 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             payload["patch"] = self.state.patch
         return payload
 
+    def _symbol_contract(self) -> str:
+        """Render the project-wide map of every file's exported public symbols.
+
+        Walks the plan's work packages and lists each file that declares a
+        non-empty ``public_api`` as ``path → [symbols]``. This is the
+        authoritative name map every writer must import against verbatim, so a
+        helper produced by one subtask is called by the same name in another.
+        """
+        plan = self.state.plan
+        if plan is None:
+            return "(no plan available)"
+        lines: list[str] = []
+        for subtask in plan.subtasks:
+            for planned_file in subtask.files:
+                if planned_file.public_api:
+                    symbols = "; ".join(planned_file.public_api)
+                    lines.append(f"- {planned_file.path} → [{symbols}]")
+        if not lines:
+            return "(no public symbols declared in the plan)"
+        return "\n".join(lines)
+
     def _build_subtask(self, subtask: SubTask, build_dir: str, *, index: int, total: int) -> None:
         writer = WriterCrew(workspace_dir=build_dir)
         reviewer = ReviewerCrew(workspace_dir=build_dir)
@@ -611,6 +647,8 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                     "workspace_listing": listing_tool._run("."),
                     "amendments": self.state.amendments or "(none)",
                     "prior_review_issues": prior_issues or "(none)",
+                    "dependency_contracts": self._symbol_contract(),
+                    "language": self.state.language or "English",
                 }
             )
             bundle = (
@@ -643,6 +681,7 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                         "subtask": subtask.model_dump_json(indent=2),
                         "artifact": bundle.model_dump_json(indent=2),
                         "workspace_dir": build_dir,
+                        "language": self.state.language or "English",
                     }
                 )
                 review = (

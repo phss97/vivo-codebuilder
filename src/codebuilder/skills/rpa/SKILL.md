@@ -19,7 +19,8 @@ description: Apply the required Python RPA project architecture, packaging, conf
 6. [TDD com Padrão Given-When-Then](#6-tdd-com-padrão-given-when-then)
 7. [Stack de Qualidade e Testes](#7-stack-de-qualidade-e-testes)
 8. [Estrutura de Pastas Recomendada](#8-estrutura-de-pastas-recomendada)
-9. [Checklist para Iniciar um Projeto Novo](#9-checklist-para-iniciar-um-projeto-novo)
+9. [Empacotamento — Executável Windows (.exe)](#9-empacotamento--executável-windows-exe)
+10. [Checklist para Iniciar um Projeto Novo](#10-checklist-para-iniciar-um-projeto-novo)
 
 ---
 
@@ -238,6 +239,7 @@ app-meu-projeto/
 ├── src/
 │   └── meu_projeto/
 │       ├── __init__.py
+│       ├── __main__.py             # entry-point p/ PyInstaller: chama o main() do orquestrador
 │       ├── domain/
 │       │   ├── entities/
 │       │   ├── exceptions/
@@ -262,6 +264,8 @@ app-meu-projeto/
 │   ├── integration/
 │   └── e2e/
 ├── .env.example
+├── build.spec                      # spec do PyInstaller (Analysis aponta p/ __main__.py)
+├── build.ps1                       # script de build no Windows (gera dist/<nome>.exe)
 ├── pyproject.toml
 ├── README.md
 └── uv.lock
@@ -292,3 +296,125 @@ mesmo arquivo da classe que os usa — não fragmente por fragmentar.
 Configuração, logging e glue de CLI podem viver em um arquivo coeso por
 concern; a regra de um-por-arquivo vale apenas para entidades, Protocols,
 exceções, casos de uso, services e adapters.
+
+---
+
+## 9. Empacotamento — Executável Windows (.exe)
+
+Todo projeto RPA novo (`new_project`) deve ser entregue com um **kit de
+build** que gera um executável Windows (`.exe`) via PyInstaller. A execução
+por terminal (`uv run`, `[project.scripts]`) **permanece inalterada** — o
+`.exe` apenas embrulha o mesmo `main()` do orquestrador.
+
+> PyInstaller **não faz cross-build**: o `.exe` precisa ser gerado em uma
+> máquina Windows. O kit é entregue pronto; o build em si roda no ambiente
+> Windows do cliente.
+
+### 9.1. Entry-script real (obrigatório)
+
+O `Analysis` do PyInstaller recebe o **caminho de um arquivo `.py`**, não o
+nome de um console_script. Por isso o projeto precisa de um módulo de entrada
+explícito que o spec possa apontar — `src/<pacote>/__main__.py` (ou um
+`launcher.py` na raiz). Ele apenas importa o orquestrador e chama `main()`:
+
+```python
+# src/meu_projeto/__main__.py
+"""Entry-point para empacotamento (PyInstaller) e `python -m meu_projeto`."""
+from meu_projeto.infrastructure.orchestrator import main  # ajuste ao seu orquestrador
+
+if __name__ == "__main__":
+    main()
+```
+
+O `[project.scripts]` (terminal) e este `__main__.py` (`.exe`) chamam o
+**mesmo** `main()` — comportamento idêntico nos dois caminhos.
+
+### 9.2. `build.spec` (PyInstaller, onefile + console)
+
+```python
+# build.spec — rode com: pyinstaller build.spec
+block_cipher = None
+
+a = Analysis(
+    ['src/meu_projeto/__main__.py'],   # caminho REAL do entry-script
+    pathex=['src'],
+    binaries=[],
+    datas=[('.env.example', '.')],     # inclua aqui config/templates lidos em runtime
+    hiddenimports=[],
+    cipher=block_cipher,
+)
+pyz = PYZ(a.pure, a.zipped_data, cipher=block_cipher)
+
+exe = EXE(
+    pyz,
+    a.scripts,
+    a.binaries,
+    a.datas,
+    [],
+    name='meu_projeto',
+    console=True,          # RPA roda em terminal; mantenha True
+    strip=False,
+    upx=True,
+    runtime_tmpdir=None,
+)
+```
+
+### 9.3. Script de build no Windows (`build.ps1`)
+
+```powershell
+# build.ps1 — gera dist\meu_projeto.exe (rode em uma máquina Windows)
+$ErrorActionPreference = "Stop"
+
+uv sync                       # instala dependências, incluindo pyinstaller (dev)
+uv run pyinstaller build.spec --noconfirm
+
+Write-Host "Executável gerado em dist\meu_projeto.exe"
+```
+
+> Se `uv` não estiver disponível, use o fallback com venv:
+> `python -m venv .venv; .\.venv\Scripts\Activate.ps1; pip install . pyinstaller; pyinstaller build.spec --noconfirm`.
+
+### 9.4. Dependência de desenvolvimento
+
+`pyinstaller` deve constar no `pyproject.toml` como dependência de dev:
+
+```toml
+[dependency-groups]
+dev = [
+    "pytest>=8",
+    "pytest-cov>=5",
+    "ruff>=0.6",
+    "mypy>=1.11",
+    "pyinstaller>=6",
+]
+```
+
+### 9.5. Seção no README
+
+O README deve trazer uma seção **"Gerar o executável (Windows)"** com os
+comandos exatos:
+
+````markdown
+## Gerar o executável (Windows)
+
+Pré-requisitos: Windows, Python 3.13 e uv.
+
+```powershell
+.\build.ps1
+```
+
+Gera `dist\meu_projeto.exe` (mesmo `main()` do `uv run`). Para executar:
+
+```powershell
+.\dist\meu_projeto.exe
+```
+````
+
+### 9.6. Checklist de empacotamento
+
+- [ ] Entry-script `__main__.py` (ou `launcher.py`) chamando `main()`.
+- [ ] `build.spec` com `Analysis` apontando para o caminho do entry-script.
+- [ ] `build.ps1` (e/ou `build.bat`) na raiz.
+- [ ] `pyinstaller` nas dependências de dev do `pyproject.toml`.
+- [ ] Seção "Gerar o executável (Windows)" no README.
+- [ ] `datas` do spec inclui todo arquivo de config/template lido em runtime.
