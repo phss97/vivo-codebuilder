@@ -15,6 +15,8 @@ review_task:
     `lint_runner` tool against each artifact path, and run `test_runner` for
     paths under `tests/`. Apply the acceptance criteria from the
     `code-review-gate` skill.
+
+    Write all `issues` and `suggestions` in {language}.
   expected_output: >
     A ReviewResult JSON object with: subtask_id (matching the bundle),
     passed (bool), issues (list of concrete problems), suggestions (list of
@@ -61,6 +63,8 @@ architecture_gate_task:
 
     Set passed=False if any required quality from the domain skill is missing,
     even if ruff and pytest passed.
+
+    Write all `issues` and `suggestions` in {language}.
   expected_output: >
     A ReviewResult JSON object with subtask_id set to "architecture_gate",
     passed (bool), issues (concrete missing or incorrect items), and

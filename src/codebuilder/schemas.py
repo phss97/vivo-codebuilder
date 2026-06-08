@@ -33,6 +33,13 @@ class FileSkeleton(StrictOutputModel):
     path: str
     purpose: str
     change_type: ChangeType = "create"
+    # Exact public symbols this file exports for OTHER files to import, with
+    # signatures. e.g. ["create_registro(data: dict) -> Registro",
+    # "class RegistroRepository(Protocol)"]. These names are binding: every
+    # file importing from this one must use them verbatim (no synonyms). Empty
+    # for files with no importable API (README, .env.example, pyproject.toml,
+    # build.spec, build scripts).
+    public_api: list[str] = Field(default_factory=list)
 
 
 class SubTask(StrictOutputModel):
@@ -55,6 +62,10 @@ class PlanSkeleton(StrictOutputModel):
     project_name: str
     mode: JobMode
     domain: str = ""
+    # Natural language the agents must write all comments, docstrings, and
+    # narrative output in (e.g. "Portuguese", "English"). The planner detects
+    # this from the brief unless the caller supplied an explicit override.
+    language: str = ""
     tech_stack: list[str]
     files: list[FileSkeleton]
     # Top-level Python package names belonging to reference libraries the user
@@ -77,6 +88,10 @@ class Plan(StrictOutputModel):
     # (e.g. "rpa"). When set, finalize dispatches the matching
     # architecture gate; when empty, no domain gate runs.
     domain: str = ""
+    # Carried over from PlanSkeleton — the language the planner detected (or
+    # the caller's override). The flow resolves this onto CodebuilderState so
+    # every downstream crew writes in the same language.
+    language: str = ""
     # Carried over from PlanSkeleton — see FileSkeleton/PlanSkeleton docstrings.
     external_packages: list[str] = Field(default_factory=list)
 
@@ -126,6 +141,10 @@ class CodebuilderState(FlowState):
     brief: str = ""
     project_name: str = ""
     project_key: str = ""
+    # Resolved output language for all agents: an explicit kickoff `language`
+    # override if supplied (auto-merged before `ingest`), else the language the
+    # planner detected from the brief, resolved onto state right after `plan`.
+    language: str = ""
     goals: list[str] = Field(default_factory=list)
     tech_stack: list[str] = Field(default_factory=list)
     attachments: list[Attachment] = Field(default_factory=list)
