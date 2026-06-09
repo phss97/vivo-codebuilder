@@ -541,7 +541,7 @@ def test_finalize_repairs_failed_final_qa_and_returns_payload(monkeypatch, tmp_p
 
     qa_calls: list[str] = []
 
-    def fake_run_final_qa(build_dir: str) -> QAReport:
+    def fake_run_final_qa(build_dir: str, *, lint_paths=None, **_kwargs) -> QAReport:
         qa_calls.append(build_dir)
         if len(qa_calls) == 1:
             return QAReport(
@@ -602,7 +602,7 @@ def test_finalize_returns_artifacts_when_final_qa_still_fails(monkeypatch, tmp_p
     flow.state.status = "executing"
     monkeypatch.setenv("CODEBUILDER_MAX_FINAL_QA_REPAIRS", "1")
 
-    def fake_run_final_qa(build_dir: str) -> QAReport:
+    def fake_run_final_qa(build_dir: str, *, lint_paths=None, **_kwargs) -> QAReport:
         return QAReport(
             passed=False,
             lint_output="PASS",

@@ -77,8 +77,19 @@ class TestRunnerTool(BaseTool):
             target = resolve_within(self.workspace_dir, path)
         except ValueError as exc:
             return f"ERROR: {exc}"
+        # The runner owns its flags. A target project's pyproject may declare
+        # addopts requiring plugins not installed here (e.g. --cov needs
+        # pytest-cov), which crashes pytest at arg parsing before any test runs.
         code, out = _run(
-            [sys.executable, "-m", "pytest", "-q", "--no-header", str(target)],
+            [
+                sys.executable,
+                "-m",
+                "pytest",
+                "-q",
+                "--no-header",
+                "--override-ini=addopts=",
+                str(target),
+            ],
             cwd=self.workspace_dir,
             timeout=300,
         )

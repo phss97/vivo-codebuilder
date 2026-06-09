@@ -15,6 +15,8 @@ skeleton_task:
     Tech stack hints from user:
     {tech_stack}
 
+    Output language (override-or-detect): {language}
+
     Attachments materialized into the workspace (relative paths):
     {attachment_records}
 
@@ -30,10 +32,22 @@ skeleton_task:
     {amendments}
 
     Rules:
+    - LANGUAGE: Determine the natural language of the brief and goals. If the
+      "Output language" above names a concrete language, use it; otherwise
+      infer it from the brief. Set the PlanSkeleton `language` field to that
+      language's name (e.g. "Portuguese", "English"), and write ALL narrative
+      fields (`purpose`, `assumptions`, `open_questions`) in that language.
     - Decide whether `mode` is "new_project" or "patch_existing" based on
       whether a git repo or zipped existing code was attached.
     - Set `domain` to the slug of your activated architecture-defining skill
       when one applies (e.g. "rpa"). Leave empty otherwise.
+    - PACKAGING (RPA new_project only): the plan MUST include, as planned
+      files, a real entry-script module (`src/<pkg>/__main__.py` or a root
+      `launcher.py` that calls the orchestrator `main()`), `build.spec`
+      (PyInstaller spec), a Windows build script (`build.ps1` and/or
+      `build.bat`), and a README packaging section — and `pyinstaller` MUST be
+      a dev dependency in `pyproject.toml`. These ship the Windows `.exe` build
+      kit. Omitting any of them fails the RPA acceptance gate.
     - Apply the conventions described in your activated skills (project
       layout, required components, layering, testing strategy, naming) when
       shaping the file list. Activated skills are authoritative for
@@ -54,6 +68,13 @@ skeleton_task:
     - `change_type` is "modify" for any file already present in an attached
       repo / zip (only legal in `patch_existing` mode), and "create" for
       every new file. Mixed plans are normal in `patch_existing` mode.
+    - PATHS in `patch_existing` mode: every FileSkeleton `path` MUST be
+      relative to the attached project's root (the cloned repo / extracted
+      zip directory under `inputs/`), NEVER prefixed with `inputs/<dir>/`.
+      E.g. if the attachment materialized at `inputs/my-app/src/pkg/mod.py`,
+      plan the path as `src/pkg/mod.py`. New files in `patch_existing` mode
+      also live under that same project root — never plan a parallel tree
+      outside the attached project.
     - Identify reference libraries. If the user attached a library (zip
       or git materialized under `inputs/`) clearly intended for the writer
       to import from rather than reimplement, record each top-level Python
@@ -71,8 +92,9 @@ skeleton_task:
       overriding.
   expected_output: >
     A PlanSkeleton JSON object matching the PlanSkeleton schema:
-    project_name, mode, domain, tech_stack (list), files (list of
-    FileSkeleton each with path/purpose/change_type), external_packages
+    project_name, mode, domain, language (the detected/overridden language
+    name), tech_stack (list), files (list of FileSkeleton each with
+    path/purpose/change_type and optional public_api), external_packages
     (list), open_questions (list), assumptions (list).
   agent: planner
 
@@ -94,6 +116,8 @@ expand_task:
     Tech stack hints from user:
     {tech_stack}
 
+    Output language (override-or-detect): {language}
+
     Attachments materialized into the workspace (relative paths):
     {attachment_records}
 
@@ -103,10 +127,32 @@ expand_task:
     {amendments}
 
     Rules:
+    - LANGUAGE: write ALL narrative fields (`description`, `tech_notes`,
+      `test_criteria`, `assumptions`, `open_questions`) in the same language
+      carried on the skeleton's `language` field. Copy that `language` value
+      onto the Plan unchanged.
     - Every FileSkeleton entry from the skeleton MUST appear exactly once
-      across the final Plan's `subtasks[*].files`.
-    - Copy `mode`, `domain`, `tech_stack`, and `external_packages` from the
-      skeleton onto the Plan unchanged.
+      across the final Plan's `subtasks[*].files`, with its `public_api`
+      preserved.
+    - PATHS in `patch_existing` mode: keep every `path` relative to the
+      attached project's root (the repo / extracted zip directory under
+      `inputs/`) — never prefixed with `inputs/<dir>/`, and never a parallel
+      tree outside the attached project.
+    - For every FileSkeleton that exports importable code, `public_api` MUST
+      list the exact function/class/constant names WITH signatures (e.g.
+      "create_registro(data: dict) -> Registro", "class RegistroRepository
+      (Protocol)"). These names are BINDING: any file that imports from or
+      calls into this file must use exactly these names — no synonyms,
+      abbreviations, or renames (never plan `create_registro` here and let a
+      caller use `build_registro`). Leave `public_api` empty only for files
+      with no importable API (README, .env.example, pyproject.toml,
+      build.spec, build scripts).
+    - Copy `mode`, `domain`, `language`, `tech_stack`, and `external_packages`
+      from the skeleton onto the Plan unchanged.
+    - PACKAGING (RPA new_project only): carry the build-kit files from the
+      skeleton (entry script, `build.spec`, Windows build script, README
+      packaging section) into the Plan's subtasks, and keep `pyinstaller` in
+      the dev dependencies. The RPA acceptance gate fails without them.
     - Target 12-20 work packages for standard RPA projects. Hard cap:
       max 24 SubTasks total, max 6 files in any one SubTask. Prefer fewer
       work packages when the files are cohesive and can be safely written
@@ -141,9 +187,11 @@ expand_task:
       Keep unchanged work package ids stable; only modify what the feedback
       requires.
   expected_output: >
-    A Plan JSON object matching the Plan schema: project_name, mode,
-    tech_stack (list), subtasks (list of SubTask, each with id, title,
-    description, files (list of FileSkeleton), depends_on, tech_notes,
+    A Plan JSON object matching the Plan schema: project_name, mode, language
+    (the language name copied from the skeleton), tech_stack (list), subtasks
+    (list of SubTask, each with id, title, description, files (list of
+    FileSkeleton, each with path/purpose/change_type and a populated
+    public_api for files that export importable code), depends_on, tech_notes,
     test_criteria), open_questions (list), assumptions (list), domain
     (slug of the architecture-defining skill or empty string),
     external_packages (list).
@@ -177,11 +225,21 @@ amend_task:
       not fit an existing package. Give new packages fresh ids that continue
       the existing sequence (e.g. if the plan ends at `s21`, add `s22`).
     - Remove a work package only when an amendment makes it obsolete.
-    - Copy `mode`, `domain`, `tech_stack`, and `external_packages` from the
-      prior plan unchanged unless an amendment changes them (e.g. the user
-      confirms internal packages that should now appear in `external_packages`,
-      or names concrete SAP transactions / queue names that belong in the
-      relevant work package's `tech_notes`).
+    - PATHS in `patch_existing` mode: keep every `path` relative to the
+      attached project's root (the repo / extracted zip directory under
+      `inputs/`) — never prefixed with `inputs/<dir>/`, and never a parallel
+      tree outside the attached project.
+    - Copy `mode`, `domain`, `language`, `tech_stack`, and `external_packages`
+      from the prior plan unchanged unless an amendment changes them (e.g. the
+      user confirms internal packages that should now appear in
+      `external_packages`, or names concrete SAP transactions / queue names
+      that belong in the relevant work package's `tech_notes`). Write any
+      new or edited narrative in the prior plan's `language`.
+    - Carry each file's `public_api` forward UNCHANGED. Update a file's
+      `public_api` only when an amendment changes that file's exported
+      symbols, and populate `public_api` for any new files that export
+      importable code (exact names with signatures — these are binding, no
+      synonyms in callers).
     - Resolve any `open_questions` that the amendments answer: move the decided
       detail into the affected work package's `tech_notes`/`description` and
       drop the answered question. Record any new decision you made on the
@@ -194,11 +252,12 @@ amend_task:
       The downstream build iterates the full `subtasks` list, so an omitted
       package is a dropped feature.
   expected_output: >
-    A Plan JSON object matching the Plan schema: project_name, mode,
-    tech_stack (list), subtasks (list of SubTask, each with id, title,
-    description, files (list of FileSkeleton), depends_on, tech_notes,
-    test_criteria), open_questions (list), assumptions (list), domain
-    (slug of the architecture-defining skill or empty string),
+    A Plan JSON object matching the Plan schema: project_name, mode, language
+    (carried from the prior plan), tech_stack (list), subtasks (list of
+    SubTask, each with id, title, description, files (list of FileSkeleton,
+    each with path/purpose/change_type and public_api), depends_on,
+    tech_notes, test_criteria), open_questions (list), assumptions (list),
+    domain (slug of the architecture-defining skill or empty string),
     external_packages (list). It must contain EVERY work package from the
     prior plan (edited or carried forward unchanged), plus any new ones the
     amendments require.

@@ -136,6 +136,78 @@ def _zip_build(build_dir: str, out_dir: Path, project_name: str) -> Path:
     return out_path
 
 
+_PROJECT_MARKERS = ("pyproject.toml", "setup.py", "setup.cfg", ".git", "src")
+
+
+def _has_project_markers(path: Path) -> bool:
+    return any((path / marker).exists() for marker in _PROJECT_MARKERS)
+
+
+def _descend_wrapper_dirs(path: Path, max_depth: int = 3) -> Path:
+    """Step into single-child wrapper dirs (zip-of-a-folder) until markers appear."""
+    current = path
+    for _ in range(max_depth):
+        if _has_project_markers(current):
+            return current
+        children = [c for c in current.iterdir() if not c.name.startswith(".")]
+        if len(children) == 1 and children[0].is_dir():
+            current = children[0]
+            continue
+        break
+    return current
+
+
+def _resolve_patch_root(workspace_dir: str) -> str | None:
+    """Locate the attached project root for a ``patch_existing`` job.
+
+    Prefers git clones (``inputs/repo*``), then any ``inputs/`` directory
+    carrying project markers, then the only/first directory present. Zip
+    attachments extract to ``inputs/<zip-stem>``, so they resolve here too —
+    falling back to the workspace root (the old behavior for non-git inputs)
+    made the writer duplicate the project tree at the root and final QA sweep
+    the user's pre-existing code. Returns ``None`` when ``inputs/`` holds no
+    directories at all.
+    """
+    inputs_dir = Path(workspace_dir) / "inputs"
+    if not inputs_dir.is_dir():
+        return None
+    candidates = sorted((c for c in inputs_dir.iterdir() if c.is_dir()), key=lambda c: c.name)
+    if not candidates:
+        return None
+    repos = [c for c in candidates if c.name.startswith("repo")]
+    if repos:
+        return str(repos[0])
+    marked = [c for c in candidates if _has_project_markers(c)]
+    if marked:
+        chosen = marked[0]
+    else:
+        chosen = candidates[0]
+        if len(candidates) > 1:
+            log.warning(
+                "patch_existing: %d candidate dirs under inputs/ and none has project markers; "
+                "defaulting to %s",
+                len(candidates),
+                chosen,
+            )
+    return str(_descend_wrapper_dirs(chosen))
+
+
+def _strip_patch_root_prefix(plan: Plan, prefix: str) -> None:
+    """Rewrite planned file paths that carry the patch root's workspace prefix.
+
+    The planner is told to emit paths relative to the attached project root,
+    but plans sometimes arrive workspace-relative ('inputs/<dir>/src/x.py').
+    Stripping the prefix keeps both conventions resolving inside build_dir
+    instead of duplicating the tree one level up.
+    """
+    if not prefix.endswith("/"):
+        prefix += "/"
+    for subtask in plan.subtasks:
+        for planned_file in subtask.files:
+            if planned_file.path.startswith(prefix):
+                planned_file.path = planned_file.path[len(prefix):]
+
+
 def _planner_inputs(state: CodebuilderState) -> dict:
     listing_tool = WorkspaceListTool(workspace_dir=state.workspace_dir) if state.workspace_dir else None
     listing = listing_tool._run(".") if listing_tool else ""
@@ -150,6 +222,11 @@ def _planner_inputs(state: CodebuilderState) -> dict:
         "prior_plan": state.plan.model_dump_json(indent=2) if state.plan else "",
         "prior_history": prior_history or "(no prior runs for this project)",
         "amendments": state.amendments,
+        # Override-or-detect hint: a concrete language name when the caller
+        # supplied one (the planner must honor it), else an instruction to
+        # infer the language from the brief. The planner is the only crew that
+        # runs before state.language is resolved, so it gets the hint form.
+        "language": state.language or "(detect the language from the brief and goals and use it)",
     }
 
 class CodebuilderFlow(Flow[CodebuilderState]):
@@ -225,6 +302,9 @@ class CodebuilderFlow(Flow[CodebuilderState]):
         result = PlannerCrew().crew().kickoff(inputs=_planner_inputs(self.state))
         plan_obj = validate_plan(result.pydantic)
         self.state.plan = plan_obj
+        # Resolve the output language for every downstream crew: caller override
+        # wins, else the planner's detection, else English.
+        self.state.language = self.state.language or plan_obj.language or "English"
         self.state.status = "awaiting_approval"
         return plan_obj.model_dump()
 
@@ -264,6 +344,9 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             ]
             plan_obj = fallback
         self.state.plan = plan_obj
+        # Normally a no-op (amend carries plan.language forward), but guards the
+        # edge case where the first plan emitted an empty language.
+        self.state.language = self.state.language or plan_obj.language or "English"
         self.state.status = "awaiting_approval"
         return plan_obj.model_dump()
 
@@ -301,12 +384,22 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             return {"status": "failed", "reason": "no plan to execute"}
 
         if plan.mode == "patch_existing":
-            inputs_dir = Path(self.state.workspace_dir) / "inputs"
-            repo_root = next(
-                (str(c) for c in [inputs_dir / "repo", *inputs_dir.glob("repo*")] if c.is_dir()),
-                None,
-            )
-            build_dir = repo_root or self.state.workspace_dir
+            patch_root = _resolve_patch_root(self.state.workspace_dir)
+            if patch_root is None:
+                log.warning(
+                    "patch_existing job %s has no attached project under inputs/; "
+                    "building at the workspace root",
+                    self.state.id,
+                )
+                build_dir = self.state.workspace_dir
+            else:
+                build_dir = patch_root
+                rel_prefix = Path(build_dir).relative_to(self.state.workspace_dir).as_posix()
+                _strip_patch_root_prefix(plan, rel_prefix)
+                # Extracted zips aren't git repos; commit the pristine attachment
+                # as a baseline so finalize's git diff captures exactly the repair.
+                if not (Path(build_dir) / ".git").exists():
+                    git_tool.init_and_commit(build_dir, "codebuilder baseline (pre-patch)")
         else:
             build_dir = str(Path(self.state.workspace_dir) / "output")
             Path(build_dir).mkdir(parents=True, exist_ok=True)
@@ -331,7 +424,7 @@ class CodebuilderFlow(Flow[CodebuilderState]):
         _emit_progress(self.state, "final_qa_started")
         self._import_gate_overflow: list[str] = []
         self._run_import_completeness_pass(build_dir)
-        self.state.qa_report = run_final_qa(build_dir)
+        self.state.qa_report = run_final_qa(build_dir, lint_paths=self._final_qa_lint_paths())
         if self._import_gate_overflow and self.state.qa_report:
             self.state.qa_report.passed = False
             _append_note(
@@ -341,7 +434,9 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             )
         self._repair_final_qa_if_needed(build_dir)
         if self.state.plan and self.state.plan.mode == "new_project":
-            architecture_review = run_full_architecture_gate(build_dir, self.state.plan)
+            architecture_review = run_full_architecture_gate(
+                build_dir, self.state.plan, self.state.language or "English"
+            )
             self.state.review_results.append(architecture_review)
             if self.state.qa_report and not architecture_review.passed:
                 self.state.qa_report.passed = False
@@ -364,7 +459,9 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                 log.warning("patch generation failed: %s", exc)
                 self.state.patch = ""
 
-        if self.state.plan and self.state.plan.mode == "new_project":
+        # Zip the build for both modes: a repair job's deliverable is the
+        # repaired project, not just the diff. SKIP_DIRS keeps .git out.
+        if self.state.plan:
             try:
                 zip_path = _zip_build(
                     build_dir,
@@ -450,6 +547,20 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             overflow_count=len(overflow),
         )
 
+    def _final_qa_lint_paths(self) -> list[str] | None:
+        """Lint scope for final QA: changed files only for patch jobs.
+
+        Pre-existing lint debt in user files the writer never touched must not
+        fail a repair job. ``None`` means lint the whole build dir (new_project,
+        or a patch job that somehow produced no artifacts — QA should fail then
+        anyway).
+        """
+        plan = self.state.plan
+        if plan is None or plan.mode != "patch_existing":
+            return None
+        paths = sorted({a.file_path for a in self.state.artifacts if a.file_path})
+        return paths or None
+
     def _repair_final_qa_once(self, build_dir: str, report: QAReport) -> CodeArtifact | None:
         writer = WriterCrew(workspace_dir=build_dir)
         listing_tool = WorkspaceListTool(workspace_dir=build_dir)
@@ -459,6 +570,8 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                 "workspace_listing": listing_tool._run("."),
                 "plan_summary": plan_summary(self.state.plan),
                 "qa_report": qa_report_for_repair(report),
+                "dependency_contracts": self._symbol_contract(),
+                "language": self.state.language or "English",
             }
         )
         artifact = result.pydantic if isinstance(result.pydantic, CodeArtifact) else None
@@ -506,7 +619,9 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             self.state.final_qa_repair_attempts += 1
             if artifact is not None:
                 self.state.artifacts.append(artifact)
-                self.state.qa_report = run_final_qa(build_dir)
+                self.state.qa_report = run_final_qa(
+                    build_dir, lint_paths=self._final_qa_lint_paths()
+                )
                 if self.state.qa_report.passed:
                     _append_note(
                         self.state.qa_report,
@@ -550,6 +665,27 @@ class CodebuilderFlow(Flow[CodebuilderState]):
         if self.state.patch:
             payload["patch"] = self.state.patch
         return payload
+
+    def _symbol_contract(self) -> str:
+        """Render the project-wide map of every file's exported public symbols.
+
+        Walks the plan's work packages and lists each file that declares a
+        non-empty ``public_api`` as ``path → [symbols]``. This is the
+        authoritative name map every writer must import against verbatim, so a
+        helper produced by one subtask is called by the same name in another.
+        """
+        plan = self.state.plan
+        if plan is None:
+            return "(no plan available)"
+        lines: list[str] = []
+        for subtask in plan.subtasks:
+            for planned_file in subtask.files:
+                if planned_file.public_api:
+                    symbols = "; ".join(planned_file.public_api)
+                    lines.append(f"- {planned_file.path} → [{symbols}]")
+        if not lines:
+            return "(no public symbols declared in the plan)"
+        return "\n".join(lines)
 
     def _build_subtask(self, subtask: SubTask, build_dir: str, *, index: int, total: int) -> None:
         writer = WriterCrew(workspace_dir=build_dir)
@@ -611,6 +747,8 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                     "workspace_listing": listing_tool._run("."),
                     "amendments": self.state.amendments or "(none)",
                     "prior_review_issues": prior_issues or "(none)",
+                    "dependency_contracts": self._symbol_contract(),
+                    "language": self.state.language or "English",
                 }
             )
             bundle = (
@@ -643,6 +781,7 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                         "subtask": subtask.model_dump_json(indent=2),
                         "artifact": bundle.model_dump_json(indent=2),
                         "workspace_dir": build_dir,
+                        "language": self.state.language or "English",
                     }
                 )
                 review = (
