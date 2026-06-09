@@ -363,24 +363,54 @@ def run_bundle_deterministic_review(
     )
 
 
+def _run_scoped_lint(lint_tool: Any, lint_paths: list[str]) -> str:
+    """Lint each path individually and aggregate into one PASS/SKIP/report string.
+
+    Used by patch jobs so pre-existing lint debt in files the writer never
+    touched cannot fail final QA. Any SKIP makes the whole result a SKIP
+    (required gate unavailable); any failure report makes it a failure.
+    """
+    failures: list[str] = []
+    for path in lint_paths:
+        output = lint_tool._run(path)
+        if is_skip(output):
+            return output
+        if not is_pass(output):
+            failures.append(output)
+    if failures:
+        return "\n".join(failures)
+    return "PASS"
+
+
 def run_final_qa(
     build_dir: str,
     *,
     artifact_urls: list[dict] | list[ArtifactRef] | None = None,
+    lint_paths: list[str] | None = None,
     lint_runner: Any | None = None,
     test_runner: Any | None = None,
 ) -> QAReport:
-    """Build the final QA report from required workspace lint and tests."""
+    """Build the final QA report from required workspace lint and tests.
+
+    ``lint_paths`` scopes ruff to specific files (patch jobs lint only what
+    the writer created/modified); ``None`` lints the whole build dir. Tests
+    always run over the whole build dir.
+    """
     lint_tool = lint_runner or LintRunnerTool(workspace_dir=build_dir)
     test_tool = test_runner or TestRunnerTool(workspace_dir=build_dir)
 
-    lint_output = lint_tool._run(".")
+    if lint_paths:
+        lint_output = _run_scoped_lint(lint_tool, lint_paths)
+        lint_scope_note = f"ruff check scoped to {len(lint_paths)} changed file(s)"
+    else:
+        lint_output = lint_tool._run(".")
+        lint_scope_note = "ruff check over the whole build directory"
     test_output = test_tool._run(".")
 
     lint_ok = is_pass(lint_output)
     test_ok = is_pass(test_output)
 
-    notes = ["Deterministic QA ran ruff check and pytest over the whole workspace."]
+    notes = [f"Deterministic QA ran {lint_scope_note} and pytest over the build directory."]
     if is_skip(lint_output):
         notes.append(f"Lint was not executed: {lint_output}")
     if is_skip(test_output):

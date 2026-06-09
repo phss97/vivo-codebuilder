@@ -68,6 +68,13 @@ skeleton_task:
     - `change_type` is "modify" for any file already present in an attached
       repo / zip (only legal in `patch_existing` mode), and "create" for
       every new file. Mixed plans are normal in `patch_existing` mode.
+    - PATHS in `patch_existing` mode: every FileSkeleton `path` MUST be
+      relative to the attached project's root (the cloned repo / extracted
+      zip directory under `inputs/`), NEVER prefixed with `inputs/<dir>/`.
+      E.g. if the attachment materialized at `inputs/my-app/src/pkg/mod.py`,
+      plan the path as `src/pkg/mod.py`. New files in `patch_existing` mode
+      also live under that same project root — never plan a parallel tree
+      outside the attached project.
     - Identify reference libraries. If the user attached a library (zip
       or git materialized under `inputs/`) clearly intended for the writer
       to import from rather than reimplement, record each top-level Python
@@ -127,6 +134,10 @@ expand_task:
     - Every FileSkeleton entry from the skeleton MUST appear exactly once
       across the final Plan's `subtasks[*].files`, with its `public_api`
       preserved.
+    - PATHS in `patch_existing` mode: keep every `path` relative to the
+      attached project's root (the repo / extracted zip directory under
+      `inputs/`) — never prefixed with `inputs/<dir>/`, and never a parallel
+      tree outside the attached project.
     - For every FileSkeleton that exports importable code, `public_api` MUST
       list the exact function/class/constant names WITH signatures (e.g.
       "create_registro(data: dict) -> Registro", "class RegistroRepository
@@ -214,6 +225,10 @@ amend_task:
       not fit an existing package. Give new packages fresh ids that continue
       the existing sequence (e.g. if the plan ends at `s21`, add `s22`).
     - Remove a work package only when an amendment makes it obsolete.
+    - PATHS in `patch_existing` mode: keep every `path` relative to the
+      attached project's root (the repo / extracted zip directory under
+      `inputs/`) — never prefixed with `inputs/<dir>/`, and never a parallel
+      tree outside the attached project.
     - Copy `mode`, `domain`, `language`, `tech_stack`, and `external_packages`
       from the prior plan unchanged unless an amendment changes them (e.g. the
       user confirms internal packages that should now appear in
