@@ -24,6 +24,7 @@ from codebuilder.runtime_qa import (
     persist_bundle_artifact,
     plan_summary,
     qa_report_for_repair,
+    rpa_packaging_remediation_subtask,
     run_bundle_deterministic_review,
     run_final_qa,
     run_full_architecture_gate,
@@ -424,7 +425,8 @@ class CodebuilderFlow(Flow[CodebuilderState]):
         _emit_progress(self.state, "final_qa_started")
         self._import_gate_overflow: list[str] = []
         self._run_import_completeness_pass(build_dir)
-        self.state.qa_report = run_final_qa(build_dir, lint_paths=self._final_qa_lint_paths())
+        self._run_rpa_packaging_pass(build_dir)
+        self.state.qa_report = self._run_final_qa(build_dir)
         if self._import_gate_overflow and self.state.qa_report:
             self.state.qa_report.passed = False
             _append_note(
@@ -502,6 +504,46 @@ class CodebuilderFlow(Flow[CodebuilderState]):
         return self._completion_payload(build_dir)
 
     # --- helpers ---------------------------------------------------------
+
+    def _run_final_qa(self, build_dir: str) -> QAReport:
+        """Final QA with mode-aware strictness: a new project that fails to
+        install (`uv sync`) fails QA outright; patch jobs degrade to the
+        orchestrator's interpreter because the user's project may not be
+        uv-installable."""
+        plan = self.state.plan
+        return run_final_qa(
+            build_dir,
+            lint_paths=self._final_qa_lint_paths(),
+            require_installable=bool(plan and plan.mode == "new_project"),
+        )
+
+    def _run_rpa_packaging_pass(self, build_dir: str) -> None:
+        """Fill in missing Windows build-kit files before final QA.
+
+        The plan mandates the kit, but a writer bundle can drop a file; the
+        deterministic RPA gate would then fail the job at finalize with no
+        remediation path. Best-effort: failures surface later in the gate.
+        """
+        plan = self.state.plan
+        if plan is None or plan.mode != "new_project" or plan.domain != "rpa":
+            return
+        try:
+            stub = rpa_packaging_remediation_subtask(build_dir)
+        except Exception as exc:  # noqa: BLE001 — remediation is best-effort
+            log.warning("RPA packaging remediation check failed: %s", exc)
+            return
+        if stub is None:
+            return
+        log.warning(
+            "RPA packaging kit incomplete; running remediation subtask for: %s",
+            ", ".join(stub.file_paths),
+        )
+        _emit_progress(
+            self.state,
+            "rpa_packaging_remediation_started",
+            file_paths=stub.file_paths,
+        )
+        self._build_subtask(stub, build_dir, index=1, total=1)
 
     def _run_import_completeness_pass(self, build_dir: str) -> None:
         """Detect missing project-local modules and run stub subtasks for them.
@@ -619,9 +661,7 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             self.state.final_qa_repair_attempts += 1
             if artifact is not None:
                 self.state.artifacts.append(artifact)
-                self.state.qa_report = run_final_qa(
-                    build_dir, lint_paths=self._final_qa_lint_paths()
-                )
+                self.state.qa_report = self._run_final_qa(build_dir)
                 if self.state.qa_report.passed:
                     _append_note(
                         self.state.qa_report,

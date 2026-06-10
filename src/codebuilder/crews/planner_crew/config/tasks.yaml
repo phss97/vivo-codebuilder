@@ -83,8 +83,14 @@ skeleton_task:
     - Runtime configuration must come from explicit config files, env-backed
       settings, or a secret-store boundary. Never plan hardcoded
       credentials, tokens, or machine-specific paths.
-    - Populate `open_questions` with anything the user must clarify later.
-    - Populate `assumptions` with anything you decided on the user's behalf.
+    - Prefer ASSUMPTIONS over questions. When the brief leaves a detail open,
+      make the industry-standard choice, record it in `assumptions`, and move
+      on — the user reviews the plan and can amend anything you assumed.
+    - Use `open_questions` ONLY for blocking decisions you cannot safely
+      assume — where a wrong guess would invalidate the deliverable (e.g.
+      which system of record to integrate against, a credential/access
+      dependency). Maximum 3. When nothing truly blocks, return an EMPTY
+      `open_questions` list; never pad it with nice-to-know questions.
     - If prior history is present, treat it as authoritative about
       conventions and prior decisions on this project. Reuse files,
       patterns, and tech choices already established. Surface any conflicts

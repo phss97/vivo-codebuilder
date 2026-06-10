@@ -21,6 +21,7 @@ from codebuilder.schemas import (
     SubTask,
 )
 from codebuilder.tools import LintRunnerTool, TestRunnerTool
+from codebuilder.tools.project_env import ensure_project_env
 from codebuilder.tools.workspace_tool import resolve_within
 
 log = logging.getLogger(__name__)
@@ -389,13 +390,37 @@ def run_final_qa(
     lint_paths: list[str] | None = None,
     lint_runner: Any | None = None,
     test_runner: Any | None = None,
+    require_installable: bool = False,
 ) -> QAReport:
     """Build the final QA report from required workspace lint and tests.
 
     ``lint_paths`` scopes ruff to specific files (patch jobs lint only what
     the writer created/modified); ``None`` lints the whole build dir. Tests
     always run over the whole build dir.
+
+    Provisions the project's own environment first (``uv sync``) so pytest
+    runs with the generated package importable and its dependencies present.
+    With ``require_installable`` (new-project jobs), a failed sync IS the QA
+    failure — a package that doesn't install is not a working deliverable —
+    and the sync output is surfaced for the repair writer to fix
+    ``pyproject.toml``. Patch jobs degrade gracefully: the user's project may
+    legitimately not be uv-installable, so QA falls back to the
+    orchestrator's interpreter as before.
     """
+    sync_error = ensure_project_env(build_dir)
+    if sync_error and require_installable:
+        return QAReport(
+            passed=False,
+            lint_output="",
+            test_output=truncate(sync_error),
+            integration_notes=(
+                "Project environment provisioning failed: `uv sync` could not "
+                "install the generated project from its pyproject.toml. Fix the "
+                "project metadata/dependencies — the sync output is in test_output."
+            ),
+            artifact_urls=artifact_refs(artifact_urls),
+        )
+
     lint_tool = lint_runner or LintRunnerTool(workspace_dir=build_dir)
     test_tool = test_runner or TestRunnerTool(workspace_dir=build_dir)
 
@@ -505,6 +530,96 @@ def run_rpa_deterministic_gate(build_dir: str) -> ReviewResult:
         passed=not issues,
         issues=issues,
         suggestions=[] if issues else ["RPA architecture gate passed."],
+    )
+
+
+def rpa_packaging_remediation_subtask(build_dir: str) -> SubTask | None:
+    """One writer work package filling in missing Windows build-kit files.
+
+    The planner is told to include the kit (entry script, build.spec, build
+    script, .env.example, pyinstaller dev dep), but when a writer bundle drops
+    one of them the deterministic RPA gate would fail the whole job at
+    finalize with no remediation path. This maps the file-level gate misses to
+    a concrete SubTask that ``finalize`` runs through the normal writer loop
+    before final QA. Returns ``None`` when the kit is complete. Layer/structure
+    gate issues (missing domain/application/infrastructure dirs) are NOT
+    remediated here — those mean the plan itself was wrong.
+    """
+    root = Path(build_dir)
+    files: list[FileSkeleton] = []
+    if not (root / ".env.example").is_file():
+        files.append(
+            FileSkeleton(
+                path=".env.example",
+                purpose=(
+                    "Runtime configuration template listing every environment "
+                    "variable the application reads (no real secrets)."
+                ),
+                change_type="create",
+            )
+        )
+    if not (root / "build.spec").is_file():
+        files.append(
+            FileSkeleton(
+                path="build.spec",
+                purpose=(
+                    "PyInstaller spec (onefile, console=True) whose Analysis "
+                    "points at the project's real entry script."
+                ),
+                change_type="create",
+            )
+        )
+    if not ((root / "build.ps1").is_file() or (root / "build.bat").is_file()):
+        files.append(
+            FileSkeleton(
+                path="build.ps1",
+                purpose=(
+                    "Windows build script: uv sync, then pyinstaller build.spec "
+                    "--noconfirm, producing dist/<name>.exe."
+                ),
+                change_type="create",
+            )
+        )
+    pyproject = _pyproject_text(root)
+    if pyproject and "pyinstaller" not in pyproject:
+        files.append(
+            FileSkeleton(
+                path="pyproject.toml",
+                purpose=(
+                    "Add pyinstaller to the dev dependency group, keeping all "
+                    "other metadata byte-for-byte intact."
+                ),
+                change_type="modify",
+            )
+        )
+    if not files:
+        return None
+
+    file_list = ", ".join(f.path for f in files)
+    return SubTask(
+        id="rpa_packaging_kit",
+        title="Complete the Windows .exe build kit",
+        description=(
+            "The RPA acceptance gate requires a complete Windows build kit, and "
+            f"these files are missing or incomplete: {file_list}. Create/fix them "
+            "following the 'Empacotamento — Executável Windows (.exe)' section of "
+            "the rpa skill. Inspect the workspace first (workspace_list / "
+            "workspace_read) to find the real entry script and package name so "
+            "build.spec points at the actual __main__.py path."
+        ),
+        files=files,
+        tech_notes=(
+            "build.spec Analysis takes the entry-script .py path (e.g. "
+            "src/<pkg>/__main__.py) with pathex=['src'] and datas including "
+            ".env.example. build.ps1 runs `uv sync` then `uv run pyinstaller "
+            "build.spec --noconfirm`. pyproject.toml edits must only add the "
+            "pyinstaller dev dependency."
+        ),
+        test_criteria=(
+            "All listed files exist with complete content; pyproject.toml "
+            "declares pyinstaller as a dev dependency; the RPA deterministic "
+            "packaging checks pass."
+        ),
     )
 
 
