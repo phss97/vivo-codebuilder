@@ -116,10 +116,22 @@ class ReviewResult(StrictOutputModel):
     suggestions: list[str] = Field(default_factory=list)
 
 
+ArtifactKind = Literal["file", "project_archive"]
+
+
 class ArtifactRef(StrictOutputModel):
     file_path: str
     size: int
     url: str
+    kind: ArtifactKind = "file"
+
+
+class ProjectArchiveRef(StrictOutputModel):
+    kind: Literal["project_archive"] = "project_archive"
+    file_path: str
+    size: int
+    local_path: str
+    url: str = ""
 
 
 class QAReport(StrictOutputModel):
@@ -159,4 +171,5 @@ class CodebuilderState(FlowState):
     patch: str = ""
     zip_path: str = ""
     zip_url: str = ""
+    project_archive: ProjectArchiveRef | None = None
     status: JobStatus = "pending"

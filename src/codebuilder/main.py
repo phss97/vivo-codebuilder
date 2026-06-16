@@ -39,6 +39,7 @@ from codebuilder.schemas import (
     CodeArtifact,
     CodebuilderState,
     Plan,
+    ProjectArchiveRef,
     QAReport,
     ReviewResult,
     SubTask,
@@ -127,6 +128,8 @@ def _zip_build(build_dir: str, out_dir: Path, project_name: str) -> Path:
     with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for path in src.rglob("*"):
             if not path.is_file():
+                continue
+            if path.resolve() == out_path.resolve():
                 continue
             if path.name in SKIP_FILES:
                 continue
@@ -471,25 +474,51 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                     self.state.project_name or self.state.id,
                 )
                 self.state.zip_path = str(zip_path)
+                self.state.project_archive = ProjectArchiveRef(
+                    file_path=zip_path.name,
+                    size=zip_path.stat().st_size,
+                    local_path=str(zip_path),
+                )
                 log.info("job %s zipped to %s", self.state.id, zip_path)
-            except Exception as exc:  # noqa: BLE001 — zip is convenience, not correctness
+            except Exception as exc:  # noqa: BLE001 — archive generation failure is reported in QA
                 log.warning("zip generation failed: %s", exc)
+                if self.state.qa_report:
+                    self.state.qa_report.passed = False
+                    _append_note(
+                        self.state.qa_report,
+                        f"Project archive generation failed: {exc}",
+                    )
 
-        try:
+        if self.state.qa_report:
             session_segment = self.state.project_key or self.state.session_id or self.state.id
             prefix = f"{session_segment}/{self.state.id}"
-            self.state.qa_report.artifact_urls = artifact_refs(upload_workspace(build_dir, prefix=prefix))
+            uploaded_refs: list[ArtifactRef] = []
+
             if self.state.zip_path:
                 zip_ref = upload_file(
                     self.state.zip_path,
                     key=f"{prefix}/{Path(self.state.zip_path).name}",
                 )
                 if zip_ref:
-                    zip_artifact = ArtifactRef(**zip_ref)
+                    zip_artifact = ArtifactRef(**{**zip_ref, "kind": "project_archive"})
                     self.state.zip_url = zip_artifact.url
-                    self.state.qa_report.artifact_urls.append(zip_artifact)
-        except Exception as exc:  # noqa: BLE001
-            log.warning("artifact upload failed: %s", exc)
+                    if self.state.project_archive:
+                        self.state.project_archive.url = zip_artifact.url
+                    uploaded_refs.append(zip_artifact)
+                elif os.environ.get("CODEBUILDER_ARTIFACT_BUCKET"):
+                    self.state.qa_report.passed = False
+                    _append_note(
+                        self.state.qa_report,
+                        "Project archive upload failed: CODEBUILDER_ARTIFACT_BUCKET is set "
+                        "but no downloadable archive URL was returned.",
+                    )
+
+            try:
+                uploaded_refs.extend(artifact_refs(upload_workspace(build_dir, prefix=prefix)))
+            except Exception as exc:  # noqa: BLE001
+                log.warning("workspace artifact upload failed: %s", exc)
+
+            self.state.qa_report.artifact_urls = uploaded_refs
 
         self.state.status = (
             "done" if self.state.qa_report is None or self.state.qa_report.passed else "failed"
@@ -702,6 +731,8 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             payload["zip_path"] = self.state.zip_path
         if self.state.zip_url:
             payload["zip_url"] = self.state.zip_url
+        if self.state.project_archive:
+            payload["project_archive"] = self.state.project_archive.model_dump(mode="json")
         if self.state.patch:
             payload["patch"] = self.state.patch
         return payload

@@ -6,7 +6,7 @@
 
 ## 1. O que é o Codebuilder
 
-O Codebuilder é um **Flow do CrewAI** que recebe um *brief* de projeto (descrição em linguagem natural + objetivos + stack + anexos) e devolve **código pronto** — seja como um projeto novo zipado, seja como um *patch* aplicado sobre um repositório existente.
+O Codebuilder é um **Flow do CrewAI** que recebe um *brief* de projeto (descrição em linguagem natural + objetivos + stack + anexos) e devolve **código pronto** — seja como um projeto novo zipado, seja como um *patch* aplicado sobre um repositório existente acompanhado do projeto completo corrigido em `.zip`.
 
 O ciclo de vida de um job é:
 
@@ -120,6 +120,7 @@ qa_report: QAReport | None
 final_qa_repair_attempts: int
 patch: str                    # modo patch_existing
 zip_path, zip_url
+project_archive               # entregável primário: zip completo do projeto
 status: "pending" | "planning" | "awaiting_approval" | "executing" | "done" | "failed"
 ```
 
@@ -266,12 +267,14 @@ def finalize(self, _prior=None):
         review = run_full_architecture_gate(build_dir, self.state.plan)
         # ↑ despacha por plan.domain (ex.: "rpa" → _rpa_full_gate)
 
-    # 4. Patch (modo patch_existing) ou zip (modo new_project)
+    # 4. Patch (modo patch_existing) + zip completo (todos os modos)
     if mode == "patch_existing": self.state.patch = git_tool.diff(build_dir)
-    if mode == "new_project":    self.state.zip_path = _zip_build(build_dir, ...)
+    self.state.zip_path = _zip_build(build_dir, ...)
+    self.state.project_archive = ProjectArchiveRef(...)
 
     # 5. Upload S3 dos artefatos
-    self.state.qa_report.artifact_urls = artifact_refs(upload_workspace(build_dir, prefix=...))
+    # O zip completo é o artefato primário; arquivos individuais são auditoria.
+    self.state.qa_report.artifact_urls = [project_archive_ref, *file_refs]
 
     # 6. Histórico (best-effort, nunca quebra o flow)
     history.record(self.state)
@@ -825,4 +828,3 @@ final, adicionar um `guardrail=` deterministic no Task que assegure
 `len(subtasks) >= 1` e cubra os campos obrigatórios. Sem isso,
 qualquer drift de structured-output do Sonnet derruba o flow inteiro
 em vez de só retentar a task.
-

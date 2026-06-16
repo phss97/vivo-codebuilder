@@ -370,7 +370,9 @@ def test_final_qa_builds_report_and_preserves_artifact_refs() -> None:
         "/unused",
         lint_runner=FakeTool("PASS"),
         test_runner=FakeTool("PASS\n1 passed"),
-        artifact_urls=[{"file_path": "hello.py", "size": 12, "url": "https://example.test/hello.py"}],
+        artifact_urls=[
+            {"file_path": "hello.py", "size": 12, "url": "https://example.test/hello.py"}
+        ],
     )
 
     assert qa.passed is True
@@ -491,6 +493,17 @@ def test_zip_build_excludes_tool_cache_dirs(tmp_path: Path) -> None:
     assert all(".ruff_cache" not in name for name in names)
 
 
+def test_zip_build_excludes_archive_when_written_inside_build_dir(tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("print('ok')\n", encoding="utf-8")
+
+    zip_path = main._zip_build(str(tmp_path), tmp_path, "demo")
+
+    with zipfile.ZipFile(zip_path) as zf:
+        names = zf.namelist()
+    assert "demo/app.py" in names
+    assert "demo/demo.zip" not in names
+
+
 def test_attachment_zip_rejects_path_traversal(tmp_path: Path) -> None:
     archive = tmp_path / "bad.zip"
     with zipfile.ZipFile(archive, "w") as zf:
@@ -592,8 +605,116 @@ def test_finalize_repairs_failed_final_qa_and_returns_payload(monkeypatch, tmp_p
     assert flow.state.final_qa_repair_attempts == 1
     assert payload["qa_report"]["passed"] is True
     assert payload["artifact_urls"] == [
-        {"file_path": "app.py", "size": 37, "url": "https://example.test/app.py"}
+        {
+            "file_path": "app.py",
+            "size": 37,
+            "url": "https://example.test/app.py",
+            "kind": "file",
+        }
     ]
+
+
+def test_finalize_returns_project_archive_as_primary_artifact(monkeypatch, tmp_path: Path) -> None:
+    build_dir = tmp_path / "inputs" / "repo"
+    build_dir.mkdir(parents=True)
+    (build_dir / "changed.py").write_text("VALUE = 2\n", encoding="utf-8")
+    (build_dir / "untouched.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+    flow = CodebuilderFlow()
+    flow.state.workspace_dir = str(tmp_path)
+    flow.state.project_name = "demo"
+    flow.state.status = "executing"
+    flow.state.plan = Plan(
+        project_name="demo",
+        mode="patch_existing",
+        tech_stack=["python"],
+        subtasks=[
+            SubTask(
+                id="s1",
+                title="Patch changed file",
+                description="Modify only changed.py.",
+                files=[FileSkeleton(path="changed.py", purpose="Changed module.", change_type="modify")],
+                test_criteria="Archive contains the repaired project.",
+            )
+        ],
+    )
+    flow.state.artifacts = [
+        CodeArtifact(
+            subtask_id="s1",
+            file_path="changed.py",
+            content="VALUE = 2\n",
+            language="python",
+        )
+    ]
+    flow._build_dir = str(build_dir)
+
+    monkeypatch.setattr(
+        main,
+        "run_final_qa",
+        lambda build_dir, **_kwargs: QAReport(
+            passed=True, lint_output="PASS", test_output="PASS", integration_notes="Clean."
+        ),
+    )
+    monkeypatch.setattr(
+        main,
+        "upload_workspace",
+        lambda build_dir, prefix: [
+            {"file_path": "changed.py", "size": 10, "url": "https://example.test/changed.py"}
+        ],
+    )
+    monkeypatch.setattr(
+        main,
+        "upload_file",
+        lambda local_path, key: {
+            "file_path": Path(local_path).name,
+            "size": Path(local_path).stat().st_size,
+            "url": "https://example.test/demo.zip",
+        },
+    )
+    monkeypatch.setattr(main.history, "record", lambda state: None)
+
+    payload = flow.finalize(None)
+
+    assert payload["project_archive"]["kind"] == "project_archive"
+    assert payload["project_archive"]["file_path"] == "demo.zip"
+    assert payload["project_archive"]["url"] == "https://example.test/demo.zip"
+    assert payload["artifact_urls"][0]["kind"] == "project_archive"
+    assert payload["artifact_urls"][0]["file_path"] == "demo.zip"
+    assert payload["artifact_urls"][1]["kind"] == "file"
+    with zipfile.ZipFile(payload["zip_path"]) as zf:
+        names = zf.namelist()
+    assert "demo/changed.py" in names
+    assert "demo/untouched.py" in names
+
+
+def test_finalize_fails_when_configured_project_archive_upload_fails(
+    monkeypatch, tmp_path: Path
+) -> None:
+    (tmp_path / "app.py").write_text("print('ok')\n", encoding="utf-8")
+
+    flow = CodebuilderFlow()
+    flow.state.workspace_dir = str(tmp_path)
+    flow.state.project_name = "demo"
+    flow.state.status = "executing"
+    flow.state.plan = _empty_plan(domain="")
+
+    monkeypatch.setenv("CODEBUILDER_ARTIFACT_BUCKET", "artifact-bucket")
+    monkeypatch.setattr(
+        main,
+        "run_final_qa",
+        lambda build_dir, **_kwargs: QAReport(
+            passed=True, lint_output="PASS", test_output="PASS", integration_notes="Clean."
+        ),
+    )
+    monkeypatch.setattr(main, "upload_workspace", lambda build_dir, prefix: [])
+    monkeypatch.setattr(main, "upload_file", lambda local_path, key: None)
+    monkeypatch.setattr(main.history, "record", lambda state: None)
+
+    payload = flow.finalize(None)
+
+    assert payload["status"] == "failed"
+    assert payload["project_archive"]["kind"] == "project_archive"
+    assert "Project archive upload failed" in payload["qa_report"]["integration_notes"]
 
 
 def test_finalize_returns_artifacts_when_final_qa_still_fails(monkeypatch, tmp_path: Path) -> None:
@@ -650,5 +771,10 @@ def test_finalize_returns_artifacts_when_final_qa_still_fails(monkeypatch, tmp_p
     assert payload["qa_report"]["passed"] is False
     assert "still failing after 1 writer repair attempt" in payload["qa_report"]["integration_notes"]
     assert payload["artifact_urls"] == [
-        {"file_path": "app.py", "size": 45, "url": "https://example.test/app.py"}
+        {
+            "file_path": "app.py",
+            "size": 45,
+            "url": "https://example.test/app.py",
+            "kind": "file",
+        }
     ]

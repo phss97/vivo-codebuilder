@@ -12,7 +12,7 @@ brief.json ──▶ ingest ──▶ plan ──▶ [HITL approve/amend/reject]
 Two modes:
 
 - **`new_project`** — agents scaffold a fresh project under `workspaces/<session_id>/output/` and `git init` it.
-- **`patch_existing`** — the Git attachment in the brief is cloned into `workspaces/<session_id>/inputs/repo`, agents edit it in place, and a diff is captured on finalize.
+- **`patch_existing`** — the Git or zip attachment is materialized under `workspaces/<session_id>/inputs/`, agents edit that project in place, a diff is captured, and the complete repaired project is zipped on finalize.
 
 ## Requirements
 
@@ -81,6 +81,15 @@ After the planner runs, the flow pauses and either:
 
 `amend` loops back through the planner with the prior plan + the amendment and gates again.
 
+### Completion payload
+
+The final payload always distinguishes the runnable project archive from file-level audit artifacts:
+
+- `project_archive` — primary deliverable for both `new_project` and `patch_existing`; contains the local archive path and, when S3 upload is enabled, the downloadable URL.
+- `zip_path` / `zip_url` — backward-compatible aliases for the same archive.
+- `artifact_urls` — individual uploaded files plus the archive when available. These are useful for inspection, but callers should use `project_archive` / `zip_url` when they need a runnable project.
+- `patch` — diff for `patch_existing` jobs only. It is an audit/review aid, not the primary runnable deliverable.
+
 ## Project layout
 
 ```
@@ -117,5 +126,6 @@ uv add <pkg>                 # prefer this over hand-editing pyproject
 - Workspaces, history DB, and the local `.env` are gitignored — see `.gitignore`.
 - All file I/O from agents is routed through `Workspace*Tool`, which enforces that relative paths cannot escape the job workspace. Never give agents a raw `FileReadTool` pointed at a real filesystem path.
 - Final QA runs deterministic `ruff` + `pytest` across the whole workspace. Skipped lint/tests are failures. If QA fails, the writer gets one repair pass by default, QA reruns, and artifacts are still returned with the final QA status.
+- Patch jobs plan and report only changed files, but the user-facing deliverable is the complete repaired project archive. Consumers must not reconstruct a project from changed-file artifacts.
 - New-project jobs whose plan declares a `domain` (e.g. `rpa`) also run that domain's architecture gate before completion. For `rpa`, missing orchestrator/producer/consumer, Clean Architecture layers, `.env.example`/CCM config, tests, or traceability marks the job failed even if lint/tests pass. Plans without a registered `domain` finalize on lint/test alone.
 - Crew outputs are validated through pydantic schemas with guardrails (e.g. the planner's `Plan` must have 1–24 bundled work packages, each with 1–6 planned files and non-empty `test_criteria`; deterministic review rejects missing/extra bundle paths and placeholder/TODO-only files).
