@@ -5,12 +5,26 @@ from pathlib import Path
 
 from pypdf import PdfReader
 
+from codebuilder.history import canonicalize_git_url
+
 from . import git_tool
-from .workspace_tool import resolve_within
+from .workspace_tool import _is_skipped_path, resolve_within
 
 
 def _safe_name(name: str) -> str:
     return Path(name).name or "attachment"
+
+
+def _sanitized_git_origin(url: str) -> str:
+    """Reduce a clone URL to ``host/org/repo`` with NO credentials.
+
+    Strips the fragment and query string (signed/`?token=` tokens) first, then
+    reuses ``canonicalize_git_url`` to drop the scheme, userinfo (``user:pat@``),
+    and ``.git`` suffix. This is what's safe to put in a record summary that
+    later reaches the planner LLM prompt.
+    """
+    base = url.split("#", 1)[0].split("?", 1)[0]
+    return canonicalize_git_url(base)
 
 
 def _extract_zip_safely(data: bytes, extract_to: Path) -> None:
@@ -20,6 +34,8 @@ def _extract_zip_safely(data: bytes, extract_to: Path) -> None:
                 target = resolve_within(str(extract_to), info.filename)
             except ValueError as exc:
                 raise ValueError(f"Unsafe zip member {info.filename!r}: {exc}") from exc
+            if _is_skipped_path(Path(info.filename)):
+                continue
             if info.is_dir():
                 target.mkdir(parents=True, exist_ok=True)
                 continue
@@ -51,7 +67,8 @@ def materialize(attachments: list[dict], workspace_dir: str) -> list[dict]:
                 dest_name = f"repo_{len(records)}"
                 dest = inputs_dir / dest_name
             git_tool.clone(url, str(dest))
-            records.append({"kind": "git", "name": name, "path": str(dest.relative_to(workspace_dir)), "summary": f"git repo cloned from {url}"})
+            origin = _sanitized_git_origin(url) or "(private source)"
+            records.append({"kind": "git", "name": name, "path": str(dest.relative_to(workspace_dir)), "summary": f"git repo cloned from {origin}"})
         elif kind == "zip":
             data = base64.b64decode(att.get("content_b64", ""))
             extract_to = inputs_dir / (Path(name).stem or "archive")

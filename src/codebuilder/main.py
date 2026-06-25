@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import os
 import re
 import zipfile
@@ -18,7 +19,9 @@ from codebuilder.crews.planner_crew import PlannerCrew
 from codebuilder.crews.reviewer_crew import ReviewerCrew
 from codebuilder.crews.writer_crew import WriterCrew
 from codebuilder.runtime_qa import (
+    MODIFY_PREIMAGE_LIMIT,
     artifact_refs,
+    build_symbol_index,
     looks_like_placeholder,
     persist_artifact,
     persist_bundle_artifact,
@@ -38,6 +41,7 @@ from codebuilder.schemas import (
     CodeBundleArtifact,
     CodeArtifact,
     CodebuilderState,
+    FileSkeleton,
     Plan,
     ProjectArchiveRef,
     QAReport,
@@ -52,7 +56,8 @@ log = logging.getLogger(__name__)
 
 WORKSPACE_ROOT = Path(os.environ.get("CODEBUILDER_WORKSPACE_ROOT", "./workspaces")).resolve()
 DEFAULT_MAX_SUBTASK_RETRIES = 1
-DEFAULT_MAX_FINAL_QA_REPAIRS = 1
+DEFAULT_PATCH_FINAL_QA_REPAIRS = 1
+DEFAULT_NEW_PROJECT_FINAL_QA_REPAIRS = 2
 PROGRESS_WEBHOOK_TIMEOUT_SECONDS = 5
 
 GUARDRAIL_LLM = os.environ.get("CODEBUILDER_GUARDRAIL_LLM", "openai/gpt-5.4-mini")
@@ -81,7 +86,7 @@ def _max_subtask_retries() -> int:
 
 
 def _max_final_qa_repairs() -> int:
-    return _env_int("CODEBUILDER_MAX_FINAL_QA_REPAIRS", DEFAULT_MAX_FINAL_QA_REPAIRS)
+    return _env_int("CODEBUILDER_MAX_FINAL_QA_REPAIRS", DEFAULT_NEW_PROJECT_FINAL_QA_REPAIRS)
 
 
 def _append_note(report: QAReport, note: str) -> None:
@@ -114,6 +119,41 @@ def _emit_progress(state: CodebuilderState, event_type: str, **payload: Any) -> 
             log.warning("progress webhook POST for %s returned %s", event_type, resp.status_code)
     except requests.RequestException as exc:
         log.warning("progress webhook POST failed for %s: %s", event_type, exc)
+
+
+def _prompt_payload_stats(inputs: dict[str, Any]) -> dict[str, Any]:
+    serialized = json.dumps(inputs, default=str, ensure_ascii=False)
+    return {
+        "input_chars": len(serialized),
+        "input_keys": sorted(inputs.keys()),
+    }
+
+
+def _emit_prompt_inputs_prepared(
+    state: CodebuilderState,
+    event_type: str,
+    inputs: dict[str, Any],
+    **payload: Any,
+) -> None:
+    _emit_progress(state, event_type, **payload, **_prompt_payload_stats(inputs))
+
+
+def _usage_payload(result: Any) -> dict[str, Any] | str | None:
+    usage = getattr(result, "token_usage", None) or getattr(result, "usage_metrics", None)
+    if usage is None:
+        return None
+    if hasattr(usage, "model_dump"):
+        return usage.model_dump(mode="json")
+    if isinstance(usage, dict):
+        return usage
+    return str(usage)
+
+
+def _emit_usage_metrics(state: CodebuilderState, stage: str, result: Any, **payload: Any) -> None:
+    usage = _usage_payload(result)
+    if usage is None:
+        return
+    _emit_progress(state, "llm_usage", stage=stage, usage=usage, **payload)
 
 
 def _zip_build(build_dir: str, out_dir: Path, project_name: str) -> Path:
@@ -212,16 +252,157 @@ def _strip_patch_root_prefix(plan: Plan, prefix: str) -> None:
                 planned_file.path = planned_file.path[len(prefix):]
 
 
+def _format_attachment_records(records: list[dict[str, str]]) -> str:
+    if not records:
+        return "(no attachments)"
+    lines: list[str] = []
+    for record in records:
+        kind = record.get("kind") or "attachment"
+        name = record.get("name") or "(unnamed)"
+        path = record.get("path") or "(no path)"
+        summary = record.get("summary") or ""
+        suffix = f": {summary}" if summary else ""
+        lines.append(f"- {kind} {name} at {path}{suffix}")
+    return "\n".join(lines)
+
+
+def _workspace_context_for_files(build_dir: str, files: list[FileSkeleton]) -> str:
+    root = Path(build_dir).resolve()
+    listing_tool = WorkspaceListTool(workspace_dir=build_dir)
+    planned_lines: list[str] = []
+    parent_dirs: set[str] = set()
+
+    for planned_file in files:
+        try:
+            target = resolve_within(build_dir, planned_file.path)
+        except ValueError as exc:
+            planned_lines.append(
+                f"- {planned_file.path} ({planned_file.change_type}): invalid path ({exc})"
+            )
+            continue
+
+        exists = "exists" if target.is_file() else "missing"
+        planned_lines.append(
+            f"- {planned_file.path} ({planned_file.change_type}, {exists}): "
+            f"{planned_file.purpose}"
+        )
+        parent = target.parent
+        try:
+            parent_rel = parent.relative_to(root).as_posix()
+        except ValueError:
+            continue
+        parent_dirs.add(parent_rel if parent_rel != "." else ".")
+
+    listing_sections: list[str] = []
+    for parent in sorted(parent_dirs):
+        listing_sections.append(
+            f"-----BEGIN DIRECTORY LISTING: {parent}-----\n"
+            f"{listing_tool._run(parent)}\n"
+            f"-----END DIRECTORY LISTING: {parent}-----"
+        )
+
+    planned = "\n".join(planned_lines) or "(no planned files)"
+    listings = "\n\n".join(listing_sections) or "(no parent directories to list)"
+    return (
+        "Planned files:\n"
+        f"{planned}\n\n"
+        "Scoped directory listings:\n"
+        f"{listings}"
+    )
+
+
+def _subtask_workspace_context(build_dir: str, subtask: SubTask) -> str:
+    return _workspace_context_for_files(build_dir, subtask.files)
+
+
+MAX_REPAIR_CONTEXT_FILES = 40
+
+
+def _repair_workspace_context(
+    build_dir: str,
+    plan: Plan | None,
+    artifacts: list[CodeArtifact],
+) -> str:
+    planned_by_path: dict[str, FileSkeleton] = {}
+    if plan:
+        for subtask in plan.subtasks:
+            for planned_file in subtask.files:
+                planned_by_path[planned_file.path] = planned_file
+
+    files: list[FileSkeleton] = []
+    seen: set[str] = set()
+    for artifact in artifacts:
+        if not artifact.file_path or artifact.file_path in seen:
+            continue
+        files.append(
+            planned_by_path.get(artifact.file_path)
+            or FileSkeleton(
+                path=artifact.file_path,
+                purpose="File changed during this run.",
+                change_type="modify",
+            )
+        )
+        seen.add(artifact.file_path)
+        # Cap always: a large job touches dozens of files and each adds a
+        # directory listing — uncapped this dominated the repair prompt.
+        if len(files) >= MAX_REPAIR_CONTEXT_FILES:
+            break
+
+    if not files and plan:
+        for subtask in plan.subtasks:
+            for planned_file in subtask.files:
+                if planned_file.path not in seen:
+                    files.append(planned_file)
+                    seen.add(planned_file.path)
+                if len(files) >= MAX_REPAIR_CONTEXT_FILES:
+                    break
+            if len(files) >= MAX_REPAIR_CONTEXT_FILES:
+                break
+
+    return _workspace_context_for_files(build_dir, files)
+
+
+def _preimage_for_prompt(content: str) -> str:
+    """Writer-facing view of a modify target's preimage, truncated only for the
+    rare file larger than ``MODIFY_PREIMAGE_LIMIT``. The marker tells the writer
+    not to rewrite wholesale; the review guard rejects a shorter result so the
+    unshown tail can't be silently dropped."""
+    if len(content) <= MODIFY_PREIMAGE_LIMIT:
+        return content
+    omitted = len(content) - MODIFY_PREIMAGE_LIMIT
+    return (
+        f"{content[:MODIFY_PREIMAGE_LIMIT]}\n\n[truncated {omitted} chars — file too large to "
+        "show in full; make targeted edits and preserve the omitted tail]"
+    )
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _upload_file_artifacts_enabled(plan: Plan | None) -> bool:
+    default = not (plan and plan.mode == "patch_existing")
+    return _env_bool("CODEBUILDER_UPLOAD_FILE_ARTIFACTS", default)
+
+
 def _planner_inputs(state: CodebuilderState) -> dict:
-    listing_tool = WorkspaceListTool(workspace_dir=state.workspace_dir) if state.workspace_dir else None
-    listing = listing_tool._run(".") if listing_tool else ""
+    records = _format_attachment_records(state.attachment_records)
+    if records == "(no attachments)" and state.workspace_dir:
+        inputs_dir = Path(state.workspace_dir) / "inputs"
+        if inputs_dir.exists():
+            listing = WorkspaceListTool(workspace_dir=state.workspace_dir)._run("inputs")
+            if listing != "(empty)":
+                records = f"Materialized inputs:\n{listing}"
     prior_history = history.summarize_for_planner(state.project_key) if state.project_key else ""
     return {
         "brief": state.brief,
         "project_name": state.project_name or "(unspecified)",
         "goals": "\n".join(f"- {g}" for g in state.goals) or "(none)",
         "tech_stack": ", ".join(state.tech_stack) or "(unspecified)",
-        "attachment_records": listing or "(no attachments)",
+        "attachment_records": records,
         "workspace_dir": state.workspace_dir,
         "prior_plan": state.plan.model_dump_json(indent=2) if state.plan else "",
         "prior_history": prior_history or "(no prior runs for this project)",
@@ -263,10 +444,12 @@ class CodebuilderFlow(Flow[CodebuilderState]):
         self.state.workspace_dir = str(workspace_dir)
 
         if self.state.attachments:
-            attachment_tool.materialize(
+            self.state.attachment_records = attachment_tool.materialize(
                 [a.model_dump() for a in self.state.attachments],
                 self.state.workspace_dir,
             )
+        else:
+            self.state.attachment_records = []
 
         project_key = history.project_key_from(self.state)
         if not project_key:
@@ -303,7 +486,19 @@ class CodebuilderFlow(Flow[CodebuilderState]):
         default_outcome="amend",
     )
     def plan(self) -> dict:
-        result = PlannerCrew().crew().kickoff(inputs=_planner_inputs(self.state))
+        planner_inputs = _planner_inputs(self.state)
+        _emit_prompt_inputs_prepared(
+            self.state,
+            "planner_inputs_prepared",
+            planner_inputs,
+            stage="plan",
+        )
+        result = (
+            PlannerCrew(workspace_dir=self.state.workspace_dir)
+            .crew()
+            .kickoff(inputs=planner_inputs)
+        )
+        _emit_usage_metrics(self.state, "plan", result)
         plan_obj = validate_plan(result.pydantic)
         self.state.plan = plan_obj
         # Resolve the output language for every downstream crew: caller override
@@ -331,7 +526,25 @@ class CodebuilderFlow(Flow[CodebuilderState]):
         # open_question, and let @human_feedback re-gate (re-pause + re-persist)
         # so the user can retry or approve the prior plan as-is.
         try:
-            result = PlannerCrew().amend_crew().kickoff(inputs=_planner_inputs(self.state))
+            planner_inputs = _planner_inputs(self.state)
+            _emit_prompt_inputs_prepared(
+                self.state,
+                "planner_inputs_prepared",
+                planner_inputs,
+                stage="revise_plan",
+                amend_cycle=self.state.amend_cycles,
+            )
+            result = (
+                PlannerCrew(workspace_dir=self.state.workspace_dir)
+                .amend_crew()
+                .kickoff(inputs=planner_inputs)
+            )
+            _emit_usage_metrics(
+                self.state,
+                "revise_plan",
+                result,
+                amend_cycle=self.state.amend_cycles,
+            )
             plan_obj = validate_plan(result.pydantic)
         except Exception as exc:  # noqa: BLE001 — a revise failure must never brick the job
             fallback = self._prior_plan_snapshot(prior)
@@ -513,10 +726,17 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                         "but no downloadable archive URL was returned.",
                     )
 
-            try:
-                uploaded_refs.extend(artifact_refs(upload_workspace(build_dir, prefix=prefix)))
-            except Exception as exc:  # noqa: BLE001
-                log.warning("workspace artifact upload failed: %s", exc)
+            if _upload_file_artifacts_enabled(self.state.plan):
+                try:
+                    uploaded_refs.extend(artifact_refs(upload_workspace(build_dir, prefix=prefix)))
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("workspace artifact upload failed: %s", exc)
+            else:
+                _emit_progress(
+                    self.state,
+                    "file_artifact_upload_skipped",
+                    reason="disabled_for_patch_existing",
+                )
 
             self.state.qa_report.artifact_urls = uploaded_refs
 
@@ -543,8 +763,20 @@ class CodebuilderFlow(Flow[CodebuilderState]):
         return run_final_qa(
             build_dir,
             lint_paths=self._final_qa_lint_paths(),
+            test_paths=self._final_qa_test_paths(build_dir),
+            type_paths=self._final_qa_type_paths(),
             require_installable=bool(plan and plan.mode == "new_project"),
+            allow_no_tests=bool(plan and plan.mode == "patch_existing"),
         )
+
+    def _max_final_qa_repairs(self) -> int:
+        plan = self.state.plan
+        default = (
+            DEFAULT_PATCH_FINAL_QA_REPAIRS
+            if plan and plan.mode == "patch_existing"
+            else DEFAULT_NEW_PROJECT_FINAL_QA_REPAIRS
+        )
+        return _env_int("CODEBUILDER_MAX_FINAL_QA_REPAIRS", default)
 
     def _run_rpa_packaging_pass(self, build_dir: str) -> None:
         """Fill in missing Windows build-kit files before final QA.
@@ -632,39 +864,145 @@ class CodebuilderFlow(Flow[CodebuilderState]):
         paths = sorted({a.file_path for a in self.state.artifacts if a.file_path})
         return paths or None
 
-    def _repair_final_qa_once(self, build_dir: str, report: QAReport) -> CodeArtifact | None:
-        writer = WriterCrew(workspace_dir=build_dir)
-        listing_tool = WorkspaceListTool(workspace_dir=build_dir)
-        result = writer.repair_crew().kickoff(
-            inputs={
-                "workspace_dir": build_dir,
-                "workspace_listing": listing_tool._run("."),
-                "plan_summary": plan_summary(self.state.plan),
-                "qa_report": qa_report_for_repair(report),
-                "dependency_contracts": self._symbol_contract(),
-                "language": self.state.language or "English",
+    def _final_qa_type_paths(self) -> list[str] | None:
+        """Type-check scope for final QA: changed Python files only for patch
+        jobs. Without this, mypy runs over the whole repo and a patch fails on
+        pre-existing type debt in files the writer never touched (the gate uses
+        ``follow_imports = silent`` so dependencies are still consulted for types
+        but only these target files report errors). ``None`` = whole package
+        (new_project, where every file is in scope)."""
+        plan = self.state.plan
+        if plan is None or plan.mode != "patch_existing":
+            return None
+        paths = sorted(
+            {
+                a.file_path
+                for a in self.state.artifacts
+                if a.file_path and a.file_path.endswith(".py")
             }
         )
-        artifact = result.pydantic if isinstance(result.pydantic, CodeArtifact) else None
-        if artifact is None:
-            log.warning("final QA repair writer did not return a CodeArtifact")
+        return paths or None
+
+    def _final_qa_test_paths(self, build_dir: str) -> list[str] | None:
+        """Pytest scope for final QA.
+
+        Patch jobs default to relevant tests only: changed test files plus tests
+        whose filename matches a changed Python module. ``None`` means run the
+        whole suite; ``[]`` means no related tests were found.
+        """
+        plan = self.state.plan
+        if plan is None or plan.mode != "patch_existing":
             return None
-        if artifact.subtask_id != "final_qa_repair":
-            artifact.subtask_id = "final_qa_repair"
-        persist_error = persist_artifact(artifact, build_dir)
-        if persist_error:
-            log.warning("final QA repair could not be persisted: %s", persist_error)
+        if os.environ.get("CODEBUILDER_PATCH_TEST_SCOPE", "").strip().lower() in {
+            "all",
+            "full",
+            "whole",
+        }:
             return None
-        if looks_like_placeholder(artifact.content):
-            log.warning("final QA repair produced placeholder content: %s", artifact.file_path)
-            return None
-        return artifact
+
+        root = Path(build_dir)
+        paths: set[str] = set()
+        module_stems: set[str] = set()
+        for artifact in self.state.artifacts:
+            rel_path = artifact.file_path or ""
+            if not rel_path:
+                continue
+            rel = Path(rel_path)
+            is_test = (
+                "tests" in rel.parts
+                or rel.name.startswith("test_")
+                or rel.name.endswith("_test.py")
+            )
+            if is_test:
+                paths.add(rel.as_posix())
+            elif rel.suffix == ".py":
+                module_stems.add(rel.stem)
+
+        tests_root = root / "tests"
+        if tests_root.is_dir():
+            wanted_names = {
+                name
+                for stem in module_stems
+                for name in (f"test_{stem}.py", f"{stem}_test.py")
+            }
+            for test_file in tests_root.rglob("*.py"):
+                if test_file.name in wanted_names:
+                    paths.add(test_file.relative_to(root).as_posix())
+
+        return sorted(paths)
+
+    @staticmethod
+    def _qa_failure_signature(report: QAReport | None) -> str:
+        """A stable string fingerprint of a QA report's failures, used to detect
+        a repair pass that changed nothing so we stop burning attempts."""
+        if report is None:
+            return ""
+        return " ".join(
+            (report.lint_output or "", report.test_output or "", report.type_output or "")
+        )
+
+    def _repair_final_qa_once(self, build_dir: str, report: QAReport) -> list[CodeArtifact]:
+        """Run one repair pass, persisting EVERY file the writer returns.
+
+        The writer returns a CodeBundleArtifact so a single pass can fix all the
+        files implicated by the failures (systemic drift spans several). A bare
+        CodeArtifact is still accepted for backward compatibility.
+        """
+        writer = WriterCrew(workspace_dir=build_dir)
+        repair_inputs = {
+            "workspace_dir": build_dir,
+            "workspace_listing": _repair_workspace_context(
+                build_dir,
+                self.state.plan,
+                self.state.artifacts,
+            ),
+            "plan_summary": plan_summary(self.state.plan),
+            "qa_report": qa_report_for_repair(report),
+            "dependency_contracts": self._symbol_contract(build_dir),
+            "language": self.state.language or "English",
+        }
+        _emit_prompt_inputs_prepared(
+            self.state,
+            "final_qa_repair_inputs_prepared",
+            repair_inputs,
+            stage="final_qa_repair",
+        )
+        result = writer.repair_crew().kickoff(inputs=repair_inputs)
+        _emit_usage_metrics(self.state, "final_qa_repair", result)
+
+        pydantic = result.pydantic
+        if isinstance(pydantic, CodeBundleArtifact):
+            candidates = list(pydantic.artifacts)
+        elif isinstance(pydantic, CodeArtifact):
+            candidates = [pydantic]
+        else:
+            log.warning("final QA repair writer did not return a CodeArtifact/CodeBundleArtifact")
+            return []
+
+        repaired: list[CodeArtifact] = []
+        for artifact in candidates:
+            if not artifact.file_path:
+                continue
+            if artifact.subtask_id != "final_qa_repair":
+                artifact.subtask_id = "final_qa_repair"
+            persist_error = persist_artifact(artifact, build_dir)
+            if persist_error:
+                log.warning(
+                    "final QA repair could not persist %s: %s", artifact.file_path, persist_error
+                )
+                continue
+            if looks_like_placeholder(artifact.content):
+                log.warning("final QA repair produced placeholder content: %s", artifact.file_path)
+                continue
+            repaired.append(artifact)
+        return repaired
 
     def _repair_final_qa_if_needed(self, build_dir: str) -> None:
-        attempts = _max_final_qa_repairs()
+        attempts = self._max_final_qa_repairs()
         if attempts <= 0:
             return
 
+        last_signature = self._qa_failure_signature(self.state.qa_report)
         for attempt in range(1, attempts + 1):
             report = self.state.qa_report
             if report is None or report.passed:
@@ -683,13 +1021,13 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                 max_repair_attempts=attempts,
             )
             try:
-                artifact = self._repair_final_qa_once(build_dir, report)
+                repaired = self._repair_final_qa_once(build_dir, report)
             except Exception as exc:  # noqa: BLE001 — repair is best-effort; still deliver artifacts
                 log.warning("final QA repair attempt failed: %s", exc)
-                artifact = None
+                repaired = []
             self.state.final_qa_repair_attempts += 1
-            if artifact is not None:
-                self.state.artifacts.append(artifact)
+            if repaired:
+                self.state.artifacts.extend(repaired)
                 self.state.qa_report = self._run_final_qa(build_dir)
                 if self.state.qa_report.passed:
                     _append_note(
@@ -697,6 +1035,18 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                         f"Final QA passed after {attempt} writer repair attempt(s).",
                     )
                     return
+                new_signature = self._qa_failure_signature(self.state.qa_report)
+                # A pass that changed nothing won't converge — stop early, but only
+                # when attempts remain (the last attempt falls through to the
+                # post-loop "still failing" summary the callers/tests expect).
+                if new_signature == last_signature and attempt < attempts:
+                    _append_note(
+                        self.state.qa_report,
+                        f"Final QA repair attempt {attempt} did not change the failures; "
+                        "stopping early.",
+                    )
+                    return
+                last_signature = new_signature
                 continue
 
             _append_note(
@@ -737,32 +1087,57 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             payload["patch"] = self.state.patch
         return payload
 
-    def _symbol_contract(self) -> str:
-        """Render the project-wide map of every file's exported public symbols.
+    def _symbol_contract(self, build_dir: str | None = None) -> str:
+        """The name map every writer must import/call against verbatim.
 
-        Walks the plan's work packages and lists each file that declares a
-        non-empty ``public_api`` as ``path → [symbols]``. This is the
-        authoritative name map every writer must import against verbatim, so a
-        helper produced by one subtask is called by the same name in another.
+        Two sources, real-first: (1) the *actual* public API extracted from the
+        files already written this run (real class fields, constructor and
+        function signatures — so a later file imports the true `Settings` fields
+        instead of inventing `settings.sap_host`); (2) the planner-declared
+        ``public_api`` for files not yet written. Building the index from the
+        written artifacts (not the whole tree) keeps it bounded in both modes.
         """
+        real_lines: list[str] = []
+        if build_dir and self.state.artifacts:
+            written = sorted({a.file_path for a in self.state.artifacts if a.file_path})
+            try:
+                index = build_symbol_index(build_dir, paths=written)
+            except Exception as exc:  # noqa: BLE001 — prevention is best-effort, never fatal
+                log.warning("symbol index build failed: %s", exc)
+                index = {}
+            for module in sorted(index):
+                compact = index[module].replace("\n", " | ")
+                real_lines.append(f"- {module}: {compact}")
+
+        planned_lines: list[str] = []
         plan = self.state.plan
-        if plan is None:
-            return "(no plan available)"
-        lines: list[str] = []
-        for subtask in plan.subtasks:
-            for planned_file in subtask.files:
-                if planned_file.public_api:
-                    symbols = "; ".join(planned_file.public_api)
-                    lines.append(f"- {planned_file.path} → [{symbols}]")
-        if not lines:
-            return "(no public symbols declared in the plan)"
-        return "\n".join(lines)
+        if plan:
+            for subtask in plan.subtasks:
+                for planned_file in subtask.files:
+                    if planned_file.public_api:
+                        symbols = "; ".join(planned_file.public_api)
+                        planned_lines.append(f"- {planned_file.path} → [{symbols}]")
+
+        sections: list[str] = []
+        if real_lines:
+            sections.append(
+                "REAL APIs already written this run (import these EXACT names, "
+                "fields, and signatures — extracted from the actual code):\n"
+                + "\n".join(real_lines)
+            )
+        if planned_lines:
+            sections.append(
+                "Planned file APIs from the plan (files not yet written):\n"
+                + "\n".join(planned_lines)
+            )
+        return "\n\n".join(sections) if sections else "(no symbols available)"
 
     def _build_subtask(self, subtask: SubTask, build_dir: str, *, index: int, total: int) -> None:
         writer = WriterCrew(workspace_dir=build_dir)
-        reviewer = ReviewerCrew(workspace_dir=build_dir)
-        listing_tool = WorkspaceListTool(workspace_dir=build_dir)
 
+        # Full preimage of each modify target — review needs it to detect
+        # silent content loss. The writer prompt gets a generously-truncated
+        # view (built below); it must never be the only copy of a file.
         existing_snapshots: dict[str, str] = {}
         for planned_file in subtask.files:
             if planned_file.change_type != "modify":
@@ -772,15 +1147,9 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             except ValueError:
                 target = None
             if target is not None and target.is_file():
-                raw = target.read_text(encoding="utf-8", errors="replace")
-                limit = 12000
-                if len(raw) > limit:
-                    omitted = len(raw) - limit
-                    existing_snapshots[planned_file.path] = (
-                        f"{raw[:limit]}\n\n[truncated {omitted} chars — call workspace_read for full file]"
-                    )
-                else:
-                    existing_snapshots[planned_file.path] = raw
+                existing_snapshots[planned_file.path] = target.read_text(
+                    encoding="utf-8", errors="replace"
+                )
 
         prior_issues = ""
         bundle: CodeBundleArtifact | None = None
@@ -790,7 +1159,7 @@ class CodebuilderFlow(Flow[CodebuilderState]):
         primary_file_path = file_paths[0] if file_paths else ""
         existing_contents = (
             "\n\n".join(
-                f"-----BEGIN EXISTING FILE: {path}-----\n{content}\n-----END EXISTING FILE: {path}-----"
+                f"-----BEGIN EXISTING FILE: {path}-----\n{_preimage_for_prompt(content)}\n-----END EXISTING FILE: {path}-----"
                 for path, content in existing_snapshots.items()
             )
             or "(no pre-existing planned files)"
@@ -809,18 +1178,32 @@ class CodebuilderFlow(Flow[CodebuilderState]):
 
         for attempt in range(_max_subtask_retries() + 1):
             attempts = attempt + 1
-            write_result = writer.crew().kickoff(
-                inputs={
-                    "subtask": subtask.model_dump_json(indent=2),
-                    "change_type": "bundle",
-                    "existing_contents": existing_contents,
-                    "workspace_dir": build_dir,
-                    "workspace_listing": listing_tool._run("."),
-                    "amendments": self.state.amendments or "(none)",
-                    "prior_review_issues": prior_issues or "(none)",
-                    "dependency_contracts": self._symbol_contract(),
-                    "language": self.state.language or "English",
-                }
+            writer_inputs = {
+                "subtask": subtask.model_dump_json(indent=2),
+                "change_type": "bundle",
+                "existing_contents": existing_contents,
+                "workspace_dir": build_dir,
+                "workspace_listing": _subtask_workspace_context(build_dir, subtask),
+                "amendments": self.state.amendments or "(none)",
+                "prior_review_issues": prior_issues or "(none)",
+                "dependency_contracts": self._symbol_contract(build_dir),
+                "language": self.state.language or "English",
+            }
+            _emit_prompt_inputs_prepared(
+                self.state,
+                "writer_inputs_prepared",
+                writer_inputs,
+                stage="subtask",
+                subtask_id=subtask.id,
+                attempt=attempts,
+            )
+            write_result = writer.crew().kickoff(inputs=writer_inputs)
+            _emit_usage_metrics(
+                self.state,
+                "subtask",
+                write_result,
+                subtask_id=subtask.id,
+                attempt=attempts,
             )
             bundle = (
                 write_result.pydantic
@@ -847,6 +1230,7 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             )
             review = deterministic.result
             if deterministic.needs_fallback:
+                reviewer = ReviewerCrew(workspace_dir=build_dir)
                 review_result = reviewer.crew().kickoff(
                     inputs={
                         "subtask": subtask.model_dump_json(indent=2),

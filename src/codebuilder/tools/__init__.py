@@ -1,5 +1,5 @@
 from .workspace_tool import WorkspaceReadTool, WorkspaceWriteTool, WorkspaceListTool
-from .lint_runner_tool import LintRunnerTool, TestRunnerTool
+from .lint_runner_tool import LintRunnerTool, TestRunnerTool, TypeCheckRunnerTool
 from . import git_tool, attachment_tool
 
 __all__ = [
@@ -8,6 +8,7 @@ __all__ = [
     "WorkspaceListTool",
     "LintRunnerTool",
     "TestRunnerTool",
+    "TypeCheckRunnerTool",
     "git_tool",
     "attachment_tool",
 ]

@@ -4,9 +4,9 @@ from typing import Any
 from crewai import Agent, Crew, LLM, Process, Task
 from crewai.project import CrewBase, agent, crew, task
 from crewai.skills import activate_skill, discover_skills
-from crewai_tools import DirectoryReadTool, FileReadTool
 
 from codebuilder.schemas import Plan, PlanSkeleton
+from codebuilder.tools import WorkspaceListTool, WorkspaceReadTool
 
 _SKILLS = {
     s.name: activate_skill(s)
@@ -41,6 +41,9 @@ class PlannerCrew:
     agents_config = "config/agents.yaml"
     tasks_config = "config/tasks.yaml"
 
+    def __init__(self, workspace_dir: str = "."):
+        self.workspace_dir = workspace_dir
+
     @agent
     def planner(self) -> Agent:
         cfg = self.agents_config["planner"]  # type: ignore[index]
@@ -50,7 +53,10 @@ class PlannerCrew:
         # for non-trivial briefs and drops required fields like `subtasks`.
         return Agent(
             config=cfg,
-            tools=[FileReadTool(), DirectoryReadTool()],
+            tools=[
+                WorkspaceReadTool(workspace_dir=self.workspace_dir),
+                WorkspaceListTool(workspace_dir=self.workspace_dir),
+            ],
             skills=[_SKILLS["rpa"]],
             llm=LLM(model=cfg["llm"], max_tokens=32768),
         )

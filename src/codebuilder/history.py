@@ -24,6 +24,7 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 DB_PATH = Path(os.environ.get("CODEBUILDER_HISTORY_DB", "./data/codebuilder_history.db")).resolve()
+MAX_HISTORY_PATCH_CHARS = 50_000
 
 
 def _enabled() -> bool:
@@ -60,6 +61,21 @@ def _connect() -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.executescript(_SCHEMA)
     return conn
+
+
+def _truncate(value: str, limit: int) -> str:
+    if len(value) <= limit:
+        return value
+    omitted = len(value) - limit
+    return f"{value[:limit]}\n\n[truncated {omitted} chars]"
+
+
+def _qa_json_for_history(state: "CodebuilderState") -> str | None:
+    if state.qa_report is None:
+        return None
+    payload = state.qa_report.model_dump(mode="json")
+    payload["artifact_urls"] = []
+    return json.dumps(payload, ensure_ascii=False)
 
 
 _SLUG_RE = re.compile(r"[^a-z0-9]+")
@@ -119,7 +135,7 @@ def record(state: "CodebuilderState") -> None:
         return
 
     plan_json = state.plan.model_dump_json() if state.plan else None
-    qa_json = state.qa_report.model_dump_json() if state.qa_report else None
+    qa_json = _qa_json_for_history(state)
     mode = state.plan.mode if state.plan else ("patch_existing" if plan_json else "new_project")
     files_touched = json.dumps(sorted({a.file_path for a in state.artifacts if a.file_path}))
     reviewer_issues = json.dumps(
@@ -157,7 +173,7 @@ def record(state: "CodebuilderState") -> None:
                     qa_json,
                     files_touched,
                     reviewer_issues,
-                    state.patch or "",
+                    _truncate(state.patch or "", MAX_HISTORY_PATCH_CHARS),
                 ),
             )
     except sqlite3.Error as exc:

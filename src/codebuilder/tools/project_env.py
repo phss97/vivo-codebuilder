@@ -46,7 +46,7 @@ def provisioning_enabled() -> bool:
 def project_python(workspace_dir: str) -> str:
     """Interpreter QA tools should use: the project venv when provisioned,
     else the orchestrator's own interpreter."""
-    python = _venv_python(Path(workspace_dir))
+    python = _venv_python(Path(workspace_dir).resolve())
     return str(python) if python.is_file() else sys.executable
 
 
@@ -58,7 +58,7 @@ def ensure_project_env(workspace_dir: str) -> str:
     output — which doubles as the "generated project is not installable"
     QA signal for new-project jobs.
     """
-    build_dir = Path(workspace_dir)
+    build_dir = Path(workspace_dir).resolve()
     pyproject = build_dir / "pyproject.toml"
     if not provisioning_enabled() or not pyproject.is_file():
         return ""

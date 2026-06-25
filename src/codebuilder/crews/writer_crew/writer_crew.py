@@ -4,7 +4,7 @@ from crewai import Agent, Crew, LLM, Process, Task
 from crewai.project import CrewBase, agent, crew, task
 from crewai.skills import activate_skill, discover_skills
 
-from codebuilder.schemas import CodeArtifact, CodeBundleArtifact
+from codebuilder.schemas import CodeBundleArtifact
 from codebuilder.tools import (
     WorkspaceListTool,
     WorkspaceReadTool,
@@ -56,7 +56,7 @@ class WriterCrew:
     def repair_task(self) -> Task:
         return Task(
             config=self.tasks_config["repair_task"],  # type: ignore[index]
-            output_pydantic=CodeArtifact,
+            output_pydantic=CodeBundleArtifact,
         )
 
     @crew

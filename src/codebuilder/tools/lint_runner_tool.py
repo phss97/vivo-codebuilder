@@ -1,5 +1,7 @@
+import os
 import subprocess
 import sys
+import tempfile
 from typing import Type
 
 from crewai.tools import BaseTool
@@ -92,6 +94,93 @@ class LintRunnerTool(BaseTool):
         if "No module named ruff" in out:
             return _SKIP_MISSING_MODULE.format(module="ruff")
         return out or f"ruff exit {code}"
+
+
+class _TypeCheckInput(BaseModel):
+    path: str = Field(default=".", description="Relative path to type-check")
+
+
+def _module_importable(workspace_dir: str, module: str) -> bool:
+    """True when ``module`` imports under the project's interpreter."""
+    try:
+        code, _ = _run(
+            [project_python(workspace_dir), "-c", f"import {module}"],
+            cwd=workspace_dir,
+            timeout=30,
+        )
+        return code == 0
+    except Exception:  # noqa: BLE001 — detection is best-effort
+        return False
+
+
+def _write_mypy_config(workspace_dir: str) -> str:
+    """Write a self-contained mypy config the gate controls, returning its path.
+
+    Using our own config (via ``--config-file``) ignores the project's
+    ``[tool.mypy]`` so a generated ``strict = true`` can't flood us with
+    annotation noise. Critically, it enables the pydantic mypy plugin when
+    pydantic is installed — without it mypy treats every ``Settings()`` /
+    pydantic model construction as missing all fields and emits bogus
+    ``call-arg`` errors on correct code (the BaseSettings false positive).
+    """
+    # follow_imports = silent: dependencies are analyzed for type info but only
+    # the files passed as targets report errors. This makes patch-mode scoping
+    # real (a changed file is checked against unchanged deps without failing on
+    # the deps' pre-existing debt) and is a no-op for new_project, where the whole
+    # package is the target.
+    lines = ["[mypy]", "ignore_missing_imports = True", "follow_imports = silent"]
+    if _module_importable(workspace_dir, "pydantic"):
+        lines.append("plugins = pydantic.mypy")
+    fd, path = tempfile.mkstemp(prefix="codebuilder-mypy-", suffix=".ini")
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+    return path
+
+
+class TypeCheckRunnerTool(BaseTool):
+    name: str = "type_checker"
+    description: str = (
+        "Run mypy on a path in the workspace and return the output. Returns "
+        "'PASS' if mypy reports no errors, otherwise the mypy report."
+    )
+    args_schema: Type[BaseModel] = _TypeCheckInput
+    workspace_dir: str
+
+    def _run(self, path: str = ".") -> str:
+        try:
+            target = resolve_within(self.workspace_dir, path)
+        except ValueError as exc:
+            return f"ERROR: {exc}"
+        if target.is_file() and target.suffix not in _PYTHON_SUFFIXES:
+            return "PASS"
+        # ensure the env first so pydantic-plugin detection sees the project venv.
+        ensure_project_env(self.workspace_dir)
+        config = _write_mypy_config(self.workspace_dir)
+        try:
+            code, out = _run_tool_module(
+                "mypy",
+                [
+                    "--config-file",
+                    config,
+                    "--no-error-summary",
+                    "--hide-error-context",
+                    "--no-color-output",
+                    "--no-pretty",
+                    str(target),
+                ],
+                self.workspace_dir,
+                timeout=180,
+            )
+        finally:
+            try:
+                os.unlink(config)
+            except OSError:
+                pass
+        if "No module named mypy" in out:
+            return _SKIP_MISSING_MODULE.format(module="mypy")
+        if code == 0:
+            return "PASS"
+        return out or f"mypy exit {code}"
 
 
 class _TestInput(BaseModel):

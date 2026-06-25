@@ -138,6 +138,10 @@ class QAReport(StrictOutputModel):
     passed: bool
     lint_output: str = ""
     test_output: str = ""
+    # Filtered mypy output: only the high-confidence cross-file drift errors
+    # (attr-defined / call-arg / name-defined / arg-type). Empty when the type
+    # gate passed or was unavailable. Surfaced to the repair writer.
+    type_output: str = ""
     integration_notes: str = ""
     artifact_urls: list[ArtifactRef] = Field(default_factory=list)
 
@@ -160,6 +164,7 @@ class CodebuilderState(FlowState):
     goals: list[str] = Field(default_factory=list)
     tech_stack: list[str] = Field(default_factory=list)
     attachments: list[Attachment] = Field(default_factory=list)
+    attachment_records: list[dict[str, str]] = Field(default_factory=list)
     workspace_dir: str = ""
     plan: Plan | None = None
     amendments: str = ""

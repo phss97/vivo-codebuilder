@@ -11,9 +11,13 @@ write_task:
     Output language for ALL comments, docstrings, log messages, and
     user-facing strings: {language}
 
-    Project symbol contract — the EXACT public names every file in this
-    project exports. When you import from or call into another project file,
-    use these names verbatim. Never invent a synonym:
+    Project symbol contract — the EXACT public names, class fields, and
+    signatures of the files you depend on. The "REAL APIs" section is extracted
+    from the actual code already on disk, so it is authoritative: when you
+    import a symbol, access an attribute/field, or call a function/constructor
+    from another project file, use exactly these names and parameters. Never
+    invent an attribute or a synonym (e.g. if Settings lists `sap_endpoint`,
+    never write `settings.sap_host`):
     {dependency_contracts}
 
     Workspace root: {workspace_dir}
@@ -65,8 +69,10 @@ write_task:
       code only.
     - Return the FULL file text for every artifact in CodeArtifact.content.
       The orchestrator persists the bundle to disk — you do NOT need to call
-      `workspace_write` to save the final files. Use `workspace_read` and
-      `workspace_list` to inspect adjacent files first when helpful.
+      `workspace_write` to save the final files. The symbol contract above
+      already gives you the real APIs of your dependencies, so do NOT spelunk
+      the workspace: call `workspace_read` only for a specific file whose detail
+      you genuinely need and the contract does not provide.
   expected_output: >
     A CodeBundleArtifact JSON object with: subtask_id, artifacts (list of
     CodeArtifact). Each CodeArtifact must include subtask_id, file_path
@@ -77,8 +83,11 @@ write_task:
 repair_task:
   description: >
     Final QA failed after all planned subtasks were written. Repair the
-    workspace by changing exactly one file that is most likely responsible
-    for the failing lint or test output.
+    workspace by fixing EVERY file implicated by the failing lint, test, and
+    type-check output — not just one. Cross-file symbol drift (an import,
+    attribute, keyword argument, or method name that disagrees between where a
+    symbol is defined and where it is used) typically requires editing several
+    files together, so return all of them in one bundle.
 
     Workspace root: {workspace_dir}
 
@@ -95,24 +104,33 @@ repair_task:
     Current workspace files:
     {workspace_listing}
 
-    Final QA report:
+    Final QA report (lint_output, test_output, type_output — the mypy
+    `type_output` names the file:line and the exact drifted symbol):
     {qa_report}
 
     Rules:
     - LANGUAGE: write all comments, docstrings, log messages, and user-facing
       strings in {language}; do not translate identifiers.
-    - NAMES: when fixing imports or calls, use the EXACT names in the project
-      symbol contract above — never substitute a synonym.
-    - Use workspace_read and workspace_list to inspect the failing code before
-      choosing the file to change.
-    - Return the FULL repaired file text in CodeArtifact.content. The
-      orchestrator persists it — you do NOT need to call `workspace_write`.
+    - COVERAGE: read the lint, test, AND type_output sections. Identify every
+      file named in a failure and fix all of them in this one pass. Returning
+      only one file when several are broken leaves the job failing.
+    - GROUND TRUTH: before changing a caller, `workspace_read` the file that
+      DEFINES the symbol (e.g. the settings/config or Protocol module) and make
+      the caller match the real attribute names, field names, and constructor
+      signature found there. Never invent a name — read it.
+    - NAMES: when fixing imports or calls, use the EXACT names defined at the
+      source — never substitute a synonym or a guessed attribute.
     - Prefer fixing production code when tests reveal a product bug; only edit
       tests when the tests themselves are clearly wrong or incomplete.
-    - Do not add placeholders, TODOs, or `...`.
-    - Do not create broad rewrites unrelated to the QA failure.
+    - Return the FULL repaired file text for each fixed file in
+      CodeArtifact.content. The orchestrator persists the bundle — you do NOT
+      need to call `workspace_write`.
+    - Do not add placeholders, TODOs, or `...`. Do not rewrite files unrelated
+      to the QA failure.
   expected_output: >
-    A CodeArtifact JSON object with: subtask_id set to "final_qa_repair",
-    file_path set to the repaired file path, content set to the COMPLETE
-    repaired file text (non-empty), language, and tests_included.
+    A CodeBundleArtifact JSON object with: subtask_id set to "final_qa_repair",
+    and artifacts (a list of one CodeArtifact per fixed file). Each CodeArtifact
+    must set subtask_id to "final_qa_repair", file_path to the repaired file
+    path, content to the COMPLETE repaired file text (non-empty), language, and
+    tests_included.
   agent: writer

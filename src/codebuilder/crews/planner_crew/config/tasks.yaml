@@ -39,6 +39,17 @@ skeleton_task:
       fields (`purpose`, `assumptions`, `open_questions`) in that language.
     - Decide whether `mode` is "new_project" or "patch_existing" based on
       whether a git repo or zipped existing code was attached.
+    - SCOPE (patch_existing): a patch is a SURGICAL set of edits, not a
+      re-description of the whole project. FIRST inspect the attached project
+      with `workspace_list` and `workspace_read` only; paths are relative to
+      the workspace root. Read the files the brief is about, then plan ONLY the
+      files the brief requires creating or modifying. Do NOT enumerate files
+      that need no change, and do NOT re-list the whole project "for
+      completeness". Files you only need to READ for context (to learn a real
+      symbol, signature, or field) must NOT appear as FileSkeleton entries —
+      they are not written; the writer is given their real APIs separately. A
+      typical patch touches a handful of files, not dozens. The unchanged rest
+      of the project is preserved automatically in the final deliverable.
     - Set `domain` to the slug of your activated architecture-defining skill
       when one applies (e.g. "rpa"). Leave empty otherwise.
     - PACKAGING (RPA new_project only): the plan MUST include, as planned
@@ -159,10 +170,13 @@ expand_task:
       skeleton (entry script, `build.spec`, Windows build script, README
       packaging section) into the Plan's subtasks, and keep `pyinstaller` in
       the dev dependencies. The RPA acceptance gate fails without them.
-    - Target 12-20 work packages for standard RPA projects. Hard cap:
-      max 24 SubTasks total, max 6 files in any one SubTask. Prefer fewer
-      work packages when the files are cohesive and can be safely written
-      together.
+    - SIZING depends on mode. For `new_project`, target 12-20 work packages for
+      a standard full RPA build. For `patch_existing`, plan ONLY as many work
+      packages as the requested changes actually require (typically 1-10) — a
+      patch is scoped to the changed files, NEVER padded to a target, and never
+      re-builds the whole project. Hard cap either way: max 24 SubTasks total,
+      max 6 files in any one SubTask. Prefer fewer work packages when the files
+      are cohesive and can be safely written together.
     - Bundle by cohesive engineering slice, not by arbitrary folder count.
       Good RPA bundles are usually: project scaffold, domain entities,
       domain exceptions, domain Protocols, application DTOs/services, core

@@ -20,7 +20,7 @@ from codebuilder.schemas import (
     ReviewResult,
     SubTask,
 )
-from codebuilder.tools import LintRunnerTool, TestRunnerTool
+from codebuilder.tools import LintRunnerTool, TestRunnerTool, TypeCheckRunnerTool
 from codebuilder.tools.project_env import ensure_project_env
 from codebuilder.tools.workspace_tool import resolve_within
 
@@ -29,8 +29,16 @@ log = logging.getLogger(__name__)
 MAX_QA_OUTPUT_CHARS = 12000
 MAX_WORK_PACKAGES = 24
 MAX_FILES_PER_WORK_PACKAGE = 6
+# Largest preimage of a `modify` target shown to the writer in full. Files above
+# this are shown truncated (with a marker); the review guards below then forbid
+# rewriting such a file shorter, so its unshown tail can't be silently dropped.
+MODIFY_PREIMAGE_LIMIT = 60_000
 
 _TODO_TOKEN_RE = re.compile(r"\b(todo|fixme|placeholder|stub)\b", re.IGNORECASE)
+# Matches the truncation markers emitted by WorkspaceReadTool and the preimage
+# injector; a persisted artifact carrying one means a truncated read was written
+# back as the file.
+_TRUNCATION_MARKER_RE = re.compile(r"\[truncated \d+")
 _PLACEHOLDER_LINE_RE = re.compile(
     r"(pass|\.\.\.|raise\s+NotImplementedError(?:\([^)]*\))?)",
     re.IGNORECASE,
@@ -50,6 +58,10 @@ def is_pass(output: str) -> bool:
 
 def is_skip(output: str) -> bool:
     return output.strip().startswith("SKIP:")
+
+
+def is_no_tests_collected(output: str) -> bool:
+    return output.strip().startswith("SKIP: no tests collected")
 
 
 def truncate(value: str, limit: int = MAX_QA_OUTPUT_CHARS) -> str:
@@ -79,6 +91,287 @@ def looks_like_placeholder(content: str) -> bool:
     if not meaningful_lines:
         return True
     return all(_PLACEHOLDER_LINE_RE.fullmatch(line) for line in meaningful_lines)
+
+
+_INDEX_SKIP_DIRS = {
+    ".git", ".venv", "__pycache__", "build", "dist", "node_modules",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache", "tests",
+}
+
+
+def _arg_names(fn: ast.FunctionDef | ast.AsyncFunctionDef, *, skip_self: bool = False) -> list[str]:
+    args = fn.args
+    names = [a.arg for a in (args.posonlyargs + args.args)]
+    if skip_self and names and names[0] in ("self", "cls"):
+        names = names[1:]
+    if args.vararg:
+        names.append("*" + args.vararg.arg)
+    names += [a.arg for a in args.kwonlyargs]
+    if args.kwarg:
+        names.append("**" + args.kwarg.arg)
+    return names
+
+
+def _unparse(node: ast.AST) -> str:
+    try:
+        return ast.unparse(node)
+    except Exception:  # noqa: BLE001 — best-effort rendering
+        return getattr(node, "id", "")
+
+
+def _func_sig(fn: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
+    ret = f" -> {_unparse(fn.returns)}" if fn.returns is not None else ""
+    return "(" + ", ".join(_arg_names(fn)) + ")" + ret
+
+
+def _class_fields(cls: ast.ClassDef) -> list[str]:
+    """Real attribute names: class-level annotations/assignments plus
+    ``self.x`` assignments in ``__init__`` (pydantic models, dataclasses, and
+    hand-rolled classes all surface their fields this way)."""
+    fields: list[str] = []
+    seen: set[str] = set()
+
+    def _add(name: str) -> None:
+        if name and not name.startswith("__") and name not in seen:
+            seen.add(name)
+            fields.append(name)
+
+    for stmt in cls.body:
+        if isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+            _add(stmt.target.id)
+        elif isinstance(stmt, ast.Assign):
+            for target in stmt.targets:
+                if isinstance(target, ast.Name):
+                    _add(target.id)
+    for stmt in cls.body:
+        if isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef)) and stmt.name == "__init__":
+            for sub in ast.walk(stmt):
+                if isinstance(sub, (ast.Assign, ast.AnnAssign)):
+                    targets = sub.targets if isinstance(sub, ast.Assign) else [sub.target]
+                    for target in targets:
+                        if (
+                            isinstance(target, ast.Attribute)
+                            and isinstance(target.value, ast.Name)
+                            and target.value.id == "self"
+                            and not target.attr.startswith("_")
+                        ):
+                            _add(target.attr)
+    return fields
+
+
+def extract_module_api(source: str) -> str:
+    """Extract a compact, *real* public-API summary from Python source via AST.
+
+    Returns one line per top-level public class (with its field/attr names and
+    ``__init__`` parameters) and public function (with signature), plus
+    module-level public constants. Private (leading-underscore) names are
+    omitted. Returns ``""`` when there is no public API or the source cannot be
+    parsed — drift prevention is best-effort and must never raise.
+    """
+    try:
+        tree = ast.parse(source)
+    except (SyntaxError, ValueError):
+        return ""
+    lines: list[str] = []
+    for node in tree.body:
+        if isinstance(node, ast.ClassDef):
+            if node.name.startswith("_"):
+                continue
+            bases = ", ".join(_unparse(b) for b in node.bases)
+            header = f"class {node.name}" + (f"({bases})" if bases else "")
+            detail: list[str] = []
+            fields = _class_fields(node)
+            if fields:
+                detail.append("fields=[" + ", ".join(fields) + "]")
+            init = next(
+                (
+                    _arg_names(s, skip_self=True)
+                    for s in node.body
+                    if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)) and s.name == "__init__"
+                ),
+                [],
+            )
+            if init:
+                detail.append("__init__(" + ", ".join(init) + ")")
+            methods = [
+                s.name
+                for s in node.body
+                if isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and not s.name.startswith("_")
+            ]
+            if methods:
+                detail.append("methods=[" + ", ".join(methods) + "]")
+            lines.append(header + (": " + "; ".join(detail) if detail else ""))
+        elif isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if not node.name.startswith("_"):
+                lines.append("def " + node.name + _func_sig(node))
+        elif isinstance(node, ast.AnnAssign):
+            if isinstance(node.target, ast.Name) and not node.target.id.startswith("_"):
+                lines.append(node.target.id)
+        elif isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and not target.id.startswith("_"):
+                    lines.append(target.id)
+    return "\n".join(lines)
+
+
+def _module_dotted_path(path: Path, root: Path) -> str:
+    rel = path.relative_to(root)
+    parts = list(rel.parts)
+    if parts and parts[0] == "src":
+        parts = parts[1:]
+    if not parts:
+        return ""
+    if parts[-1] == "__init__.py":
+        parts = parts[:-1]
+    elif parts[-1].endswith(".py"):
+        parts[-1] = parts[-1][:-3]
+    return ".".join(parts)
+
+
+def build_symbol_index(build_dir: str, *, paths: list[str] | None = None) -> dict[str, str]:
+    """Map each already-written project module (dotted path) → its real public
+    API summary, extracted from disk.
+
+    Grounds writers/repair in the *actual* code (real field names, constructor
+    signatures, function signatures) instead of the planner's declared
+    ``public_api`` — which carries top-level names but not class fields, the gap
+    that lets a caller invent ``settings.sap_host``. ``paths`` (relative to
+    ``build_dir``) scopes the walk; ``None`` walks the whole tree minus tests
+    and generated dirs. Best-effort: unparseable files are skipped.
+    """
+    root = Path(build_dir)
+    if not root.is_dir():
+        return {}
+    if paths is not None:
+        files = [root / p for p in paths]
+    else:
+        files = [
+            p
+            for p in root.rglob("*.py")
+            if not any(part in _INDEX_SKIP_DIRS for part in p.relative_to(root).parts)
+        ]
+    index: dict[str, str] = {}
+    for path in files:
+        if not path.is_file() or path.suffix != ".py":
+            continue
+        try:
+            source = path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        api = extract_module_api(source)
+        if not api:
+            continue
+        module = _module_dotted_path(path, root)
+        if module:
+            index[module] = api
+    return index
+
+
+def _is_basesettings_class(node: ast.ClassDef) -> bool:
+    for base in node.bases:
+        name = base.id if isinstance(base, ast.Name) else getattr(base, "attr", "")
+        if name == "BaseSettings":
+            return True
+    return False
+
+
+def _settings_env_prefix(cls: ast.ClassDef) -> str:
+    """Extract ``env_prefix`` from ``model_config = SettingsConfigDict(...)`` or
+    a nested ``class Config``. Returns ``""`` when none is declared."""
+    for stmt in cls.body:
+        if isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Call):
+            targets = [t.id for t in stmt.targets if isinstance(t, ast.Name)]
+            if "model_config" in targets:
+                for kw in stmt.value.keywords:
+                    if kw.arg == "env_prefix" and isinstance(kw.value, ast.Constant):
+                        return str(kw.value.value)
+        if isinstance(stmt, ast.ClassDef) and stmt.name == "Config":
+            for sub in stmt.body:
+                if (
+                    isinstance(sub, ast.Assign)
+                    and any(isinstance(t, ast.Name) and t.id == "env_prefix" for t in sub.targets)
+                    and isinstance(sub.value, ast.Constant)
+                ):
+                    return str(sub.value.value)
+    return ""
+
+
+def _settings_required_fields(cls: ast.ClassDef) -> list[str]:
+    """Required (no-default) field names of a settings class — these are the
+    env vars an operator MUST provide. Fields with a default are optional."""
+    required: list[str] = []
+    for stmt in cls.body:
+        if not isinstance(stmt, ast.AnnAssign) or not isinstance(stmt.target, ast.Name):
+            continue
+        name = stmt.target.id
+        if name == "model_config" or name.startswith("_"):
+            continue
+        annotation = stmt.annotation
+        is_classvar = (isinstance(annotation, ast.Subscript) and isinstance(annotation.value, ast.Name)
+                       and annotation.value.id == "ClassVar") or (
+            isinstance(annotation, ast.Name) and annotation.id == "ClassVar")
+        if is_classvar:
+            continue
+        if stmt.value is None:  # no default → required
+            required.append(name)
+    return required
+
+
+def _parse_env_example_keys(text: str) -> set[str]:
+    keys: set[str] = set()
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key = line.split("=", 1)[0].strip()
+        if key.lower().startswith("export "):
+            key = key[len("export "):].strip()
+        if key:
+            keys.add(key.upper())
+    return keys
+
+
+def check_env_example_consistency(build_dir: str) -> list[str]:
+    """Flag required Settings fields whose env var is absent from .env.example.
+
+    Catches the "config won't load even when filled in" symptom: a generated
+    ``.env.example`` whose keys don't match the env vars pydantic-settings
+    reads (wrong names, or missing the ``env_prefix``). Comparison is
+    case-insensitive. Returns ``[]`` when there is no ``.env.example`` or no
+    ``BaseSettings`` subclass — best-effort, never raises.
+    """
+    root = Path(build_dir)
+    env_file = root / ".env.example"
+    if not env_file.is_file():
+        return []
+    try:
+        declared = _parse_env_example_keys(env_file.read_text(encoding="utf-8", errors="replace"))
+    except OSError:
+        return []
+
+    issues: list[str] = []
+    seen: set[str] = set()
+    for py_file in root.rglob("*.py"):
+        if any(part in _INDEX_SKIP_DIRS for part in py_file.relative_to(root).parts):
+            continue
+        try:
+            tree = ast.parse(py_file.read_text(encoding="utf-8", errors="replace"))
+        except (SyntaxError, ValueError, OSError):
+            continue
+        for node in tree.body:
+            if not isinstance(node, ast.ClassDef) or not _is_basesettings_class(node):
+                continue
+            prefix = _settings_env_prefix(node)
+            for field in _settings_required_fields(node):
+                key = f"{prefix}{field}".upper()
+                if key not in declared and key not in seen:
+                    seen.add(key)
+                    issues.append(
+                        f".env.example is missing `{key}` (required by Settings field "
+                        f"`{field}` in {py_file.relative_to(root).as_posix()})."
+                    )
+    return issues
 
 
 def artifact_refs(refs: list[dict] | list[ArtifactRef] | None) -> list[ArtifactRef]:
@@ -217,6 +510,7 @@ def qa_report_for_repair(report: QAReport) -> str:
     payload = report.model_dump()
     payload["lint_output"] = truncate(payload.get("lint_output") or "")
     payload["test_output"] = truncate(payload.get("test_output") or "")
+    payload["type_output"] = truncate(payload.get("type_output") or "")
     return json.dumps(payload, indent=2)
 
 
@@ -286,6 +580,27 @@ def run_deterministic_review(
     content_to_check = actual or artifact.content
     if looks_like_placeholder(content_to_check):
         issues.append("Artifact content is empty or contains placeholder/TODO-only output.")
+
+    # Data-loss guards: a truncated read written back as the file, or a large
+    # file rewritten shorter than its preimage (whose tail the writer never saw).
+    if _TRUNCATION_MARKER_RE.search(content_to_check):
+        issues.append(
+            f"Artifact '{artifact.file_path}' contains a truncation marker — a truncated "
+            "read was written as the file. Return the COMPLETE file content."
+        )
+    if (
+        planned_file is not None
+        and planned_file.change_type == "modify"
+        and existing_snapshot
+        and actual
+        and len(existing_snapshot) > MODIFY_PREIMAGE_LIMIT
+        and len(actual) < len(existing_snapshot)
+    ):
+        issues.append(
+            f"Modify target '{artifact.file_path}' is large ({len(existing_snapshot)} chars) but the "
+            f"returned file is shorter ({len(actual)} chars); content may have been lost. Make "
+            "targeted edits that preserve the rest of the file instead of rewriting it wholesale."
+        )
 
     if not issues:
         lint_tool = lint_runner or LintRunnerTool(workspace_dir=build_dir)
@@ -383,20 +698,97 @@ def _run_scoped_lint(lint_tool: Any, lint_paths: list[str]) -> str:
     return "PASS"
 
 
+def _run_scoped_tests(test_tool: Any, test_paths: list[str]) -> str:
+    """Run pytest against selected paths and aggregate the result.
+
+    Patch jobs should not pay for the whole customer suite by default. Any
+    non-PASS output is kept so the final-QA repair prompt still gets the exact
+    failing collection/test text.
+    """
+    failures: list[str] = []
+    for path in test_paths:
+        output = test_tool._run(path)
+        if not is_pass(output):
+            failures.append(output)
+    if failures:
+        return "\n".join(failures)
+    return "PASS"
+
+
+_TYPE_GATE_CODES = ("attr-defined", "call-arg", "name-defined", "arg-type")
+
+
+def filter_type_errors(output: str, codes: tuple[str, ...] = _TYPE_GATE_CODES) -> str:
+    """Keep only mypy error lines tagged with a high-confidence drift code.
+
+    The gate fails on cross-file symbol drift (``attr-defined``, ``call-arg``,
+    ``name-defined``, ``arg-type``) — exactly the bugs ruff and the
+    file-existence import gate miss. Annotation-completeness / untyped-dependency
+    noise (``no-untyped-def``, ``import``, ``assignment``) is dropped so the gate
+    never bricks a job on pre-existing issues the writer never introduced.
+    """
+    if not output:
+        return ""
+    kept = [
+        line
+        for line in output.splitlines()
+        if ": error:" in line and any(f"[{code}]" in line for code in codes)
+    ]
+    return "\n".join(kept)
+
+
+def _default_type_targets(build_dir: str) -> list[str]:
+    """Type-check the project's own ``src/<pkg>`` packages, else the build dir."""
+    root = Path(build_dir)
+    packages = _package_dirs(root)
+    if packages:
+        return [p.relative_to(root).as_posix() for p in packages]
+    return ["."]
+
+
+def _run_type_gate(
+    type_tool: Any, targets: list[str], codes: tuple[str, ...] = _TYPE_GATE_CODES
+) -> tuple[bool, str]:
+    """Run mypy over ``targets`` → ``(passed, filtered_errors)``.
+
+    A SKIP (mypy unavailable — e.g. a patch target that doesn't declare it) is
+    non-blocking: the job still finalizes on lint + tests. Only the gated drift
+    codes can fail the gate.
+    """
+    raws: list[str] = []
+    for target in targets:
+        out = type_tool._run(target)
+        if is_skip(out):
+            return True, ""
+        if out and not is_pass(out):
+            raws.append(out)
+    errors = filter_type_errors("\n".join(raws), codes)
+    return (not errors), errors
+
+
 def run_final_qa(
     build_dir: str,
     *,
     artifact_urls: list[dict] | list[ArtifactRef] | None = None,
     lint_paths: list[str] | None = None,
+    test_paths: list[str] | None = None,
+    type_paths: list[str] | None = None,
     lint_runner: Any | None = None,
     test_runner: Any | None = None,
+    type_runner: Any | None = None,
     require_installable: bool = False,
+    allow_no_tests: bool = False,
+    skip_pytest_on_deterministic_failure: bool = True,
 ) -> QAReport:
     """Build the final QA report from required workspace lint and tests.
 
     ``lint_paths`` scopes ruff to specific files (patch jobs lint only what
-    the writer created/modified); ``None`` lints the whole build dir. Tests
-    always run over the whole build dir.
+    the writer created/modified); ``None`` lints the whole build dir.
+    ``test_paths`` scopes pytest to selected paths; ``None`` tests the whole
+    build dir and ``[]`` means no relevant tests were found.
+    ``allow_no_tests`` makes pytest's "no tests collected" outcome a
+    non-blocking warning when lint passed, for patch jobs against existing
+    repositories that may not have tests.
 
     Provisions the project's own environment first (``uv sync``) so pytest
     runs with the generated package importable and its dependencies present.
@@ -422,7 +814,6 @@ def run_final_qa(
         )
 
     lint_tool = lint_runner or LintRunnerTool(workspace_dir=build_dir)
-    test_tool = test_runner or TestRunnerTool(workspace_dir=build_dir)
 
     if lint_paths:
         lint_output = _run_scoped_lint(lint_tool, lint_paths)
@@ -430,25 +821,66 @@ def run_final_qa(
     else:
         lint_output = lint_tool._run(".")
         lint_scope_note = "ruff check over the whole build directory"
-    test_output = test_tool._run(".")
+
+    type_tool = type_runner or TypeCheckRunnerTool(workspace_dir=build_dir)
+    type_targets = type_paths or _default_type_targets(build_dir)
+    type_ok, type_errors = _run_type_gate(type_tool, type_targets)
+
+    # .env.example must match the Settings env vars an operator fills in. Enforce
+    # for new projects (require_installable); for patch jobs only note it, since
+    # pre-existing .env debt the patch never touched must not fail the job.
+    env_issues = check_env_example_consistency(build_dir)
+    env_ok = (not env_issues) or not require_installable
 
     lint_ok = is_pass(lint_output)
-    test_ok = is_pass(test_output)
+    deterministic_failed = not (lint_ok and type_ok and env_ok)
+    if deterministic_failed and skip_pytest_on_deterministic_failure:
+        test_output = "SKIP: pytest skipped because deterministic QA failed first."
+        test_scope_note = "pytest skipped before execution"
+    elif test_paths == []:
+        test_output = "SKIP: no tests collected under this path."
+        test_scope_note = "pytest scoped to 0 path(s)"
+    else:
+        test_tool = test_runner or TestRunnerTool(workspace_dir=build_dir)
+        if test_paths is None:
+            test_output = test_tool._run(".")
+            test_scope_note = "pytest over the whole build directory"
+        else:
+            test_output = _run_scoped_tests(test_tool, test_paths)
+            test_scope_note = f"pytest scoped to {len(test_paths)} path(s)"
 
-    notes = [f"Deterministic QA ran {lint_scope_note} and pytest over the build directory."]
+    no_tests_warning = allow_no_tests and lint_ok and is_no_tests_collected(test_output)
+    test_ok = is_pass(test_output) or no_tests_warning
+
+    notes = [
+        f"Deterministic QA ran {lint_scope_note}, {test_scope_note}, and mypy over the build directory."
+    ]
     if is_skip(lint_output):
         notes.append(f"Lint was not executed: {lint_output}")
-    if is_skip(test_output):
+    if no_tests_warning:
+        notes.append(
+            "No pytest tests were collected in the existing project; "
+            "QA validated changed files with ruff only."
+        )
+    elif test_output == "SKIP: pytest skipped because deterministic QA failed first.":
+        notes.append("Pytest skipped because deterministic QA failed first.")
+    elif is_skip(test_output):
         notes.append(f"Tests were not executed: {test_output}")
     if not lint_ok and not is_skip(lint_output):
         notes.append("Lint failed.")
     if not test_ok and not is_skip(test_output):
         notes.append("Tests failed.")
+    if not type_ok:
+        notes.append("Type check (mypy) found cross-file symbol drift.")
+    if env_issues:
+        verb = "is" if not env_ok else "may be"
+        notes.append(f".env.example {verb} inconsistent with Settings: " + " ".join(env_issues))
 
     return QAReport(
-        passed=lint_ok and test_ok,
+        passed=lint_ok and test_ok and type_ok and env_ok,
         lint_output=lint_output,
         test_output=test_output,
+        type_output=type_errors,
         integration_notes=" ".join(notes),
         artifact_urls=artifact_refs(artifact_urls),
     )
