@@ -1,9 +1,12 @@
 import base64
+import json
+import sqlite3
 import zipfile
 from pathlib import Path
 from types import SimpleNamespace
 
 import codebuilder.main as main
+from codebuilder import history
 from codebuilder.main import CodebuilderFlow
 from codebuilder.runtime_qa import (
     persist_bundle_artifact,
@@ -17,6 +20,7 @@ from codebuilder.schemas import (
     ArtifactRef,
     CodeArtifact,
     CodeBundleArtifact,
+    CodebuilderState,
     FileSkeleton,
     Plan,
     QAReport,
@@ -24,6 +28,7 @@ from codebuilder.schemas import (
 )
 from codebuilder.tools import attachment_tool
 from codebuilder.tools.lint_runner_tool import LintRunnerTool, TestRunnerTool as CodebuilderTestRunnerTool
+from codebuilder.tools.workspace_tool import WorkspaceListTool
 
 
 class FakeTool:
@@ -34,6 +39,17 @@ class FakeTool:
     def _run(self, path: str = ".") -> str:
         self.calls.append(path)
         return self.output
+
+
+class FakeToolByPath:
+    def __init__(self, outputs: dict[str, str], default: str = "PASS"):
+        self.outputs = outputs
+        self.default = default
+        self.calls: list[str] = []
+
+    def _run(self, path: str = ".") -> str:
+        self.calls.append(path)
+        return self.outputs.get(path, self.default)
 
 
 def _subtask(path: str = "hello.py") -> SubTask:
@@ -72,6 +88,41 @@ def test_qa_report_artifact_urls_schema_is_closed() -> None:
 
     assert schema["additionalProperties"] is False
     assert _artifact_ref_schema(schema)["additionalProperties"] is False
+
+
+def test_workspace_list_filters_generated_dirs_and_caps_output(tmp_path: Path) -> None:
+    for path in (
+        ".git/objects/aa/blob",
+        ".venv/lib/site.py",
+        "node_modules/pkg/index.js",
+        "__pycache__/mod.pyc",
+        ".pytest_cache/v/cache",
+        "dist/app.exe",
+        "build/temp.o",
+        "project.zip",
+    ):
+        target = tmp_path / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("noise", encoding="utf-8")
+
+    src = tmp_path / "src"
+    src.mkdir()
+    for i in range(450):
+        (src / f"file_{i:03d}.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+    listing = WorkspaceListTool(workspace_dir=str(tmp_path))._run(".")
+
+    assert "src/file_000.py" in listing
+    assert ".git" not in listing
+    assert ".venv" not in listing
+    assert "node_modules" not in listing
+    assert "__pycache__" not in listing
+    assert ".pytest_cache" not in listing
+    assert "dist/" not in listing
+    assert "build/" not in listing
+    assert "project.zip" not in listing
+    assert "[truncated" in listing
+    assert len(listing) <= 20500
 
 
 def test_deterministic_review_passes_good_file(tmp_path: Path) -> None:
@@ -310,6 +361,34 @@ def test_final_qa_fails_when_pytest_collects_no_tests() -> None:
     assert "Tests were not executed" in qa.integration_notes
 
 
+def test_patch_final_qa_treats_no_tests_as_warning() -> None:
+    qa = run_final_qa(
+        "/unused",
+        lint_runner=FakeTool("PASS"),
+        test_runner=FakeTool("SKIP: no tests collected under this path."),
+        allow_no_tests=True,
+    )
+
+    assert qa.passed is True
+    assert (
+        "No pytest tests were collected in the existing project; "
+        "QA validated changed files with ruff only."
+    ) in qa.integration_notes
+    assert "Tests were not executed" not in qa.integration_notes
+
+
+def test_patch_final_qa_still_fails_lint_even_when_no_tests_collected() -> None:
+    qa = run_final_qa(
+        "/unused",
+        lint_runner=FakeTool("F821 undefined name 'x'"),
+        test_runner=FakeTool("SKIP: no tests collected under this path."),
+        allow_no_tests=True,
+    )
+
+    assert qa.passed is False
+    assert "Lint failed." in qa.integration_notes
+
+
 def test_architecture_gate_fails_missing_rpa_structure(tmp_path: Path) -> None:
     (tmp_path / "pyproject.toml").write_text("[project]\nname = 'demo'\n", encoding="utf-8")
     (tmp_path / "src/demo").mkdir(parents=True)
@@ -323,10 +402,10 @@ def test_architecture_gate_fails_missing_rpa_structure(tmp_path: Path) -> None:
     assert "consumer" in "\n".join(result.issues)
 
 
-def _empty_plan(domain: str = "") -> Plan:
+def _empty_plan(domain: str = "", mode: str = "new_project") -> Plan:
     return Plan(
         project_name="demo",
-        mode="new_project",
+        mode=mode,
         tech_stack=["python"],
         subtasks=[
             SubTask(
@@ -417,6 +496,56 @@ def test_emit_progress_posts_configured_webhook(monkeypatch) -> None:
             "timeout": main.PROGRESS_WEBHOOK_TIMEOUT_SECONDS,
         }
     ]
+
+
+def test_planner_inputs_use_materialized_attachment_records_not_full_tree(tmp_path: Path) -> None:
+    repo = tmp_path / "inputs" / "repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / ".git" / "config").write_text("[core]\n", encoding="utf-8")
+    (repo / "src").mkdir()
+    (repo / "src" / "important.py").write_text("VALUE = 1\n", encoding="utf-8")
+
+    flow = CodebuilderFlow()
+    flow.state.workspace_dir = str(tmp_path)
+    flow.state.attachment_records = [
+        {
+            "kind": "git",
+            "name": "repo",
+            "path": "inputs/repo",
+            "summary": "git repo cloned from https://example.test/repo.git",
+        }
+    ]
+
+    inputs = main._planner_inputs(flow.state)
+
+    assert "git repo cloned" in inputs["attachment_records"]
+    assert "inputs/repo/.git/config" not in inputs["attachment_records"]
+    assert "inputs/repo/src/important.py" not in inputs["attachment_records"]
+
+
+def test_writer_context_is_scoped_to_planned_file_parent(tmp_path: Path) -> None:
+    (tmp_path / ".git").mkdir()
+    (tmp_path / ".git" / "config").write_text("[core]\n", encoding="utf-8")
+    (tmp_path / "src" / "pkg").mkdir(parents=True)
+    (tmp_path / "src" / "pkg" / "target.py").write_text("VALUE = 1\n", encoding="utf-8")
+    (tmp_path / "src" / "pkg" / "neighbor.py").write_text("VALUE = 2\n", encoding="utf-8")
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "docs" / "unrelated.md").write_text("# docs\n", encoding="utf-8")
+
+    subtask = SubTask(
+        id="s1",
+        title="Patch target",
+        description="Modify target only.",
+        files=[FileSkeleton(path="src/pkg/target.py", purpose="Target module.", change_type="modify")],
+        test_criteria="Scoped context is enough.",
+    )
+
+    context = main._subtask_workspace_context(str(tmp_path), subtask)
+
+    assert "src/pkg/target.py" in context
+    assert "src/pkg/neighbor.py" in context
+    assert "docs/unrelated.md" not in context
+    assert ".git/config" not in context
 
 
 def test_build_subtask_persists_bundle_artifacts(monkeypatch, tmp_path: Path) -> None:
@@ -523,6 +652,33 @@ def test_attachment_zip_rejects_path_traversal(tmp_path: Path) -> None:
         raise AssertionError("zip traversal attachment was accepted")
 
 
+def test_attachment_zip_skips_generated_noise(tmp_path: Path) -> None:
+    archive = tmp_path / "input.zip"
+    with zipfile.ZipFile(archive, "w") as zf:
+        zf.writestr("app/src/main.py", "VALUE = 1\n")
+        zf.writestr("app/.venv/lib/site.py", "noise\n")
+        zf.writestr("app/.pytest_cache/v/cache", "noise\n")
+        zf.writestr("app/dist/app.exe", "noise\n")
+        zf.writestr("app/build/temp.o", "noise\n")
+        zf.writestr("app/nested.zip", "noise\n")
+
+    attachment = {
+        "kind": "zip",
+        "name": "input.zip",
+        "content_b64": base64.b64encode(archive.read_bytes()).decode(),
+    }
+
+    records = attachment_tool.materialize([attachment], str(tmp_path))
+
+    extracted = tmp_path / records[0]["path"]
+    assert (extracted / "app/src/main.py").is_file()
+    assert not (extracted / "app/.venv").exists()
+    assert not (extracted / "app/.pytest_cache").exists()
+    assert not (extracted / "app/dist").exists()
+    assert not (extracted / "app/build").exists()
+    assert not (extracted / "app/nested.zip").exists()
+
+
 def test_attachment_file_name_cannot_escape_inputs_dir(tmp_path: Path) -> None:
     attachment = {
         "kind": "image",
@@ -543,6 +699,37 @@ def test_lint_and_test_runner_reject_paths_outside_workspace(tmp_path: Path) -> 
 
     assert "escapes workspace" in lint._run("../outside.py")
     assert "escapes workspace" in tests._run("../outside.py")
+
+
+def test_final_qa_skips_pytest_when_deterministic_gates_fail(tmp_path: Path) -> None:
+    tests = FakeTool("PASS\n1 passed")
+
+    qa = run_final_qa(
+        str(tmp_path),
+        lint_runner=FakeTool("bad.py:1:1: F401 unused import"),
+        type_runner=FakeTool("PASS"),
+        test_runner=tests,
+    )
+
+    assert qa.passed is False
+    assert tests.calls == []
+    assert qa.test_output == "SKIP: pytest skipped because deterministic QA failed first."
+
+
+def test_final_qa_runs_targeted_test_paths(tmp_path: Path) -> None:
+    tests = FakeToolByPath({"tests/test_changed.py": "PASS\n1 passed"})
+
+    qa = run_final_qa(
+        str(tmp_path),
+        lint_runner=FakeTool("PASS"),
+        type_runner=FakeTool("PASS"),
+        test_runner=tests,
+        test_paths=["tests/test_changed.py"],
+    )
+
+    assert qa.passed is True
+    assert tests.calls == ["tests/test_changed.py"]
+    assert "pytest scoped to 1 path(s)" in qa.integration_notes
 
 
 def test_finalize_repairs_failed_final_qa_and_returns_payload(monkeypatch, tmp_path: Path) -> None:
@@ -655,6 +842,70 @@ def test_finalize_returns_project_archive_as_primary_artifact(monkeypatch, tmp_p
             passed=True, lint_output="PASS", test_output="PASS", integration_notes="Clean."
         ),
     )
+    def fail_upload_workspace(build_dir, prefix):
+        raise AssertionError("patch jobs should not upload every file by default")
+
+    monkeypatch.setattr(main, "upload_workspace", fail_upload_workspace)
+    monkeypatch.setattr(
+        main,
+        "upload_file",
+        lambda local_path, key: {
+            "file_path": Path(local_path).name,
+            "size": Path(local_path).stat().st_size,
+            "url": "https://example.test/demo.zip",
+        },
+    )
+    monkeypatch.setattr(main.history, "record", lambda state: None)
+
+    payload = flow.finalize(None)
+
+    assert payload["project_archive"]["kind"] == "project_archive"
+    assert payload["project_archive"]["file_path"] == "demo.zip"
+    assert payload["project_archive"]["url"] == "https://example.test/demo.zip"
+    assert payload["artifact_urls"][0]["kind"] == "project_archive"
+    assert payload["artifact_urls"][0]["file_path"] == "demo.zip"
+    assert len(payload["artifact_urls"]) == 1
+    with zipfile.ZipFile(payload["zip_path"]) as zf:
+        names = zf.namelist()
+    assert "demo/changed.py" in names
+    assert "demo/untouched.py" in names
+
+
+def test_patch_finalize_uploads_file_artifacts_only_when_enabled(
+    monkeypatch, tmp_path: Path
+) -> None:
+    build_dir = tmp_path / "inputs" / "repo"
+    build_dir.mkdir(parents=True)
+    (build_dir / "changed.py").write_text("VALUE = 2\n", encoding="utf-8")
+
+    flow = CodebuilderFlow()
+    flow.state.workspace_dir = str(tmp_path)
+    flow.state.project_name = "demo"
+    flow.state.status = "executing"
+    flow.state.plan = Plan(
+        project_name="demo",
+        mode="patch_existing",
+        tech_stack=["python"],
+        subtasks=[
+            SubTask(
+                id="s1",
+                title="Patch changed file",
+                description="Modify only changed.py.",
+                files=[FileSkeleton(path="changed.py", purpose="Changed module.", change_type="modify")],
+                test_criteria="Archive contains the repaired project.",
+            )
+        ],
+    )
+    flow._build_dir = str(build_dir)
+
+    monkeypatch.setenv("CODEBUILDER_UPLOAD_FILE_ARTIFACTS", "true")
+    monkeypatch.setattr(
+        main,
+        "run_final_qa",
+        lambda build_dir, **_kwargs: QAReport(
+            passed=True, lint_output="PASS", test_output="PASS", integration_notes="Clean."
+        ),
+    )
     monkeypatch.setattr(
         main,
         "upload_workspace",
@@ -675,16 +926,142 @@ def test_finalize_returns_project_archive_as_primary_artifact(monkeypatch, tmp_p
 
     payload = flow.finalize(None)
 
-    assert payload["project_archive"]["kind"] == "project_archive"
-    assert payload["project_archive"]["file_path"] == "demo.zip"
-    assert payload["project_archive"]["url"] == "https://example.test/demo.zip"
-    assert payload["artifact_urls"][0]["kind"] == "project_archive"
-    assert payload["artifact_urls"][0]["file_path"] == "demo.zip"
-    assert payload["artifact_urls"][1]["kind"] == "file"
-    with zipfile.ZipFile(payload["zip_path"]) as zf:
-        names = zf.namelist()
-    assert "demo/changed.py" in names
-    assert "demo/untouched.py" in names
+    assert [ref["kind"] for ref in payload["artifact_urls"]] == ["project_archive", "file"]
+
+
+def test_patch_finalize_no_tests_warning_does_not_trigger_repair(
+    monkeypatch, tmp_path: Path
+) -> None:
+    build_dir = tmp_path / "inputs" / "repo"
+    build_dir.mkdir(parents=True)
+    (build_dir / "changed.py").write_text("VALUE = 2\n", encoding="utf-8")
+
+    flow = CodebuilderFlow()
+    flow.state.workspace_dir = str(tmp_path)
+    flow.state.project_name = "demo"
+    flow.state.status = "executing"
+    flow.state.plan = Plan(
+        project_name="demo",
+        mode="patch_existing",
+        tech_stack=["python"],
+        subtasks=[
+            SubTask(
+                id="s1",
+                title="Patch changed file",
+                description="Modify only changed.py.",
+                files=[FileSkeleton(path="changed.py", purpose="Changed module.", change_type="modify")],
+                test_criteria="Existing project may not include tests.",
+            )
+        ],
+    )
+    flow.state.artifacts = [
+        CodeArtifact(
+            subtask_id="s1",
+            file_path="changed.py",
+            content="VALUE = 2\n",
+            language="python",
+        )
+    ]
+    flow._build_dir = str(build_dir)
+
+    def fake_run_final_qa(build_dir, **kwargs):
+        return QAReport(
+            passed=bool(kwargs.get("allow_no_tests")),
+            lint_output="PASS",
+            test_output="SKIP: no tests collected under this path.",
+            integration_notes=(
+                "No pytest tests were collected in the existing project; "
+                "QA validated changed files with ruff only."
+            ),
+        )
+
+    class FailingWriterCrew:
+        def __init__(self, workspace_dir: str):
+            self.workspace_dir = workspace_dir
+
+        def repair_crew(self):
+            raise AssertionError("patch no-tests warning should not trigger final QA repair")
+
+    monkeypatch.setenv("CODEBUILDER_MAX_FINAL_QA_REPAIRS", "1")
+    monkeypatch.delenv("CODEBUILDER_ARTIFACT_BUCKET", raising=False)
+    monkeypatch.setattr(main, "run_final_qa", fake_run_final_qa)
+    monkeypatch.setattr(main, "WriterCrew", FailingWriterCrew)
+    monkeypatch.setattr(main, "upload_file", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main.history, "record", lambda state: None)
+
+    payload = flow.finalize(None)
+
+    assert payload["status"] == "done"
+    assert payload["qa_report"]["passed"] is True
+    assert flow.state.final_qa_repair_attempts == 0
+    assert "No pytest tests were collected" in payload["qa_report"]["integration_notes"]
+
+
+def test_patch_test_paths_select_changed_and_related_tests(tmp_path: Path) -> None:
+    (tmp_path / "tests" / "unit").mkdir(parents=True)
+    (tmp_path / "tests" / "unit" / "test_settings.py").write_text(
+        "def test_ok():\n    assert True\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "tests" / "unit" / "test_unrelated.py").write_text(
+        "def test_ok():\n    assert True\n",
+        encoding="utf-8",
+    )
+
+    flow = CodebuilderFlow()
+    flow.state.workspace_dir = str(tmp_path)
+    flow.state.plan = Plan(
+        project_name="demo",
+        mode="patch_existing",
+        tech_stack=["python"],
+        subtasks=[
+            SubTask(
+                id="s1",
+                title="Patch settings",
+                description="Patch settings.",
+                files=[
+                    FileSkeleton(
+                        path="src/demo/settings.py",
+                        purpose="Settings module.",
+                        change_type="modify",
+                    )
+                ],
+                test_criteria="Related settings tests pass.",
+            )
+        ],
+    )
+    flow.state.artifacts = [
+        CodeArtifact(subtask_id="s1", file_path="src/demo/settings.py", language="python"),
+        CodeArtifact(subtask_id="s1", file_path="tests/unit/test_explicit.py", language="python"),
+    ]
+
+    assert flow._final_qa_test_paths(str(tmp_path)) == [
+        "tests/unit/test_explicit.py",
+        "tests/unit/test_settings.py",
+    ]
+
+
+def test_patch_test_paths_full_scope_env_returns_none(monkeypatch, tmp_path: Path) -> None:
+    flow = CodebuilderFlow()
+    flow.state.plan = _empty_plan(mode="patch_existing")
+    monkeypatch.setenv("CODEBUILDER_PATCH_TEST_SCOPE", "full")
+
+    assert flow._final_qa_test_paths(str(tmp_path)) is None
+
+
+def test_mode_aware_final_qa_repair_defaults(monkeypatch) -> None:
+    monkeypatch.delenv("CODEBUILDER_MAX_FINAL_QA_REPAIRS", raising=False)
+
+    patch_flow = CodebuilderFlow()
+    patch_flow.state.plan = _empty_plan(mode="patch_existing")
+    assert patch_flow._max_final_qa_repairs() == 1
+
+    new_flow = CodebuilderFlow()
+    new_flow.state.plan = _empty_plan(mode="new_project")
+    assert new_flow._max_final_qa_repairs() == 2
+
+    monkeypatch.setenv("CODEBUILDER_MAX_FINAL_QA_REPAIRS", "4")
+    assert patch_flow._max_final_qa_repairs() == 4
 
 
 def test_finalize_fails_when_configured_project_archive_upload_fails(
@@ -715,6 +1092,44 @@ def test_finalize_fails_when_configured_project_archive_upload_fails(
     assert payload["status"] == "failed"
     assert payload["project_archive"]["kind"] == "project_archive"
     assert "Project archive upload failed" in payload["qa_report"]["integration_notes"]
+
+
+def test_history_record_strips_artifact_urls_and_truncates_patch(monkeypatch, tmp_path: Path) -> None:
+    monkeypatch.setattr(history, "DB_PATH", tmp_path / "history.db")
+    monkeypatch.setenv("CODEBUILDER_HISTORY_ENABLED", "true")
+
+    state = CodebuilderState()
+    state.project_key = "demo"
+    state.project_name = "demo"
+    state.plan = _empty_plan(domain="")
+    state.status = "done"
+    state.qa_report = QAReport(
+        passed=True,
+        lint_output="PASS",
+        test_output="PASS",
+        integration_notes="Clean.",
+        artifact_urls=[
+            ArtifactRef(
+                file_path=f"file_{i}.py",
+                size=10,
+                url=f"https://example.test/file_{i}.py",
+            )
+            for i in range(500)
+        ],
+    )
+    state.patch = "x" * 60000
+
+    history.record(state)
+
+    with sqlite3.connect(tmp_path / "history.db") as conn:
+        qa_blob, patch = conn.execute(
+            "select qa_report_json, patch from project_history"
+        ).fetchone()
+
+    stored_qa = json.loads(qa_blob)
+    assert stored_qa["artifact_urls"] == []
+    assert len(patch) < 51000
+    assert "[truncated" in patch
 
 
 def test_finalize_returns_artifacts_when_final_qa_still_fails(monkeypatch, tmp_path: Path) -> None:

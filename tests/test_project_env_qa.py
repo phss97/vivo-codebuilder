@@ -56,6 +56,15 @@ def test_project_python_falls_back_to_orchestrator(tmp_path):
     assert project_python(str(tmp_path)) == sys.executable
 
 
+def test_project_python_returns_absolute_project_venv(tmp_path, monkeypatch):
+    python = tmp_path / ".venv" / "bin" / "python"
+    python.parent.mkdir(parents=True)
+    python.write_text("#!/bin/sh\n", encoding="utf-8")
+    monkeypatch.chdir(tmp_path.parent)
+
+    assert project_python(tmp_path.name) == str(python.resolve())
+
+
 def test_ensure_project_env_noop_without_pyproject(tmp_path):
     assert ensure_project_env(str(tmp_path)) == ""
     assert not (tmp_path / ".venv").exists()

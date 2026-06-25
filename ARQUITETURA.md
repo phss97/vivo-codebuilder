@@ -109,6 +109,7 @@ Tudo que persiste entre passos vive no `CodebuilderState` (pydantic, herda de `F
 session_id: str               # identidade do USUÁRIO/UI (estável, vem do caller)
 # state.id (= flow_id)        # identidade da EXECUÇÃO (UUID auto-gerado pelo Flow)
 brief, project_name, goals, tech_stack, attachments
+attachment_records: list[dict] # resumo compacto dos anexos materializados
 project_key: str              # chave estável p/ histórico (canônica do git URL OU slug do project_name)
 workspace_dir: str
 plan: Plan | None
@@ -147,8 +148,10 @@ def ingest(self):
     self.state.workspace_dir = str(workspace_dir)
 
     if self.state.attachments:
-        attachment_tool.materialize([a.model_dump() for a in self.state.attachments],
-                                    self.state.workspace_dir)
+        self.state.attachment_records = attachment_tool.materialize(
+            [a.model_dump() for a in self.state.attachments],
+            self.state.workspace_dir,
+        )
 
     self.state.project_key = history.project_key_from(self.state) or session_key
     self.state.status = "planning"
@@ -156,7 +159,7 @@ def ingest(self):
 
 **O que esta etapa faz:**
 - Cria o sandbox `workspaces/<session_id>/`.
-- Materializa anexos: clones git vão para `inputs/repo`, zips são extraídos, PDFs viram texto, imagens são salvas como blob.
+- Materializa anexos: clones git vão para `inputs/repo`, zips são extraídos, PDFs viram texto, imagens são salvas como blob. O retorno fica em `attachment_records`, um resumo compacto usado pelo planner.
 - Deriva uma **chave estável de projeto** (`project_key`) usando o URL git canonicalizado ou um slug do `project_name` — isso permite que múltiplos runs do mesmo projeto compartilhem histórico.
 
 ### 6.2 `plan` — `@listen(ingest)` + `@human_feedback(...)`
@@ -256,8 +259,8 @@ for attempt in range(_max_subtask_retries() + 1):
 def finalize(self, _prior=None):
     build_dir = getattr(self, "_build_dir", self.state.workspace_dir)
 
-    # 1. QA determinístico sobre TODO o workspace
-    self.state.qa_report = run_final_qa(build_dir)        # ruff . + pytest .
+    # 1. QA determinístico
+    self.state.qa_report = run_final_qa(build_dir)        # ruff + pytest
 
     # 2. Repair pass — 1 tentativa do writer pra corrigir QA quebrado
     self._repair_final_qa_if_needed(build_dir)
@@ -281,6 +284,8 @@ def finalize(self, _prior=None):
 
     self.state.status = "done" if qa_report.passed else "failed"
 ```
+
+Em `patch_existing`, lint/type rodam nos arquivos alterados e pytest roda só nos testes alterados/relacionados por padrão. `CODEBUILDER_PATCH_TEST_SCOPE=full` força a suíte inteira. Se pytest não coletar testes e os gates determinísticos tiverem passado, o job finaliza com aviso em vez de falhar; repositórios existentes do cliente podem não ter testes. Em `new_project`, ausência de testes continua sendo falha de QA.
 
 ### 6.7 Gate de arquitetura por domínio
 
@@ -459,7 +464,8 @@ API pública:
 | `CODEBUILDER_PROGRESS_WEBHOOK` | — | Eventos de subtask started/completed/failed |
 | `CODEBUILDER_PROGRESS_WEBHOOK_SECRET` | — | idem |
 | `CODEBUILDER_MAX_SUBTASK_RETRIES` | `1` | Retries por subtask no loop writer↔reviewer |
-| `CODEBUILDER_MAX_FINAL_QA_REPAIRS` | `1` | Tentativas de reparo após QA final falhar |
+| `CODEBUILDER_MAX_FINAL_QA_REPAIRS` | `1` em `patch_existing`, `2` em `new_project` | Tentativas de reparo após QA final falhar |
+| `CODEBUILDER_PATCH_TEST_SCOPE` | `targeted` | Use `full`/`all`/`whole` para rodar toda a suíte pytest em patches; por padrão roda só testes alterados/relacionados |
 | `CODEBUILDER_HISTORY_DB` | `./data/codebuilder_history.db` | SQLite de histórico |
 | `CODEBUILDER_GUARDRAIL_LLM` | `openai/gpt-5.4-mini` | LLM que classifica feedback do humano |
 

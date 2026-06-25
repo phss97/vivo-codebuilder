@@ -29,3 +29,6 @@ brief.json
 
 # CrewAI scaffolding doc (kept locally, not pushed)
 AGENTS.md
+
+.claude
+references/

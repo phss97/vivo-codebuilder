@@ -27,6 +27,14 @@ def test_planner_and_writer_have_rpa_skill(tmp_path: Path) -> None:
     assert "rpa" in _skill_names(WriterCrew(workspace_dir=str(tmp_path)).writer())
 
 
+def test_planner_uses_bounded_workspace_tools(tmp_path: Path) -> None:
+    tool_names = {tool.name for tool in PlannerCrew(workspace_dir=str(tmp_path)).planner().tools}
+
+    assert {"workspace_read", "workspace_list"} <= tool_names
+    assert "Read a file's content" not in tool_names
+    assert "List files and directories" not in tool_names
+
+
 def test_reviewer_and_qa_have_rpa_and_gate_skills(tmp_path: Path) -> None:
     reviewer_crew = ReviewerCrew(workspace_dir=str(tmp_path))
 

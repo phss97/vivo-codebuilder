@@ -107,12 +107,38 @@ def test_symbol_contract_renders_only_files_with_public_api() -> None:
 
 
 def test_symbol_contract_sentinels() -> None:
+    # No plan, no written artifacts → nothing to contract.
     no_plan = CodebuilderFlow()
-    assert no_plan._symbol_contract() == "(no plan available)"
+    assert no_plan._symbol_contract() == "(no symbols available)"
 
+    # Plan present but no declared public_api and no artifacts on disk yet.
     no_symbols = CodebuilderFlow()
-    no_symbols.state.plan = _plan(public_api=[])  # plan present, no public symbols
-    assert no_symbols._symbol_contract() == "(no public symbols declared in the plan)"
+    no_symbols.state.plan = _plan(public_api=[])
+    assert no_symbols._symbol_contract() == "(no symbols available)"
+
+
+def test_symbol_contract_prefers_real_written_api(tmp_path) -> None:
+    """Once a file is written, the contract carries its REAL fields (extracted
+    from disk), so a later writer can't drift onto an invented attribute."""
+    from codebuilder.schemas import CodeArtifact
+
+    settings_src = (
+        "class Settings:\n"
+        "    database_url: str\n"
+        "    sap_endpoint: str\n"
+    )
+    pkg = tmp_path / "src" / "demo" / "config"
+    pkg.mkdir(parents=True)
+    (pkg / "settings.py").write_text(settings_src, encoding="utf-8")
+
+    flow = CodebuilderFlow()
+    flow.state.artifacts = [
+        CodeArtifact(subtask_id="s1", file_path="src/demo/config/settings.py", language="python")
+    ]
+    contract = flow._symbol_contract(str(tmp_path))
+    assert "demo.config.settings" in contract
+    assert "database_url" in contract and "sap_endpoint" in contract
+    assert "sap_host" not in contract  # the drift attribute is never present
 
 
 # --------------------------------------------------------------------------- #
