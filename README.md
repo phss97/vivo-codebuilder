@@ -12,7 +12,7 @@ brief.json ──▶ ingest ──▶ plan ──▶ [HITL approve/amend/reject]
 Two modes:
 
 - **`new_project`** — agents scaffold a fresh project under `workspaces/<session_id>/output/` and `git init` it.
-- **`patch_existing`** — the Git or zip attachment is materialized under `workspaces/<session_id>/inputs/`, agents edit that project in place, a diff is captured, and the complete repaired project is zipped on finalize.
+- **`patch_existing`** — the Git or zip attachment is materialized under `workspaces/<session_id>/inputs/`, agents edit the resolved project root in place, a diff is captured, and the complete repaired project is zipped even when final QA still reports failures.
 
 ## Requirements
 
@@ -42,7 +42,7 @@ Optional environment variables (see `.env.example`):
 | `CODEBUILDER_APPROVAL_WEBHOOK` | *(unset)* | POST target for HITL plan approvals. Falls back to a console prompt when unset. |
 | Agent model settings | `agents.yaml` | Planner/writer/reviewer models and reasoning/planning settings live in each crew's YAML. Edit YAML instead of using Python env override plumbing. |
 | `CODEBUILDER_GUARDRAIL_LLM` | `openai/gpt-5.4-mini` | Override the model used by the `@human_feedback` guardrail when classifying user replies. |
-| `CODEBUILDER_MAX_SUBTASK_RETRIES` | `1` | Per-file writer retry count after deterministic review failure. |
+| `CODEBUILDER_MAX_SUBTASK_RETRIES` | `3` | Per-subtask writer retry count after deterministic/reviewer failure. Total attempts are initial write + this retry count. |
 | `CODEBUILDER_MAX_FINAL_QA_REPAIRS` | `1` for `patch_existing`, `2` for `new_project` | Whole-workspace repair attempts after final QA failure. |
 | `CODEBUILDER_PATCH_TEST_SCOPE` | full when tests exist | Patch jobs run the full pytest suite when test files exist. With no test files, no-tests collection is a non-blocking warning. |
 | `CODEBUILDER_PROGRESS_WEBHOOK` | *(unset)* | Optional best-effort progress callback after subtasks and final QA. |
@@ -85,12 +85,23 @@ After the planner runs, the flow pauses and either:
 
 ### Completion payload
 
-Successful final payloads distinguish the runnable project archive from file-level audit artifacts. Failed QA payloads omit runnable archive fields.
+Completion payloads distinguish the project archive from file-level audit artifacts. Failed QA payloads can still include the archive plus a Markdown QA report so users can salvage or resubmit the package with concrete failure context.
 
-- `project_archive` — success-only primary deliverable for both `new_project` and `patch_existing`; contains the local archive path and, when S3 upload is enabled, the downloadable URL.
+- `project_archive` — primary package deliverable for both `new_project` and `patch_existing`; contains the local archive path and, when S3 upload is enabled, the downloadable URL. Check `qa_passed` before treating it as verified.
 - `zip_path` / `zip_url` — backward-compatible aliases for the same archive.
 - `artifact_urls` — the archive and, when per-file uploads are enabled, individual uploaded files. These are useful for inspection, but callers should use `project_archive` / `zip_url` when they need a runnable project.
 - `patch` — diff for `patch_existing` jobs only. It is an audit/review aid, not the primary runnable deliverable.
+- `qa_report_markdown` — deterministic Markdown summary of failed lint/type/test/subtask issues and a copyable next-fix request.
+
+Failed QA payloads return `status="failed"` and `qa_passed=false` even when `project_archive`, `zip_path`, `zip_url`, or archive entries in `artifact_urls` are present. Callers must treat `qa_passed` / `qa_report.passed` as the safety signal.
+
+### Patch QA contract
+
+For `patch_existing`, Codebuilder runs deterministic preflight QA against the attached project before planning when the project root can be resolved. The truncated preflight `QAReport` is planner context, so patch plans must be grounded in concrete lint/type/test output rather than speculative diagnostic tasks.
+
+Patch plans must name real production, test, or build target files. Placeholder paths such as `FILES_TO_BE_DETERMINED_BY_*`, `TESTS_TO_BE_DETERMINED_BY_*`, `TBD`, and `PLACEHOLDER` are rejected, and diagnostic-only RPA/code plans are invalid.
+
+Final QA is package-level. When tests exist, patch jobs run the full pytest suite even if lint/type gates fail first, so repair receives real acceptance-test failures too. With no test files, "no tests collected" is a non-blocking warning. The type gate includes generated tests so drift between tests and production APIs fails QA.
 
 ## Project layout
 
@@ -131,4 +142,4 @@ uv add <pkg>                 # prefer this over hand-editing pyproject
 - Patch jobs plan and report only changed files, but the user-facing deliverable is the complete repaired project archive. Consumers must not reconstruct a project from changed-file artifacts.
 - Patch jobs feed planner/writer crews compact attachment records and scoped parent-directory listings, not a full recursive repository tree.
 - New-project jobs whose plan declares a `domain` (e.g. `rpa`) also run that domain's architecture gate before completion. For `rpa`, missing orchestrator/producer/consumer, Clean Architecture layers, `.env.example`/CCM config, tests, or traceability marks the job failed even if lint/tests pass. Plans without a registered `domain` finalize on lint/test alone.
-- Crew outputs are validated through pydantic schemas with guardrails (e.g. the planner's `Plan` must have 1–24 bundled work packages, each with 1–6 planned files and non-empty `test_criteria`; deterministic review rejects missing/extra bundle paths and placeholder/TODO-only files).
+- Crew outputs are validated through pydantic schemas with guardrails (e.g. the planner's `Plan` must have 1–24 bundled work packages, each with 1–6 planned files and non-empty `test_criteria`; deterministic review rejects placeholder paths, diagnostic-only plans, missing/extra bundle paths, and placeholder/TODO-only files).

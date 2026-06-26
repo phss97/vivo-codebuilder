@@ -8,6 +8,9 @@ review_task:
     Artifact bundle to review:
     {artifact}
 
+    Deterministic failure output that triggered this review:
+    {deterministic_issues}
+
     Workspace root: {workspace_dir}
 
     Use the `workspace_read` and `workspace_list` tools to read every file

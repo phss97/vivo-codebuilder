@@ -122,7 +122,7 @@ preflight_qa_report: QAReport | None  # QA completo antes do plano em patch_exis
 final_qa_repair_attempts: int
 patch: str                    # modo patch_existing
 zip_path, zip_url              # só aparecem no payload público quando QA passa
-project_archive               # entregável primário de sucesso: zip completo do projeto
+project_archive               # zip completo do projeto; QA define se é verificado ou "salvage"
 status: "pending" | "planning" | "awaiting_approval" | "executing" | "done" | "failed"
 ```
 
@@ -464,7 +464,7 @@ API pública:
 | `CODEBUILDER_APPROVAL_WEBHOOK_SECRET` | — | Header `X-Codebuilder-...` |
 | `CODEBUILDER_PROGRESS_WEBHOOK` | — | Eventos de subtask started/completed/failed |
 | `CODEBUILDER_PROGRESS_WEBHOOK_SECRET` | — | idem |
-| `CODEBUILDER_MAX_SUBTASK_RETRIES` | `1` | Retries por subtask no loop writer↔reviewer |
+| `CODEBUILDER_MAX_SUBTASK_RETRIES` | `3` | Retries por subtask no loop writer↔reviewer; tentativas totais = escrita inicial + retries |
 | `CODEBUILDER_MAX_FINAL_QA_REPAIRS` | `1` em `patch_existing`, `2` em `new_project` | Tentativas de reparo após QA final falhar |
 | `CODEBUILDER_PATCH_TEST_SCOPE` | full se houver testes | Compatibilidade: `full`/`all`/`whole` também força suíte inteira; sem arquivos de teste, falta de coleta é aviso |
 | `CODEBUILDER_HISTORY_DB` | `./data/codebuilder_history.db` | SQLite de histórico |

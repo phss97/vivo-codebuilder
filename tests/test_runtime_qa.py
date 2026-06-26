@@ -639,9 +639,12 @@ def test_build_subtask_persists_bundle_artifacts(monkeypatch, tmp_path: Path) ->
     assert flow.state.review_results[-1].passed is True
 
 
-def test_build_stops_after_first_failed_subtask(monkeypatch, tmp_path: Path) -> None:
+def test_build_stops_later_subtasks_after_retry_exhaustion_but_finalize_zips(
+    monkeypatch, tmp_path: Path
+) -> None:
     flow = CodebuilderFlow()
     flow.state.workspace_dir = str(tmp_path)
+    flow.state.project_name = "demo"
     flow.state.plan = Plan(
         project_name="demo",
         mode="new_project",
@@ -667,6 +670,8 @@ def test_build_stops_after_first_failed_subtask(monkeypatch, tmp_path: Path) -> 
 
     def fake_build_subtask(subtask: SubTask, build_dir: str, *, index: int, total: int):
         calls.append(subtask.id)
+        Path(build_dir).mkdir(parents=True, exist_ok=True)
+        (Path(build_dir) / "partial.py").write_text("VALUE = 1\n", encoding="utf-8")
         return ReviewResult(
             subtask_id=subtask.id,
             passed=False,
@@ -675,14 +680,109 @@ def test_build_stops_after_first_failed_subtask(monkeypatch, tmp_path: Path) -> 
 
     monkeypatch.setattr(main.git_tool, "init_and_commit", lambda *args, **kwargs: None)
     monkeypatch.setattr(flow, "_build_subtask", fake_build_subtask)
+    monkeypatch.setattr(
+        main,
+        "run_final_qa",
+        lambda build_dir, **_kwargs: QAReport(
+            passed=False,
+            lint_output="PASS",
+            test_output="FAILED tests/test_partial.py::test_partial",
+            integration_notes="Tests failed.",
+        ),
+    )
+    monkeypatch.setattr(main, "upload_file", lambda *args, **kwargs: None)
+    monkeypatch.setattr(main.history, "record", lambda state: None)
 
     flow.build(SimpleNamespace(feedback=""))
+    payload = flow.finalize(None)
 
     assert calls == ["s1"]
     assert flow.state.status == "failed"
     assert flow.state.qa_report is not None
     assert flow.state.qa_report.passed is False
     assert "s1" in flow.state.qa_report.integration_notes
+    assert payload["zip_path"].endswith("demo.zip")
+    assert payload["project_archive"]["file_path"] == "demo.zip"
+    assert "qa_report_markdown" in payload
+
+
+def test_build_subtask_retries_with_reviewer_feedback(monkeypatch, tmp_path: Path) -> None:
+    flow = CodebuilderFlow()
+    flow.state.workspace_dir = str(tmp_path)
+    monkeypatch.setenv("CODEBUILDER_MAX_SUBTASK_RETRIES", "1")
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "mod.py").write_text("VALUE = 1\n", encoding="utf-8")
+    subtask = SubTask(
+        id="s08",
+        title="Patch module",
+        description="Change VALUE to 2.",
+        files=[
+            FileSkeleton(path="src/mod.py", purpose="Existing module.", change_type="modify")
+        ],
+        test_criteria="VALUE changes.",
+    )
+    writer_inputs: list[dict] = []
+    reviewer_inputs: list[dict] = []
+
+    class FakeWriterCrew:
+        def __init__(self, workspace_dir: str):
+            self.workspace_dir = workspace_dir
+            self.calls = 0
+
+        def crew(self):
+            outer = self
+
+            class FakeCrew:
+                def kickoff(self, inputs: dict):
+                    writer_inputs.append(inputs)
+                    outer.calls += 1
+                    content = "VALUE = 1\n" if outer.calls == 1 else "VALUE = 2\n"
+                    return SimpleNamespace(
+                        pydantic=CodeBundleArtifact(
+                            subtask_id="s08",
+                            artifacts=[
+                                CodeArtifact(
+                                    subtask_id="s08",
+                                    file_path="src/mod.py",
+                                    content=content,
+                                    language="python",
+                                )
+                            ],
+                        )
+                    )
+
+            return FakeCrew()
+
+    class FakeReviewerCrew:
+        def __init__(self, workspace_dir: str):
+            self.workspace_dir = workspace_dir
+
+        def crew(self):
+            class FakeCrew:
+                def kickoff(self, inputs: dict):
+                    reviewer_inputs.append(inputs)
+                    return SimpleNamespace(
+                        pydantic=ReviewResult(
+                            subtask_id="s08",
+                            passed=False,
+                            issues=["The file is unchanged."],
+                            suggestions=["Set VALUE to 2 and return the full file."],
+                        )
+                    )
+
+            return FakeCrew()
+
+    monkeypatch.setattr(main, "WriterCrew", FakeWriterCrew)
+    monkeypatch.setattr(main, "ReviewerCrew", FakeReviewerCrew)
+
+    review = flow._build_subtask(subtask, str(tmp_path), index=1, total=1)
+
+    assert review.passed is True
+    assert len(writer_inputs) == 2
+    assert reviewer_inputs
+    assert "produced no change" in reviewer_inputs[0]["deterministic_issues"]
+    assert "Set VALUE to 2" in writer_inputs[1]["prior_review_issues"]
+    assert (tmp_path / "src" / "mod.py").read_text(encoding="utf-8") == "VALUE = 2\n"
 
 
 def test_zip_build_excludes_tool_cache_dirs(tmp_path: Path) -> None:
@@ -1146,6 +1246,9 @@ def test_patch_test_paths_full_scope_env_returns_none(monkeypatch, tmp_path: Pat
 
 def test_mode_aware_final_qa_repair_defaults(monkeypatch) -> None:
     monkeypatch.delenv("CODEBUILDER_MAX_FINAL_QA_REPAIRS", raising=False)
+    monkeypatch.delenv("CODEBUILDER_MAX_SUBTASK_RETRIES", raising=False)
+
+    assert main._max_subtask_retries() == 3
 
     patch_flow = CodebuilderFlow()
     patch_flow.state.plan = _empty_plan(mode="patch_existing")
@@ -1185,9 +1288,10 @@ def test_finalize_fails_when_configured_project_archive_upload_fails(
     payload = flow.finalize(None)
 
     assert payload["status"] == "failed"
-    assert "project_archive" not in payload
-    assert "zip_path" not in payload
-    assert "artifact_urls" not in payload
+    assert payload["project_archive"]["file_path"] == "demo.zip"
+    assert payload["zip_path"].endswith("demo.zip")
+    assert "zip_url" not in payload
+    assert payload["artifact_urls"] == []
     assert "Project archive upload failed" in payload["qa_report"]["integration_notes"]
 
 
@@ -1229,10 +1333,13 @@ def test_history_record_strips_artifact_urls_and_truncates_patch(monkeypatch, tm
     assert "[truncated" in patch
 
 
-def test_failed_qa_omits_runnable_archive_fields(monkeypatch, tmp_path: Path) -> None:
+def test_failed_qa_includes_archive_and_markdown_report(monkeypatch, tmp_path: Path) -> None:
+    (tmp_path / "app.py").write_text("def still_broken() -> bool:\n    return False\n", encoding="utf-8")
     flow = CodebuilderFlow()
     flow.state.workspace_dir = str(tmp_path)
+    flow.state.project_name = "demo"
     flow.state.status = "executing"
+    flow.state.plan = _empty_plan(domain="")
     monkeypatch.setenv("CODEBUILDER_MAX_FINAL_QA_REPAIRS", "1")
 
     def fake_run_final_qa(build_dir: str, *, lint_paths=None, **_kwargs) -> QAReport:
@@ -1266,14 +1373,16 @@ def test_failed_qa_omits_runnable_archive_fields(monkeypatch, tmp_path: Path) ->
 
     monkeypatch.setattr(main, "run_final_qa", fake_run_final_qa)
     monkeypatch.setattr(main, "WriterCrew", FakeWriterCrew)
+    monkeypatch.setattr(main, "upload_workspace", lambda build_dir, prefix: [])
     monkeypatch.setattr(
         main,
-        "upload_workspace",
-        lambda build_dir, prefix: [
-            {"file_path": "app.py", "size": 45, "url": "https://example.test/app.py"}
-        ],
+        "upload_file",
+        lambda local_path, key: {
+            "file_path": Path(local_path).name,
+            "size": Path(local_path).stat().st_size,
+            "url": "https://example.test/demo.zip",
+        },
     )
-    monkeypatch.setattr(main, "upload_file", lambda *args, **kwargs: None)
     monkeypatch.setattr(main.history, "record", lambda state: None)
 
     payload = flow.finalize(None)
@@ -1282,8 +1391,9 @@ def test_failed_qa_omits_runnable_archive_fields(monkeypatch, tmp_path: Path) ->
     assert flow.state.final_qa_repair_attempts == 1
     assert payload["qa_report"]["passed"] is False
     assert "still failing after 1 writer repair attempt" in payload["qa_report"]["integration_notes"]
-    assert "artifact_urls" not in payload
-    assert "zip_path" not in payload
-    assert "zip_url" not in payload
-    assert "project_archive" not in payload
-    assert payload["qa_report"]["artifact_urls"] == []
+    assert payload["zip_path"].endswith("demo.zip")
+    assert payload["zip_url"] == "https://example.test/demo.zip"
+    assert payload["project_archive"]["file_path"] == "demo.zip"
+    assert payload["artifact_urls"][0]["kind"] == "project_archive"
+    assert payload["qa_report"]["artifact_urls"][0]["kind"] == "project_archive"
+    assert "FAILED tests/test_app.py::test_demo" in payload["qa_report_markdown"]

@@ -56,7 +56,7 @@ from codebuilder.tools.s3_artifacts import SKIP_DIRS, SKIP_FILES, upload_file, u
 log = logging.getLogger(__name__)
 
 WORKSPACE_ROOT = Path(os.environ.get("CODEBUILDER_WORKSPACE_ROOT", "./workspaces")).resolve()
-DEFAULT_MAX_SUBTASK_RETRIES = 1
+DEFAULT_MAX_SUBTASK_RETRIES = 3
 DEFAULT_PATCH_FINAL_QA_REPAIRS = 1
 DEFAULT_NEW_PROJECT_FINAL_QA_REPAIRS = 2
 PROGRESS_WEBHOOK_TIMEOUT_SECONDS = 5
@@ -92,6 +92,24 @@ def _max_final_qa_repairs() -> int:
 
 def _append_note(report: QAReport, note: str) -> None:
     report.integration_notes = " ".join(part for part in (report.integration_notes, note) if part)
+
+
+def _review_feedback_text(review: ReviewResult) -> str:
+    parts: list[str] = []
+    if review.issues:
+        parts.append("Reviewer issues:\n" + "\n".join(f"- {issue}" for issue in review.issues))
+    if review.suggestions:
+        parts.append(
+            "Reviewer suggestions:\n" + "\n".join(f"- {suggestion}" for suggestion in review.suggestions)
+        )
+    return "\n\n".join(parts)
+
+
+def _markdown_excerpt(value: str, limit: int = 6000) -> str:
+    if len(value) <= limit:
+        return value
+    omitted = len(value) - limit
+    return f"{value[:limit]}\n\n[truncated {omitted} chars]"
 
 
 def _emit_progress(state: CodebuilderState, event_type: str, **payload: Any) -> None:
@@ -664,18 +682,14 @@ class CodebuilderFlow(Flow[CodebuilderState]):
 
         total_subtasks = len(plan.subtasks)
         self._build_dir = build_dir
+        self._failed_subtask = None
+        self._failed_subtask_review = None
         for index, subtask in enumerate(plan.subtasks, start=1):
             review = self._build_subtask(subtask, build_dir, index=index, total=total_subtasks)
             if not review.passed:
-                self.state.status = "failed"
-                self.state.qa_report = QAReport(
-                    passed=False,
-                    test_output="\n".join(review.issues),
-                    integration_notes=(
-                        f"Subtask {subtask.id} failed before final QA; build stopped."
-                    ),
-                )
-                return {"status": "failed", "failed_subtask_id": subtask.id}
+                self._failed_subtask = subtask
+                self._failed_subtask_review = review
+                break
 
     @listen(build)
     def finalize(self, _prior=None):
@@ -687,11 +701,27 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                 log.warning("history.record on build failure failed: %s", exc)
             return self._completion_payload(build_dir)
 
+        def apply_failed_subtask_note() -> None:
+            failed_review = getattr(self, "_failed_subtask_review", None)
+            failed_subtask = getattr(self, "_failed_subtask", None)
+            if not failed_review or self.state.qa_report is None:
+                return
+            subtask_id = getattr(failed_subtask, "id", failed_review.subtask_id)
+            issue_text = "; ".join(failed_review.issues) or "review failed without detail"
+            note = (
+                f"Subtask {subtask_id} failed after all writer retries; later subtasks were skipped. "
+                f"Issues: {issue_text}"
+            )
+            self.state.qa_report.passed = False
+            if note not in self.state.qa_report.integration_notes:
+                _append_note(self.state.qa_report, note)
+
         _emit_progress(self.state, "final_qa_started")
         self._import_gate_overflow: list[str] = []
         self._run_import_completeness_pass(build_dir)
         self._run_rpa_packaging_pass(build_dir)
         self.state.qa_report = self._run_final_qa(build_dir)
+        apply_failed_subtask_note()
         if self._import_gate_overflow and self.state.qa_report:
             self.state.qa_report.passed = False
             _append_note(
@@ -700,6 +730,7 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                 f"could cover. Unresolved paths: {', '.join(self._import_gate_overflow)}.",
             )
         self._repair_final_qa_if_needed(build_dir)
+        apply_failed_subtask_note()
         if self.state.plan and self.state.plan.mode == "new_project":
             architecture_review = run_full_architecture_gate(
                 build_dir, self.state.plan, self.state.language or "English"
@@ -711,13 +742,7 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                     self.state.qa_report,
                     "Architecture gate failed: " + "; ".join(architecture_review.issues),
                 )
-        _emit_progress(
-            self.state,
-            "final_qa_completed",
-            passed=bool(self.state.qa_report and self.state.qa_report.passed),
-            repair_attempts=self.state.final_qa_repair_attempts,
-            integration_notes=self.state.qa_report.integration_notes if self.state.qa_report else "",
-        )
+        apply_failed_subtask_note()
 
         if self.state.plan and self.state.plan.mode == "patch_existing":
             try:
@@ -726,8 +751,7 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                 log.warning("patch generation failed: %s", exc)
                 self.state.patch = ""
 
-        # Only passing QA gets a runnable deliverable in the public payload.
-        if self.state.plan and (self.state.qa_report is None or self.state.qa_report.passed):
+        if self.state.plan:
             try:
                 zip_path = _zip_build(
                     build_dir,
@@ -750,7 +774,7 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                         f"Project archive generation failed: {exc}",
                     )
 
-        if self.state.qa_report and self.state.qa_report.passed:
+        if self.state.qa_report:
             session_segment = self.state.project_key or self.state.session_id or self.state.id
             prefix = f"{session_segment}/{self.state.id}"
             uploaded_refs: list[ArtifactRef] = []
@@ -774,33 +798,41 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                         "but no downloadable archive URL was returned.",
                     )
 
-            if _upload_file_artifacts_enabled(self.state.plan):
+            if self.state.qa_report.passed and _upload_file_artifacts_enabled(self.state.plan):
                 try:
                     uploaded_refs.extend(artifact_refs(upload_workspace(build_dir, prefix=prefix)))
                 except Exception as exc:  # noqa: BLE001
                     log.warning("workspace artifact upload failed: %s", exc)
-            else:
+            elif self.state.qa_report.passed:
                 _emit_progress(
                     self.state,
                     "file_artifact_upload_skipped",
                     reason="disabled_for_patch_existing",
                 )
 
-            self.state.qa_report.artifact_urls = (
-                uploaded_refs if self.state.qa_report.passed else []
-            )
+            self.state.qa_report.artifact_urls = uploaded_refs
 
         self.state.status = (
             "done" if self.state.qa_report is None or self.state.qa_report.passed else "failed"
         )
         log.info("job %s complete", self.state.id)
 
+        completion = self._completion_payload(build_dir)
+        _emit_progress(
+            self.state,
+            "final_qa_completed",
+            **completion,
+            passed=bool(self.state.qa_report and self.state.qa_report.passed),
+            repair_attempts=self.state.final_qa_repair_attempts,
+            integration_notes=self.state.qa_report.integration_notes if self.state.qa_report else "",
+        )
+
         try:
             history.record(self.state)
         except Exception as exc:  # noqa: BLE001 — history is observability, never fatal
             log.warning("history.record on finalize failed: %s", exc)
 
-        return self._completion_payload(build_dir)
+        return completion
 
     # --- helpers ---------------------------------------------------------
 
@@ -1096,22 +1128,65 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             payload["build_dir"] = build_dir
         if self.state.qa_report:
             qa = self.state.qa_report.model_dump(mode="json")
-            if not self.state.qa_report.passed:
-                qa["artifact_urls"] = []
             payload["qa_report"] = qa
-            if self.state.qa_report.passed:
-                payload["artifact_urls"] = qa.get("artifact_urls", [])
+            payload["artifact_urls"] = qa.get("artifact_urls", [])
             payload["qa_passed"] = self.state.qa_report.passed
-        expose_archive = self.state.qa_report is None or self.state.qa_report.passed
-        if expose_archive and self.state.zip_path:
+            payload["qa_report_markdown"] = self._qa_report_markdown(build_dir)
+        if self.state.zip_path:
             payload["zip_path"] = self.state.zip_path
-        if expose_archive and self.state.zip_url:
+        if self.state.zip_url:
             payload["zip_url"] = self.state.zip_url
-        if expose_archive and self.state.project_archive:
+        if self.state.project_archive:
             payload["project_archive"] = self.state.project_archive.model_dump(mode="json")
         if self.state.patch:
             payload["patch"] = self.state.patch
         return payload
+
+    def _qa_report_markdown(self, build_dir: str | None = None) -> str:
+        report = self.state.qa_report
+        if report is None:
+            return ""
+        status = "passed" if report.passed else "failed"
+        lines = [
+            "# CodeBuilder QA Report",
+            "",
+            f"- Status: {status}",
+            f"- Project: {self.state.project_name or self.state.id}",
+            f"- Build dir: {build_dir or self.state.workspace_dir}",
+            f"- Repair attempts: {self.state.final_qa_repair_attempts}",
+        ]
+        if self.state.project_archive:
+            lines.append(f"- Archive: {self.state.project_archive.local_path}")
+            if self.state.project_archive.url:
+                lines.append(f"- Download: {self.state.project_archive.url}")
+        if getattr(self, "_failed_subtask_review", None):
+            failed_review = self._failed_subtask_review
+            lines.extend(["", "## Failed Subtask"])
+            lines.append(f"- Subtask: {failed_review.subtask_id}")
+            for issue in failed_review.issues:
+                lines.append(f"- Issue: {issue}")
+            for suggestion in failed_review.suggestions:
+                lines.append(f"- Suggestion: {suggestion}")
+        sections = [
+            ("Integration Notes", report.integration_notes),
+            ("Lint Output", report.lint_output),
+            ("Type Output", report.type_output),
+            ("Test Output", report.test_output),
+        ]
+        for title, value in sections:
+            if not value:
+                continue
+            lines.extend(["", f"## {title}", "", "```text", _markdown_excerpt(value), "```"])
+        if not report.passed:
+            lines.extend(
+                [
+                    "",
+                    "## Suggested next request",
+                    "",
+                    "Please fix the QA failures in this package. Use the lint, type, test, and failed-subtask output above as the source of truth, then rerun the relevant tests.",
+                ]
+            )
+        return "\n".join(lines) + "\n"
 
     def _symbol_contract(self, build_dir: str | None = None) -> str:
         """The name map every writer must import/call against verbatim.
@@ -1255,13 +1330,41 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                 existing_snapshots=existing_snapshots,
             )
             review = deterministic.result
-            if deterministic.needs_fallback:
+            if not review.passed:
+                deterministic_issues = "\n".join(review.issues)
+                try:
+                    reviewer = ReviewerCrew(workspace_dir=build_dir)
+                    review_result = reviewer.crew().kickoff(
+                        inputs={
+                            "subtask": subtask.model_dump_json(indent=2),
+                            "artifact": bundle.model_dump_json(indent=2),
+                            "workspace_dir": build_dir,
+                            "deterministic_issues": deterministic_issues,
+                            "language": self.state.language or "English",
+                        }
+                    )
+                    reviewer_review = (
+                        review_result.pydantic
+                        if isinstance(review_result.pydantic, ReviewResult)
+                        else None
+                    )
+                    if reviewer_review:
+                        review = ReviewResult(
+                            subtask_id=subtask.id,
+                            passed=False,
+                            issues=[*review.issues, *reviewer_review.issues],
+                            suggestions=[*review.suggestions, *reviewer_review.suggestions],
+                        )
+                except Exception as exc:  # noqa: BLE001 — retry can use deterministic issues alone
+                    log.warning("subtask %s reviewer feedback failed: %s", subtask.id, exc)
+            elif deterministic.needs_fallback:
                 reviewer = ReviewerCrew(workspace_dir=build_dir)
                 review_result = reviewer.crew().kickoff(
                     inputs={
                         "subtask": subtask.model_dump_json(indent=2),
                         "artifact": bundle.model_dump_json(indent=2),
                         "workspace_dir": build_dir,
+                        "deterministic_issues": "(none)",
                         "language": self.state.language or "English",
                     }
                 )
@@ -1273,19 +1376,7 @@ class CodebuilderFlow(Flow[CodebuilderState]):
 
             if review.passed:
                 break
-            next_issues = "\n".join(review.issues) if review.issues else "review failed without detail"
-            if review.issues and all("SKIP:" in issue for issue in review.issues):
-                log.warning("subtask %s: deterministic review skipped; not retrying writer", subtask.id)
-                break
-            # If the reviewer returns the same issues twice in a row, the writer
-            # cannot fix them (systemic problem — missing tool, env, etc.).
-            # Stop burning retries and let finalize/QA surface it instead.
-            if attempt > 0 and next_issues == prior_issues:
-                log.warning(
-                    "subtask %s: identical review issues across retries, short-circuiting",
-                    subtask.id,
-                )
-                break
+            next_issues = _review_feedback_text(review) or "review failed without detail"
             prior_issues = next_issues
 
         if bundle is not None:
