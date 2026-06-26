@@ -22,6 +22,7 @@ from codebuilder.runtime_qa import (
     MODIFY_PREIMAGE_LIMIT,
     artifact_refs,
     build_symbol_index,
+    has_pytest_files,
     looks_like_placeholder,
     persist_artifact,
     persist_bundle_artifact,
@@ -397,6 +398,11 @@ def _planner_inputs(state: CodebuilderState) -> dict:
             if listing != "(empty)":
                 records = f"Materialized inputs:\n{listing}"
     prior_history = history.summarize_for_planner(state.project_key) if state.project_key else ""
+    preflight_qa_report = (
+        qa_report_for_repair(state.preflight_qa_report)
+        if state.preflight_qa_report
+        else "(not run; no attached patch project detected)"
+    )
     return {
         "brief": state.brief,
         "project_name": state.project_name or "(unspecified)",
@@ -406,6 +412,7 @@ def _planner_inputs(state: CodebuilderState) -> dict:
         "workspace_dir": state.workspace_dir,
         "prior_plan": state.plan.model_dump_json(indent=2) if state.plan else "",
         "prior_history": prior_history or "(no prior runs for this project)",
+        "preflight_qa_report": preflight_qa_report,
         "amendments": state.amendments,
         # Override-or-detect hint: a concrete language name when the caller
         # supplied one (the planner must honor it), else an instruction to
@@ -413,6 +420,38 @@ def _planner_inputs(state: CodebuilderState) -> dict:
         # runs before state.language is resolved, so it gets the hint form.
         "language": state.language or "(detect the language from the brief and goals and use it)",
     }
+
+
+def _run_patch_preflight_if_available(state: CodebuilderState) -> None:
+    if state.preflight_qa_report is not None or not state.workspace_dir:
+        return
+    kinds = {
+        (
+            a.kind
+            if isinstance(a, Attachment)
+            else str(a.get("kind", "") if isinstance(a, dict) else getattr(a, "kind", ""))
+        ).lower()
+        for a in state.attachments
+    }
+    if not (kinds & {"git", "zip"}):
+        return
+    patch_root = _resolve_patch_root(state.workspace_dir)
+    if patch_root is None:
+        return
+    try:
+        state.preflight_qa_report = run_final_qa(
+            patch_root,
+            test_paths=None,
+            require_installable=False,
+            allow_no_tests=True,
+            skip_pytest_on_deterministic_failure=False,
+        )
+    except Exception as exc:  # noqa: BLE001 - preflight must inform planning, not brick it
+        state.preflight_qa_report = QAReport(
+            passed=False,
+            integration_notes=f"Patch preflight QA failed before planning: {exc}",
+        )
+
 
 class CodebuilderFlow(Flow[CodebuilderState]):
     """Single flow: ingest → plan (HITL) → build → finalize."""
@@ -450,6 +489,7 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             )
         else:
             self.state.attachment_records = []
+        _run_patch_preflight_if_available(self.state)
 
         project_key = history.project_key_from(self.state)
         if not project_key:
@@ -623,10 +663,19 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             git_tool.init_and_commit(build_dir)
 
         total_subtasks = len(plan.subtasks)
-        for index, subtask in enumerate(plan.subtasks, start=1):
-            self._build_subtask(subtask, build_dir, index=index, total=total_subtasks)
-
         self._build_dir = build_dir
+        for index, subtask in enumerate(plan.subtasks, start=1):
+            review = self._build_subtask(subtask, build_dir, index=index, total=total_subtasks)
+            if not review.passed:
+                self.state.status = "failed"
+                self.state.qa_report = QAReport(
+                    passed=False,
+                    test_output="\n".join(review.issues),
+                    integration_notes=(
+                        f"Subtask {subtask.id} failed before final QA; build stopped."
+                    ),
+                )
+                return {"status": "failed", "failed_subtask_id": subtask.id}
 
     @listen(build)
     def finalize(self, _prior=None):
@@ -677,9 +726,8 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                 log.warning("patch generation failed: %s", exc)
                 self.state.patch = ""
 
-        # Zip the build for both modes: a repair job's deliverable is the
-        # repaired project, not just the diff. SKIP_DIRS keeps .git out.
-        if self.state.plan:
+        # Only passing QA gets a runnable deliverable in the public payload.
+        if self.state.plan and (self.state.qa_report is None or self.state.qa_report.passed):
             try:
                 zip_path = _zip_build(
                     build_dir,
@@ -702,7 +750,7 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                         f"Project archive generation failed: {exc}",
                     )
 
-        if self.state.qa_report:
+        if self.state.qa_report and self.state.qa_report.passed:
             session_segment = self.state.project_key or self.state.session_id or self.state.id
             prefix = f"{session_segment}/{self.state.id}"
             uploaded_refs: list[ArtifactRef] = []
@@ -738,7 +786,9 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                     reason="disabled_for_patch_existing",
                 )
 
-            self.state.qa_report.artifact_urls = uploaded_refs
+            self.state.qa_report.artifact_urls = (
+                uploaded_refs if self.state.qa_report.passed else []
+            )
 
         self.state.status = (
             "done" if self.state.qa_report is None or self.state.qa_report.passed else "failed"
@@ -766,7 +816,9 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             test_paths=self._final_qa_test_paths(build_dir),
             type_paths=self._final_qa_type_paths(),
             require_installable=bool(plan and plan.mode == "new_project"),
-            allow_no_tests=bool(plan and plan.mode == "patch_existing"),
+            allow_no_tests=bool(
+                plan and plan.mode == "patch_existing" and not has_pytest_files(build_dir)
+            ),
         )
 
     def _max_final_qa_repairs(self) -> int:
@@ -899,37 +951,7 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             "whole",
         }:
             return None
-
-        root = Path(build_dir)
-        paths: set[str] = set()
-        module_stems: set[str] = set()
-        for artifact in self.state.artifacts:
-            rel_path = artifact.file_path or ""
-            if not rel_path:
-                continue
-            rel = Path(rel_path)
-            is_test = (
-                "tests" in rel.parts
-                or rel.name.startswith("test_")
-                or rel.name.endswith("_test.py")
-            )
-            if is_test:
-                paths.add(rel.as_posix())
-            elif rel.suffix == ".py":
-                module_stems.add(rel.stem)
-
-        tests_root = root / "tests"
-        if tests_root.is_dir():
-            wanted_names = {
-                name
-                for stem in module_stems
-                for name in (f"test_{stem}.py", f"{stem}_test.py")
-            }
-            for test_file in tests_root.rglob("*.py"):
-                if test_file.name in wanted_names:
-                    paths.add(test_file.relative_to(root).as_posix())
-
-        return sorted(paths)
+        return None if has_pytest_files(build_dir) else []
 
     @staticmethod
     def _qa_failure_signature(report: QAReport | None) -> str:
@@ -1074,14 +1096,18 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             payload["build_dir"] = build_dir
         if self.state.qa_report:
             qa = self.state.qa_report.model_dump(mode="json")
+            if not self.state.qa_report.passed:
+                qa["artifact_urls"] = []
             payload["qa_report"] = qa
-            payload["artifact_urls"] = qa.get("artifact_urls", [])
+            if self.state.qa_report.passed:
+                payload["artifact_urls"] = qa.get("artifact_urls", [])
             payload["qa_passed"] = self.state.qa_report.passed
-        if self.state.zip_path:
+        expose_archive = self.state.qa_report is None or self.state.qa_report.passed
+        if expose_archive and self.state.zip_path:
             payload["zip_path"] = self.state.zip_path
-        if self.state.zip_url:
+        if expose_archive and self.state.zip_url:
             payload["zip_url"] = self.state.zip_url
-        if self.state.project_archive:
+        if expose_archive and self.state.project_archive:
             payload["project_archive"] = self.state.project_archive.model_dump(mode="json")
         if self.state.patch:
             payload["patch"] = self.state.patch
@@ -1132,7 +1158,7 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             )
         return "\n\n".join(sections) if sections else "(no symbols available)"
 
-    def _build_subtask(self, subtask: SubTask, build_dir: str, *, index: int, total: int) -> None:
+    def _build_subtask(self, subtask: SubTask, build_dir: str, *, index: int, total: int) -> ReviewResult:
         writer = WriterCrew(workspace_dir=build_dir)
 
         # Full preimage of each modify target — review needs it to detect
@@ -1264,8 +1290,13 @@ class CodebuilderFlow(Flow[CodebuilderState]):
 
         if bundle is not None:
             self.state.artifacts.extend(bundle.artifacts)
-        if review is not None:
-            self.state.review_results.append(review)
+        if review is None:
+            review = ReviewResult(
+                subtask_id=subtask.id,
+                passed=False,
+                issues=[prior_issues or "Writer did not return a valid artifact."],
+            )
+        self.state.review_results.append(review)
 
         if review and review.passed:
             _emit_progress(
@@ -1290,8 +1321,9 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                 index=index,
                 total=total,
                 attempts=attempts,
-                issues=review.issues if review else ["Writer did not return a valid artifact."],
+                issues=review.issues,
             )
+        return review
 
 
 def kickoff() -> Any:

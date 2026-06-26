@@ -23,7 +23,7 @@ from codebuilder.main import (
     _strip_patch_root_prefix,
 )
 from codebuilder.runtime_qa import run_final_qa
-from codebuilder.schemas import FileSkeleton, Plan, SubTask
+from codebuilder.schemas import FileSkeleton, Plan, ReviewResult, SubTask
 from codebuilder.tools.lint_runner_tool import TestRunnerTool
 
 # build is wrapped by @listen("approved"); unwrap to call the body directly
@@ -117,12 +117,14 @@ def test_build_uses_zip_patch_root_and_inits_git(tmp_path: Path, monkeypatch) ->
     flow.state.plan = _patch_plan(["inputs/app-x/src/mod.py"])
 
     built: list[tuple[str, str]] = []
+    def fake_build_subtask(self, subtask, build_dir, *, index, total):
+        built.append((subtask.files[0].path, build_dir))
+        return ReviewResult(subtask_id=subtask.id, passed=True)
+
     monkeypatch.setattr(
         CodebuilderFlow,
         "_build_subtask",
-        lambda self, subtask, build_dir, *, index, total: built.append(
-            (subtask.files[0].path, build_dir)
-        ),
+        fake_build_subtask,
     )
 
     _BUILD_BODY(flow, prior=None)

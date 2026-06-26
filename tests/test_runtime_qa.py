@@ -17,6 +17,7 @@ from codebuilder.runtime_qa import (
     run_rpa_deterministic_gate,
 )
 from codebuilder.schemas import (
+    Attachment,
     ArtifactRef,
     CodeArtifact,
     CodeBundleArtifact,
@@ -24,6 +25,7 @@ from codebuilder.schemas import (
     FileSkeleton,
     Plan,
     QAReport,
+    ReviewResult,
     SubTask,
 )
 from codebuilder.tools import attachment_tool
@@ -523,6 +525,37 @@ def test_planner_inputs_use_materialized_attachment_records_not_full_tree(tmp_pa
     assert "inputs/repo/src/important.py" not in inputs["attachment_records"]
 
 
+def test_patch_preflight_qa_is_passed_to_planner(monkeypatch, tmp_path: Path) -> None:
+    repo = tmp_path / "inputs" / "repo"
+    (repo / "tests").mkdir(parents=True)
+    (repo / "tests" / "test_existing.py").write_text(
+        "def test_existing():\n    assert True\n",
+        encoding="utf-8",
+    )
+
+    flow = CodebuilderFlow()
+    flow.state.workspace_dir = str(tmp_path)
+    flow.state.attachments = [Attachment(kind="zip", name="repo.zip")]
+    calls: list[dict] = []
+
+    def fake_run_final_qa(build_dir: str, **kwargs):
+        calls.append({"build_dir": build_dir, **kwargs})
+        return QAReport(
+            passed=False,
+            lint_output="E999",
+            test_output="FAILED tests/test_existing.py::test_existing",
+        )
+
+    monkeypatch.setattr(main, "run_final_qa", fake_run_final_qa)
+
+    main._run_patch_preflight_if_available(flow.state)
+    inputs = main._planner_inputs(flow.state)
+
+    assert calls[0]["build_dir"] == str(repo)
+    assert calls[0]["test_paths"] is None
+    assert "FAILED tests/test_existing.py::test_existing" in inputs["preflight_qa_report"]
+
+
 def test_writer_context_is_scoped_to_planned_file_parent(tmp_path: Path) -> None:
     (tmp_path / ".git").mkdir()
     (tmp_path / ".git" / "config").write_text("[core]\n", encoding="utf-8")
@@ -604,6 +637,52 @@ def test_build_subtask_persists_bundle_artifacts(monkeypatch, tmp_path: Path) ->
     assert (tmp_path / "b.py").read_text(encoding="utf-8") == "B = 2\n"
     assert [a.file_path for a in flow.state.artifacts] == ["a.py", "b.py"]
     assert flow.state.review_results[-1].passed is True
+
+
+def test_build_stops_after_first_failed_subtask(monkeypatch, tmp_path: Path) -> None:
+    flow = CodebuilderFlow()
+    flow.state.workspace_dir = str(tmp_path)
+    flow.state.plan = Plan(
+        project_name="demo",
+        mode="new_project",
+        tech_stack=["python"],
+        subtasks=[
+            SubTask(
+                id="s1",
+                title="Bad package",
+                description="Fails review.",
+                files=[FileSkeleton(path="a.py", purpose="A module.")],
+                test_criteria="Passes review.",
+            ),
+            SubTask(
+                id="s2",
+                title="Should not run",
+                description="Must be skipped after s1 fails.",
+                files=[FileSkeleton(path="b.py", purpose="B module.")],
+                test_criteria="Passes review.",
+            ),
+        ],
+    )
+    calls: list[str] = []
+
+    def fake_build_subtask(subtask: SubTask, build_dir: str, *, index: int, total: int):
+        calls.append(subtask.id)
+        return ReviewResult(
+            subtask_id=subtask.id,
+            passed=False,
+            issues=["deterministic review failed"],
+        )
+
+    monkeypatch.setattr(main.git_tool, "init_and_commit", lambda *args, **kwargs: None)
+    monkeypatch.setattr(flow, "_build_subtask", fake_build_subtask)
+
+    flow.build(SimpleNamespace(feedback=""))
+
+    assert calls == ["s1"]
+    assert flow.state.status == "failed"
+    assert flow.state.qa_report is not None
+    assert flow.state.qa_report.passed is False
+    assert "s1" in flow.state.qa_report.integration_notes
 
 
 def test_zip_build_excludes_tool_cache_dirs(tmp_path: Path) -> None:
@@ -701,8 +780,8 @@ def test_lint_and_test_runner_reject_paths_outside_workspace(tmp_path: Path) -> 
     assert "escapes workspace" in tests._run("../outside.py")
 
 
-def test_final_qa_skips_pytest_when_deterministic_gates_fail(tmp_path: Path) -> None:
-    tests = FakeTool("PASS\n1 passed")
+def test_final_qa_reports_pytest_failures_even_when_deterministic_gate_fails(tmp_path: Path) -> None:
+    tests = FakeTool("FAILED tests/test_app.py::test_app")
 
     qa = run_final_qa(
         str(tmp_path),
@@ -712,8 +791,10 @@ def test_final_qa_skips_pytest_when_deterministic_gates_fail(tmp_path: Path) -> 
     )
 
     assert qa.passed is False
-    assert tests.calls == []
-    assert qa.test_output == "SKIP: pytest skipped because deterministic QA failed first."
+    assert tests.calls == ["."]
+    assert "FAILED tests/test_app.py::test_app" in qa.test_output
+    assert "Lint failed." in qa.integration_notes
+    assert "Tests failed." in qa.integration_notes
 
 
 def test_final_qa_runs_targeted_test_paths(tmp_path: Path) -> None:
@@ -1035,10 +1116,24 @@ def test_patch_test_paths_select_changed_and_related_tests(tmp_path: Path) -> No
         CodeArtifact(subtask_id="s1", file_path="tests/unit/test_explicit.py", language="python"),
     ]
 
-    assert flow._final_qa_test_paths(str(tmp_path)) == [
-        "tests/unit/test_explicit.py",
-        "tests/unit/test_settings.py",
+    assert flow._final_qa_test_paths(str(tmp_path)) is None
+
+
+def test_patch_final_qa_runs_full_suite_when_tests_exist(tmp_path: Path) -> None:
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_unrelated.py").write_text(
+        "def test_ok():\n    assert True\n",
+        encoding="utf-8",
+    )
+
+    flow = CodebuilderFlow()
+    flow.state.workspace_dir = str(tmp_path)
+    flow.state.plan = _empty_plan(mode="patch_existing")
+    flow.state.artifacts = [
+        CodeArtifact(subtask_id="s1", file_path="src/demo/settings.py", language="python")
     ]
+
+    assert flow._final_qa_test_paths(str(tmp_path)) is None
 
 
 def test_patch_test_paths_full_scope_env_returns_none(monkeypatch, tmp_path: Path) -> None:
@@ -1090,7 +1185,9 @@ def test_finalize_fails_when_configured_project_archive_upload_fails(
     payload = flow.finalize(None)
 
     assert payload["status"] == "failed"
-    assert payload["project_archive"]["kind"] == "project_archive"
+    assert "project_archive" not in payload
+    assert "zip_path" not in payload
+    assert "artifact_urls" not in payload
     assert "Project archive upload failed" in payload["qa_report"]["integration_notes"]
 
 
@@ -1132,7 +1229,7 @@ def test_history_record_strips_artifact_urls_and_truncates_patch(monkeypatch, tm
     assert "[truncated" in patch
 
 
-def test_finalize_returns_artifacts_when_final_qa_still_fails(monkeypatch, tmp_path: Path) -> None:
+def test_failed_qa_omits_runnable_archive_fields(monkeypatch, tmp_path: Path) -> None:
     flow = CodebuilderFlow()
     flow.state.workspace_dir = str(tmp_path)
     flow.state.status = "executing"
@@ -1185,11 +1282,8 @@ def test_finalize_returns_artifacts_when_final_qa_still_fails(monkeypatch, tmp_p
     assert flow.state.final_qa_repair_attempts == 1
     assert payload["qa_report"]["passed"] is False
     assert "still failing after 1 writer repair attempt" in payload["qa_report"]["integration_notes"]
-    assert payload["artifact_urls"] == [
-        {
-            "file_path": "app.py",
-            "size": 45,
-            "url": "https://example.test/app.py",
-            "kind": "file",
-        }
-    ]
+    assert "artifact_urls" not in payload
+    assert "zip_path" not in payload
+    assert "zip_url" not in payload
+    assert "project_archive" not in payload
+    assert payload["qa_report"]["artifact_urls"] == []

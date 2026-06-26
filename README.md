@@ -44,7 +44,7 @@ Optional environment variables (see `.env.example`):
 | `CODEBUILDER_GUARDRAIL_LLM` | `openai/gpt-5.4-mini` | Override the model used by the `@human_feedback` guardrail when classifying user replies. |
 | `CODEBUILDER_MAX_SUBTASK_RETRIES` | `1` | Per-file writer retry count after deterministic review failure. |
 | `CODEBUILDER_MAX_FINAL_QA_REPAIRS` | `1` for `patch_existing`, `2` for `new_project` | Whole-workspace repair attempts after final QA failure. |
-| `CODEBUILDER_PATCH_TEST_SCOPE` | targeted | Set to `full`/`all`/`whole` to run the entire pytest suite for patch jobs; otherwise only changed/related tests run. |
+| `CODEBUILDER_PATCH_TEST_SCOPE` | full when tests exist | Patch jobs run the full pytest suite when test files exist. With no test files, no-tests collection is a non-blocking warning. |
 | `CODEBUILDER_PROGRESS_WEBHOOK` | *(unset)* | Optional best-effort progress callback after subtasks and final QA. |
 | `CODEBUILDER_PROGRESS_WEBHOOK_SECRET` | *(unset)* | Optional shared secret sent as `X-Codebuilder-Progress-Secret`. |
 | `CODEBUILDER_UPLOAD_FILE_ARTIFACTS` | `false` for `patch_existing`, `true` otherwise | Upload individual file artifacts in addition to the project archive. Keep disabled for patch jobs unless callers need per-file inspection URLs. |
@@ -85,9 +85,9 @@ After the planner runs, the flow pauses and either:
 
 ### Completion payload
 
-The final payload always distinguishes the runnable project archive from file-level audit artifacts:
+Successful final payloads distinguish the runnable project archive from file-level audit artifacts. Failed QA payloads omit runnable archive fields.
 
-- `project_archive` — primary deliverable for both `new_project` and `patch_existing`; contains the local archive path and, when S3 upload is enabled, the downloadable URL.
+- `project_archive` — success-only primary deliverable for both `new_project` and `patch_existing`; contains the local archive path and, when S3 upload is enabled, the downloadable URL.
 - `zip_path` / `zip_url` — backward-compatible aliases for the same archive.
 - `artifact_urls` — the archive and, when per-file uploads are enabled, individual uploaded files. These are useful for inspection, but callers should use `project_archive` / `zip_url` when they need a runnable project.
 - `patch` — diff for `patch_existing` jobs only. It is an audit/review aid, not the primary runnable deliverable.
@@ -127,7 +127,7 @@ uv add <pkg>                 # prefer this over hand-editing pyproject
 
 - Workspaces, history DB, and the local `.env` are gitignored — see `.gitignore`.
 - All file I/O from agents is routed through `Workspace*Tool`, which enforces that relative paths cannot escape the job workspace. Never give agents a raw `FileReadTool` pointed at a real filesystem path.
-- Final QA runs deterministic `ruff`, mypy symbol-drift checks, `.env.example` consistency checks, and pytest. Patch jobs lint/type changed files and run only changed/related tests by default; set `CODEBUILDER_PATCH_TEST_SCOPE=full` for the full suite. Pytest is skipped when an earlier deterministic gate already failed.
+- Final QA runs deterministic `ruff`, mypy symbol-drift checks, `.env.example` consistency checks, and pytest. Patch jobs lint/type changed files and run the full pytest suite when tests exist; pytest still runs when lint/type fails so repair gets the real failures.
 - Patch jobs plan and report only changed files, but the user-facing deliverable is the complete repaired project archive. Consumers must not reconstruct a project from changed-file artifacts.
 - Patch jobs feed planner/writer crews compact attachment records and scoped parent-directory listings, not a full recursive repository tree.
 - New-project jobs whose plan declares a `domain` (e.g. `rpa`) also run that domain's architecture gate before completion. For `rpa`, missing orchestrator/producer/consumer, Clean Architecture layers, `.env.example`/CCM config, tests, or traceability marks the job failed even if lint/tests pass. Plans without a registered `domain` finalize on lint/test alone.

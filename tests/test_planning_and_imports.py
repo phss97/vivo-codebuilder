@@ -315,6 +315,37 @@ def test_validate_plan_rejects_duplicate_planned_file_paths() -> None:
         raise AssertionError("duplicate planned path was accepted")
 
 
+def test_validate_plan_rejects_diagnostic_only_plan() -> None:
+    plan = Plan(
+        project_name="TBD",
+        mode="patch_existing",
+        tech_stack=["python"],
+        subtasks=[
+            SubTask(
+                id="s1",
+                title="Diagnose failures",
+                description="Inspect the project and write diagnostic notes.",
+                files=[
+                    FileSkeleton(
+                        path="FILES_TO_BE_DETERMINED_BY_DIAGNOSTICS.md",
+                        purpose="Placeholder diagnostic report.",
+                    )
+                ],
+                test_criteria="TESTS_TO_BE_DETERMINED_BY_DIAGNOSTICS",
+            )
+        ],
+    )
+
+    try:
+        validate_plan(plan)
+    except ValueError as exc:
+        message = str(exc)
+        assert "placeholder" in message.lower()
+        assert "diagnostic-only" in message.lower()
+    else:
+        raise AssertionError("diagnostic-only plan was accepted")
+
+
 def test_plan_skeleton_roundtrip() -> None:
     skeleton = PlanSkeleton(
         project_name="x",

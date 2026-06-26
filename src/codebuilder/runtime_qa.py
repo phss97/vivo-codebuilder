@@ -43,6 +43,24 @@ _PLACEHOLDER_LINE_RE = re.compile(
     r"(pass|\.\.\.|raise\s+NotImplementedError(?:\([^)]*\))?)",
     re.IGNORECASE,
 )
+_PLACEHOLDER_PLAN_RE = re.compile(
+    r"(^|[\W_])(files_to_be_determined_by|tests_to_be_determined_by|tbd|placeholder)([\W_]|$)",
+    re.IGNORECASE,
+)
+_REAL_TARGET_NAMES = {
+    "pyproject.toml",
+    "requirements.txt",
+    "setup.py",
+    "setup.cfg",
+    "build.spec",
+    "build.ps1",
+    "build.bat",
+    ".env.example",
+}
+_QA_TEST_SKIP_DIRS = {
+    ".git", ".venv", "__pycache__", "build", "dist", "node_modules",
+    ".mypy_cache", ".pytest_cache", ".ruff_cache",
+}
 
 
 @dataclass(frozen=True)
@@ -74,6 +92,22 @@ def truncate(value: str, limit: int = MAX_QA_OUTPUT_CHARS) -> str:
 def _is_test_file(path: str) -> bool:
     p = Path(path)
     return "tests" in p.parts or p.name.startswith("test_") or p.name.endswith("_test.py")
+
+
+def has_pytest_files(build_dir: str) -> bool:
+    root = Path(build_dir)
+    if not root.is_dir():
+        return False
+    for path in root.rglob("*.py"):
+        try:
+            rel = path.relative_to(root)
+        except ValueError:
+            continue
+        if any(part in _QA_TEST_SKIP_DIRS for part in rel.parts):
+            continue
+        if _is_test_file(rel.as_posix()):
+            return True
+    return False
 
 
 def looks_like_placeholder(content: str) -> bool:
@@ -458,10 +492,19 @@ def validate_plan(plan: Plan | None) -> Plan:
         raise ValueError("Planner did not return a valid Plan object.")
 
     issues: list[str] = []
+    if _PLACEHOLDER_PLAN_RE.search(plan.project_name):
+        issues.append(f"project_name contains placeholder text: {plan.project_name}")
     if not 1 <= len(plan.subtasks) <= MAX_WORK_PACKAGES:
         issues.append(f"plan must contain between 1 and {MAX_WORK_PACKAGES} work packages")
     seen_paths: set[str] = set()
+    real_targets = 0
     for subtask in plan.subtasks:
+        for label, value in (
+            ("id", subtask.id),
+            ("title", subtask.title),
+        ):
+            if _PLACEHOLDER_PLAN_RE.search(value):
+                issues.append(f"subtask {subtask.id} {label} contains placeholder text: {value}")
         if not subtask.files:
             issues.append(f"subtask {subtask.id} must contain at least one file")
         if len(subtask.files) > MAX_FILES_PER_WORK_PACKAGE:
@@ -470,15 +513,31 @@ def validate_plan(plan: Plan | None) -> Plan:
                 f"work packages may contain at most {MAX_FILES_PER_WORK_PACKAGE} files"
             )
         for planned_file in subtask.files:
-            if not planned_file.path.strip():
+            path = planned_file.path.strip()
+            if not path:
                 issues.append(f"subtask {subtask.id} has an empty file path")
+            if _PLACEHOLDER_PLAN_RE.search(path):
+                issues.append(f"subtask {subtask.id} path contains placeholder text: {path}")
+            if "*" in path or "?" in path:
+                issues.append(f"subtask {subtask.id} path must be concrete, not a wildcard: {path}")
             if not planned_file.purpose.strip():
                 issues.append(f"subtask {subtask.id} file {planned_file.path!r} has empty purpose")
             if planned_file.path in seen_paths:
                 issues.append(f"duplicate planned file path: {planned_file.path}")
             seen_paths.add(planned_file.path)
+            p = Path(path)
+            if p.suffix in {".py", ".pyi"} or p.name in _REAL_TARGET_NAMES:
+                real_targets += 1
         if not subtask.test_criteria.strip():
             issues.append(f"subtask {subtask.id} has empty test_criteria")
+        if _PLACEHOLDER_PLAN_RE.search(subtask.test_criteria):
+            issues.append(f"subtask {subtask.id} test_criteria contains placeholder text")
+    codeish = plan.domain == "rpa" or any(
+        token in " ".join(plan.tech_stack).lower()
+        for token in ("python", "rpa", "code", "pytest", "mypy", "ruff")
+    )
+    if codeish and real_targets == 0:
+        issues.append("diagnostic-only plan has no real production, test, or build target files")
     if issues:
         raise ValueError("Invalid plan: " + "; ".join(issues))
     return plan
@@ -738,11 +797,13 @@ def filter_type_errors(output: str, codes: tuple[str, ...] = _TYPE_GATE_CODES) -
 
 
 def _default_type_targets(build_dir: str) -> list[str]:
-    """Type-check the project's own ``src/<pkg>`` packages, else the build dir."""
+    """Type-check own packages plus generated tests, else the build dir."""
     root = Path(build_dir)
-    packages = _package_dirs(root)
-    if packages:
-        return [p.relative_to(root).as_posix() for p in packages]
+    targets = [p.relative_to(root).as_posix() for p in _package_dirs(root)]
+    if has_pytest_files(build_dir) and (root / "tests").is_dir():
+        targets.append("tests")
+    if targets:
+        return targets
     return ["."]
 
 
@@ -778,7 +839,7 @@ def run_final_qa(
     type_runner: Any | None = None,
     require_installable: bool = False,
     allow_no_tests: bool = False,
-    skip_pytest_on_deterministic_failure: bool = True,
+    skip_pytest_on_deterministic_failure: bool = False,
 ) -> QAReport:
     """Build the final QA report from required workspace lint and tests.
 
@@ -834,22 +895,29 @@ def run_final_qa(
 
     lint_ok = is_pass(lint_output)
     deterministic_failed = not (lint_ok and type_ok and env_ok)
+    project_has_tests = has_pytest_files(build_dir)
+    effective_test_paths = None if test_paths == [] and project_has_tests else test_paths
     if deterministic_failed and skip_pytest_on_deterministic_failure:
         test_output = "SKIP: pytest skipped because deterministic QA failed first."
         test_scope_note = "pytest skipped before execution"
-    elif test_paths == []:
+    elif effective_test_paths == []:
         test_output = "SKIP: no tests collected under this path."
         test_scope_note = "pytest scoped to 0 path(s)"
     else:
         test_tool = test_runner or TestRunnerTool(workspace_dir=build_dir)
-        if test_paths is None:
+        if effective_test_paths is None:
             test_output = test_tool._run(".")
             test_scope_note = "pytest over the whole build directory"
         else:
-            test_output = _run_scoped_tests(test_tool, test_paths)
-            test_scope_note = f"pytest scoped to {len(test_paths)} path(s)"
+            test_output = _run_scoped_tests(test_tool, effective_test_paths)
+            test_scope_note = f"pytest scoped to {len(effective_test_paths)} path(s)"
 
-    no_tests_warning = allow_no_tests and lint_ok and is_no_tests_collected(test_output)
+    no_tests_warning = (
+        allow_no_tests
+        and not project_has_tests
+        and lint_ok
+        and is_no_tests_collected(test_output)
+    )
     test_ok = is_pass(test_output) or no_tests_warning
 
     notes = [

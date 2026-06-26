@@ -118,10 +118,11 @@ amend_cycles: int
 artifacts: list[CodeArtifact]
 review_results: list[ReviewResult]
 qa_report: QAReport | None
+preflight_qa_report: QAReport | None  # QA completo antes do plano em patch_existing
 final_qa_repair_attempts: int
 patch: str                    # modo patch_existing
-zip_path, zip_url
-project_archive               # entregável primário: zip completo do projeto
+zip_path, zip_url              # só aparecem no payload público quando QA passa
+project_archive               # entregável primário de sucesso: zip completo do projeto
 status: "pending" | "planning" | "awaiting_approval" | "executing" | "done" | "failed"
 ```
 
@@ -247,7 +248,7 @@ for attempt in range(_max_subtask_retries() + 1):
 ```
 
 **Pontos-chave:**
-- O writer só escreve **um arquivo por subtask**, com tools `WorkspaceRead/Write/List` que validam paths via `resolve_within()` (impossível escapar do sandbox).
+- O writer escreve **um bundle por subtask** (1–6 arquivos planejados), com paths validados via `resolve_within()` (impossível escapar do sandbox).
 - A revisão **determinística** (lint+test) é a primeira linha de defesa. O reviewer LLM só roda quando o determinístico não consegue decidir — economia de tokens.
 - Issues idênticas em retries consecutivos → **circuit breaker** que entrega o erro pro QA final em vez de queimar mais retries.
 - A cada subtask, um webhook de progresso (`CODEBUILDER_PROGRESS_WEBHOOK`) é disparado com `subtask_started / completed / failed` para a UI mostrar progresso fino.
@@ -270,7 +271,7 @@ def finalize(self, _prior=None):
         review = run_full_architecture_gate(build_dir, self.state.plan)
         # ↑ despacha por plan.domain (ex.: "rpa" → _rpa_full_gate)
 
-    # 4. Patch (modo patch_existing) + zip completo (todos os modos)
+    # 4. Patch (modo patch_existing) + zip completo (somente se QA passou)
     if mode == "patch_existing": self.state.patch = git_tool.diff(build_dir)
     self.state.zip_path = _zip_build(build_dir, ...)
     self.state.project_archive = ProjectArchiveRef(...)
@@ -285,7 +286,7 @@ def finalize(self, _prior=None):
     self.state.status = "done" if qa_report.passed else "failed"
 ```
 
-Em `patch_existing`, lint/type rodam nos arquivos alterados e pytest roda só nos testes alterados/relacionados por padrão. `CODEBUILDER_PATCH_TEST_SCOPE=full` força a suíte inteira. Se pytest não coletar testes e os gates determinísticos tiverem passado, o job finaliza com aviso em vez de falhar; repositórios existentes do cliente podem não ter testes. Em `new_project`, ausência de testes continua sendo falha de QA.
+Em `patch_existing`, lint/type rodam nos arquivos alterados e pytest roda a suíte inteira quando existem testes no projeto. Se o projeto realmente não tem arquivos de teste, `pytest` sem coleta vira aviso não-bloqueante; em `new_project`, ausência de testes continua sendo falha de QA. Mesmo quando lint/type falham, pytest roda para alimentar o repair com as falhas reais.
 
 ### 6.7 Gate de arquitetura por domínio
 
@@ -465,7 +466,7 @@ API pública:
 | `CODEBUILDER_PROGRESS_WEBHOOK_SECRET` | — | idem |
 | `CODEBUILDER_MAX_SUBTASK_RETRIES` | `1` | Retries por subtask no loop writer↔reviewer |
 | `CODEBUILDER_MAX_FINAL_QA_REPAIRS` | `1` em `patch_existing`, `2` em `new_project` | Tentativas de reparo após QA final falhar |
-| `CODEBUILDER_PATCH_TEST_SCOPE` | `targeted` | Use `full`/`all`/`whole` para rodar toda a suíte pytest em patches; por padrão roda só testes alterados/relacionados |
+| `CODEBUILDER_PATCH_TEST_SCOPE` | full se houver testes | Compatibilidade: `full`/`all`/`whole` também força suíte inteira; sem arquivos de teste, falta de coleta é aviso |
 | `CODEBUILDER_HISTORY_DB` | `./data/codebuilder_history.db` | SQLite de histórico |
 | `CODEBUILDER_GUARDRAIL_LLM` | `openai/gpt-5.4-mini` | LLM que classifica feedback do humano |
 

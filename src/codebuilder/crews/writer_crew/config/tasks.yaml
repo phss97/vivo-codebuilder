@@ -67,6 +67,11 @@ write_task:
     - Do NOT embed tests inside a production module. If a planned file path is
       under `tests/`, write tests there; otherwise write production or support
       code only.
+    - Tests MUST call the real production API contract already on disk. Before
+      writing a test assertion, use the project symbol contract above (and
+      `workspace_read` only when needed) to match actual constructor
+      signatures, method names, fields, and Protocol methods. Do not invent
+      test-only names or alternate arguments.
     - Return the FULL file text for every artifact in CodeArtifact.content.
       The orchestrator persists the bundle to disk — you do NOT need to call
       `workspace_write` to save the final files. The symbol contract above

@@ -172,6 +172,7 @@ class CodebuilderState(FlowState):
     artifacts: list[CodeArtifact] = Field(default_factory=list)
     review_results: list[ReviewResult] = Field(default_factory=list)
     qa_report: QAReport | None = None
+    preflight_qa_report: QAReport | None = None
     final_qa_repair_attempts: int = 0
     patch: str = ""
     zip_path: str = ""

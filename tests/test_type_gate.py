@@ -76,3 +76,20 @@ def test_final_qa_type_skip_does_not_block(tmp_path) -> None:
     skip = "SKIP: mypy not installed in the runtime; review logic manually."
     report = run_final_qa(str(tmp_path), **_passing({"type_runner": FakeTool(skip)}))
     assert report.passed
+
+
+def test_final_qa_type_gate_checks_generated_tests_against_production_api(tmp_path) -> None:
+    (tmp_path / "src" / "pkg").mkdir(parents=True)
+    (tmp_path / "src" / "pkg" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests" / "test_api.py").write_text(
+        "from pkg import missing\n\n\ndef test_api():\n    assert missing()\n",
+        encoding="utf-8",
+    )
+    type_runner = FakeTool("PASS")
+
+    report = run_final_qa(str(tmp_path), **_passing({"type_runner": type_runner}))
+
+    assert report.passed
+    assert "src/pkg" in type_runner.calls
+    assert "tests" in type_runner.calls

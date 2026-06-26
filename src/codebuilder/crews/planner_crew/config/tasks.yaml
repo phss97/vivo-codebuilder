@@ -25,6 +25,9 @@ skeleton_task:
     Prior work on this project (most recent first):
     {prior_history}
 
+    Patch preflight QA report (only populated for attached existing projects):
+    {preflight_qa_report}
+
     Prior plan (only populated on revision; empty on first pass):
     {prior_plan}
 
@@ -86,6 +89,11 @@ skeleton_task:
       plan the path as `src/pkg/mod.py`. New files in `patch_existing` mode
       also live under that same project root — never plan a parallel tree
       outside the attached project.
+    - Patch plans MUST name concrete production/test/build files to create or
+      modify. Never emit placeholder paths such as
+      `FILES_TO_BE_DETERMINED_BY_*`, `TESTS_TO_BE_DETERMINED_BY_*`, `TBD`, or
+      diagnostic-only markdown work packages. Use the preflight QA report to
+      identify the real failing files and tests.
     - Identify reference libraries. If the user attached a library (zip
       or git materialized under `inputs/`) clearly intended for the writer
       to import from rather than reimplement, record each top-level Python
@@ -143,6 +151,9 @@ expand_task:
     User amendments (only populated on revision; empty on first pass):
     {amendments}
 
+    Patch preflight QA report (only populated for attached existing projects):
+    {preflight_qa_report}
+
     Rules:
     - LANGUAGE: write ALL narrative fields (`description`, `tech_notes`,
       `test_criteria`, `assumptions`, `open_questions`) in the same language
@@ -155,6 +166,10 @@ expand_task:
       attached project's root (the repo / extracted zip directory under
       `inputs/`) — never prefixed with `inputs/<dir>/`, and never a parallel
       tree outside the attached project.
+    - Patch plans MUST name concrete production/test/build files to create or
+      modify. Do not create diagnostic-only subtasks, investigation reports, or
+      placeholder paths/names; use the preflight QA output and workspace reads
+      to choose the real files.
     - For every FileSkeleton that exports importable code, `public_api` MUST
       list the exact function/class/constant names WITH signatures (e.g.
       "create_registro(data: dict) -> Registro", "class RegistroRepository
@@ -235,6 +250,9 @@ amend_task:
     User amendments to fold in:
     {amendments}
 
+    Patch preflight QA report (only populated for attached existing projects):
+    {preflight_qa_report}
+
     Rules:
     - Treat the prior plan as authoritative. Carry every existing work package
       forward UNCHANGED unless an amendment specifically requires editing it.
@@ -249,6 +267,8 @@ amend_task:
       attached project's root (the repo / extracted zip directory under
       `inputs/`) — never prefixed with `inputs/<dir>/`, and never a parallel
       tree outside the attached project.
+    - Do not add diagnostic-only work packages or placeholder paths/names.
+      Every added patch work package must name concrete files to edit.
     - Copy `mode`, `domain`, `language`, `tech_stack`, and `external_packages`
       from the prior plan unchanged unless an amendment changes them (e.g. the
       user confirms internal packages that should now appear in
