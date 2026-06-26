@@ -270,7 +270,7 @@ def test_validate_plan_rejects_oversized_work_package() -> None:
         description="d",
         files=[
             FileSkeleton(path=f"src/pkg/f{i}.py", purpose="Module.")
-            for i in range(7)
+            for i in range(9)
         ],
         test_criteria="t",
     )
@@ -279,9 +279,42 @@ def test_validate_plan_rejects_oversized_work_package() -> None:
     try:
         validate_plan(plan)
     except ValueError as exc:
-        assert "at most 6 files" in str(exc)
+        assert "at most 8 files" in str(exc)
     else:
         raise AssertionError("oversized work package was accepted")
+
+
+def test_guardrail_force_splits_oversized_work_package() -> None:
+    from codebuilder.crews.planner_crew.planner_crew import _require_nonempty_plan
+
+    class _Out:
+        def __init__(self, plan: Plan) -> None:
+            self.pydantic = plan
+
+    def _plan(n_files: int) -> Plan:
+        subtask = SubTask(
+            id="s03",
+            title="Bundle",
+            description="d",
+            files=[
+                FileSkeleton(path=f"src/pkg/f{i}.py", purpose="Module.")
+                for i in range(n_files)
+            ],
+            test_criteria="t",
+        )
+        return Plan(
+            project_name="x", mode="new_project", tech_stack=["python"], subtasks=[subtask]
+        )
+
+    # 9 files > cap (8): guardrail fails so the crew re-prompts the planner to split.
+    ok, msg = _require_nonempty_plan(_Out(_plan(9)))
+    assert ok is False
+    assert "s03" in msg and "split" in msg.lower()
+
+    # 8 files == cap: accepted, returns the Plan unchanged.
+    ok, result = _require_nonempty_plan(_Out(_plan(8)))
+    assert ok is True
+    assert isinstance(result, Plan)
 
 
 def test_validate_plan_rejects_duplicate_planned_file_paths() -> None:

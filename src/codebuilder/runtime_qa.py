@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any
 
 from codebuilder.schemas import (
+    MAX_FILES_PER_WORK_PACKAGE,
+    MAX_WORK_PACKAGES,
     ArtifactRef,
     CodeBundleArtifact,
     CodeArtifact,
@@ -27,8 +29,6 @@ from codebuilder.tools.workspace_tool import resolve_within
 log = logging.getLogger(__name__)
 
 MAX_QA_OUTPUT_CHARS = 12000
-MAX_WORK_PACKAGES = 24
-MAX_FILES_PER_WORK_PACKAGE = 6
 # Largest preimage of a `modify` target shown to the writer in full. Files above
 # this are shown truncated (with a marker); the review guards below then forbid
 # rewriting such a file shorter, so its unshown tail can't be silently dropped.

@@ -5,7 +5,7 @@ from crewai import Agent, Crew, LLM, Process, Task
 from crewai.project import CrewBase, agent, crew, task
 from crewai.skills import activate_skill, discover_skills
 
-from codebuilder.schemas import Plan, PlanSkeleton
+from codebuilder.schemas import MAX_FILES_PER_WORK_PACKAGE, Plan, PlanSkeleton
 from codebuilder.tools import WorkspaceListTool, WorkspaceReadTool
 
 _SKILLS = {
@@ -30,6 +30,17 @@ def _require_nonempty_plan(output) -> tuple[bool, Any]:
         return (
             False,
             "Plan.subtasks must not be empty — return the COMPLETE plan with every work package.",
+        )
+    oversized = [st for st in plan.subtasks if len(st.files) > MAX_FILES_PER_WORK_PACKAGE]
+    if oversized:
+        names = ", ".join(f"{st.id} ({len(st.files)} files)" for st in oversized)
+        return (
+            False,
+            f"These work packages exceed the {MAX_FILES_PER_WORK_PACKAGE}-file limit: "
+            f"{names}. Split each into multiple cohesive work packages of at most "
+            f"{MAX_FILES_PER_WORK_PACKAGE} files. Keep files that import each other's "
+            "public_api in the same package, and order dependency-providing packages "
+            "first so the sequential build never hits a forward reference.",
         )
     return (True, plan)
 
@@ -75,6 +86,11 @@ class PlannerCrew:
             context=[self.skeleton_task()],
             output_pydantic=Plan,
             guardrail=_require_nonempty_plan,
+            # Force-split retries regenerate the whole plan, so a single
+            # stubborn oversized package can whack-a-mole across a large plan.
+            # Give the planner extra samples before the guardrail gives up and
+            # raises (default is 3); only paid on the rare retry path.
+            guardrail_max_retries=5,
         )
 
     # Plain method (NOT @task) so it is excluded from the auto-collected
@@ -86,6 +102,7 @@ class PlannerCrew:
             config=self.tasks_config["amend_task"],  # type: ignore[index]
             output_pydantic=Plan,
             guardrail=_require_nonempty_plan,
+            guardrail_max_retries=5,  # see expand_task
         )
 
     @crew

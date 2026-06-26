@@ -28,6 +28,12 @@ class StrictOutputModel(BaseModel):
 
 ChangeType = Literal["create", "modify"]
 
+# Structural caps on a Plan. Single source of truth: validate_plan enforces them
+# as the final backstop, the planner guardrail force-splits packages over
+# MAX_FILES_PER_WORK_PACKAGE in-loop, and the planner prompt states them.
+MAX_WORK_PACKAGES = 24
+MAX_FILES_PER_WORK_PACKAGE = 8  # raised from 6; Writer handles ~8 files per bundle
+
 
 class FileSkeleton(StrictOutputModel):
     path: str

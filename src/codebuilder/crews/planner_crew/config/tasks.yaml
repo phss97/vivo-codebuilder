@@ -127,7 +127,7 @@ expand_task:
   description: >
     Expand the skeleton into a full Plan whose subtasks are bundled work
     packages. A SubTask is NOT a single file anymore; each SubTask contains
-    `files`, a list of 1 to 6 FileSkeleton entries that should be written
+    `files`, a list of 1 to 8 FileSkeleton entries that should be written
     together in one Writer kickoff.
 
     Project name: {project_name}
@@ -190,7 +190,7 @@ expand_task:
       packages as the requested changes actually require (typically 1-10) — a
       patch is scoped to the changed files, NEVER padded to a target, and never
       re-builds the whole project. Hard cap either way: max 24 SubTasks total,
-      max 6 files in any one SubTask. Prefer fewer work packages when the files
+      max 8 files in any one SubTask. Prefer fewer work packages when the files
       are cohesive and can be safely written together.
     - Bundle by cohesive engineering slice, not by arbitrary folder count.
       Good RPA bundles are usually: project scaffold, domain entities,
@@ -285,7 +285,7 @@ amend_task:
       drop the answered question. Record any new decision you made on the
       user's behalf in `assumptions`.
     - Respect the same structural caps as the original plan: at most 24 work
-      packages total and at most 6 files in any one package. If folding in the
+      packages total and at most 8 files in any one package. If folding in the
       amendments would exceed a cap, consolidate cohesive files rather than
       dropping required work.
     - Return the COMPLETE plan: every work package, not just the changed ones.
