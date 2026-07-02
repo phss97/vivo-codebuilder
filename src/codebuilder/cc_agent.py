@@ -43,11 +43,25 @@ SKILLS = ["rpa", "code-review-gate"]
 # bugs (bad model id, bad key, too-long prompt) and retrying just burns credits.
 _TRANSIENT_API_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504, 529}
 
+_EFFORT_LEVELS = {"low", "medium", "high", "xhigh", "max"}
+
 ProgressCallback = Callable[[Any], None]
+UsageCallback = Callable[[dict], None]
 
 
 class CCAgentError(RuntimeError):
     """The CC agent failed to produce usable output."""
+
+
+class CCBudgetExceeded(CCAgentError):
+    """The executor hit its cost budget mid-run and was stopped. Carries the
+    estimated spend and the transcript accumulated so far; the partial build is
+    already on disk."""
+
+    def __init__(self, cost_usd: float, transcript: str) -> None:
+        super().__init__(f"executor stopped at cost budget (est. ${cost_usd:.2f} spent)")
+        self.cost_usd = cost_usd
+        self.transcript = transcript
 
 
 def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
@@ -59,6 +73,110 @@ def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
     except ValueError:
         log.warning("%s=%r is not an int; using %s", name, raw, default)
         return default
+
+
+def _env_float(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        log.warning("%s=%r is not a number; using %s", name, raw, default)
+        return default
+
+
+def _effort(name: str, default: str) -> str:
+    val = os.environ.get(name, default)
+    if val not in _EFFORT_LEVELS:
+        log.warning("%s=%r invalid (want one of %s); using %s", name, val, sorted(_EFFORT_LEVELS), default)
+        return default
+    return val
+
+
+# Reasoning effort — the biggest token lever. The CLI's own default is xhigh
+# (most expensive); default the executor to medium for cost, planner to high.
+PLANNER_EFFORT = _effort("CODEBUILDER_PLANNER_EFFORT", "high")
+EXECUTOR_EFFORT = _effort("CODEBUILDER_EXECUTOR_EFFORT", "medium")
+
+# Per-MTok rates for the MID-RUN cost estimate that drives the budget cap.
+# Defaults are derived from the executor model (so pointing it at Opus doesn't
+# silently undercount ~2.5×) and skew to STANDARD (not intro) pricing — a slight
+# overestimate makes the cap stop a touch early, which is the safe direction for
+# "don't overspend". This is a safety valve, not billing — the authoritative
+# per-call cost is ResultMessage.total_cost_usd.
+_MODEL_RATES = {  # (input, output) $/MTok, conservative/standard
+    "fable": (10.0, 50.0),
+    "opus": (5.0, 25.0),
+    "sonnet": (3.0, 15.0),
+    "haiku": (1.0, 5.0),
+}
+
+
+def _rates_for(model: str) -> tuple[float, float]:
+    m = (model or "").lower()
+    for key, rates in _MODEL_RATES.items():
+        if key in m:
+            return rates
+    return (3.0, 15.0)  # default to Sonnet-tier
+
+
+_default_rates = _rates_for(EXECUTOR_MODEL)
+_COST_PER_MTOK_INPUT = _env_float("CODEBUILDER_COST_PER_MTOK_INPUT", _default_rates[0])
+_COST_PER_MTOK_OUTPUT = _env_float("CODEBUILDER_COST_PER_MTOK_OUTPUT", _default_rates[1])
+
+
+def _usage_get(usage: Any, key: str) -> int:
+    if isinstance(usage, dict):
+        val = usage.get(key)
+    else:
+        val = getattr(usage, key, None)
+    return int(val) if isinstance(val, (int, float)) else 0
+
+
+def _estimate_cost_usd(usage: Any) -> float:
+    """Rough $ estimate for one turn's usage. cache writes ≈1.25×, reads ≈0.1×."""
+    if usage is None:
+        return 0.0
+    inp = _usage_get(usage, "input_tokens")
+    cache_w = _usage_get(usage, "cache_creation_input_tokens")
+    cache_r = _usage_get(usage, "cache_read_input_tokens")
+    out = _usage_get(usage, "output_tokens")
+    input_cost = (inp + cache_w * 1.25 + cache_r * 0.1) * _COST_PER_MTOK_INPUT / 1_000_000
+    output_cost = out * _COST_PER_MTOK_OUTPUT / 1_000_000
+    return input_cost + output_cost
+
+
+def _usage_summary(result: Any, stage: str) -> dict | None:
+    if result is None:
+        return None
+    usage = getattr(result, "usage", None)
+    return {
+        "stage": stage,
+        "cost_usd": getattr(result, "total_cost_usd", None),
+        "num_turns": getattr(result, "num_turns", None),
+        "duration_ms": getattr(result, "duration_ms", None),
+        "input_tokens": _usage_get(usage, "input_tokens"),
+        "output_tokens": _usage_get(usage, "output_tokens"),
+        "cache_read_tokens": _usage_get(usage, "cache_read_input_tokens"),
+        "cache_creation_tokens": _usage_get(usage, "cache_creation_input_tokens"),
+    }
+
+
+def _report_usage(result: Any, stage: str, on_usage: UsageCallback | None) -> None:
+    summary = _usage_summary(result, stage)
+    if summary is None:
+        return
+    log.info(
+        "agent usage [%s]: cost=$%s turns=%s in=%s out=%s cache_read=%s cache_write=%s",
+        stage, summary["cost_usd"], summary["num_turns"], summary["input_tokens"],
+        summary["output_tokens"], summary["cache_read_tokens"], summary["cache_creation_tokens"],
+    )
+    if on_usage is not None:
+        try:
+            on_usage(summary)
+        except Exception as exc:  # noqa: BLE001 — usage reporting must never break the run
+            log.warning("on_usage callback failed: %s", exc)
 
 
 def _api_attempts() -> int:
@@ -128,7 +246,9 @@ async def _drive_once(
     query_fn: Callable[..., Any],
     outcome: _Outcome,
     on_message: ProgressCallback | None,
+    budget_usd: float | None = None,
 ) -> None:
+    est_cost = 0.0
     async for message in query_fn(prompt=prompt, options=options):
         if on_message is not None:
             try:
@@ -140,6 +260,11 @@ async def _drive_once(
             outcome.parts.append(text)
         if _is_result_message(message):
             outcome.result = message
+        elif budget_usd is not None:
+            # Accumulate per-turn (non-result) usage; stop before the cap blows.
+            est_cost += _estimate_cost_usd(getattr(message, "usage", None))
+            if est_cost >= budget_usd:
+                raise CCBudgetExceeded(est_cost, outcome.transcript)
 
 
 async def _run_query(
@@ -150,15 +275,21 @@ async def _run_query(
     query_fn: Callable[..., Any],
     stderr_lines: list[str],
     on_message: ProgressCallback | None = None,
+    on_usage: UsageCallback | None = None,
+    budget_usd: float | None = None,
 ) -> _Outcome:
-    """Run query() with bounded retries on transient API errors. Raises
-    CCAgentError with the real HTTP status / CLI stderr on give-up."""
+    """Run query() with bounded retries on transient API errors. Reports usage
+    on success and failure. Raises CCBudgetExceeded (not retried) when the cost
+    cap trips, else CCAgentError with the real HTTP status / CLI stderr."""
     attempts = _api_attempts()
     for attempt in range(1, attempts + 1):
         outcome = _Outcome()
         try:
-            await _drive_once(options, prompt, query_fn, outcome, on_message)
+            await _drive_once(options, prompt, query_fn, outcome, on_message, budget_usd)
+            _report_usage(outcome.result, label, on_usage)
             return outcome
+        except CCBudgetExceeded:
+            raise  # a hard stop — never retried, never wrapped
         except Exception as exc:  # noqa: BLE001 — classify, then retry or surface
             status = getattr(outcome.result, "api_error_status", None)
             if status in _TRANSIENT_API_STATUSES and attempt < attempts:
@@ -169,6 +300,7 @@ async def _run_query(
                 )
                 await asyncio.sleep(delay)
                 continue
+            _report_usage(outcome.result, label, on_usage)  # surface the wasted spend
             suffix = f" (HTTP {status})" if status else ""
             raise CCAgentError(
                 _with_stderr(f"{label} query failed{suffix}: {exc}", stderr_lines)
@@ -182,6 +314,7 @@ async def run_planner(
     prompt: str,
     system_prompt: str | None = None,
     model: str | None = None,
+    on_usage: UsageCallback | None = None,
     query_fn: Callable[..., Any] = query,
 ) -> Plan:
     """Read-only planning pass. Returns a validated :class:`Plan` via the SDK's
@@ -192,6 +325,7 @@ async def run_planner(
         cwd=str(cwd),
         model=model or PLANNER_MODEL,
         fallback_model=PLANNER_FALLBACK_MODEL,
+        effort=PLANNER_EFFORT,
         allowed_tools=["Read", "Grep", "Glob", "Skill"],
         disallowed_tools=["Write", "Edit", "MultiEdit", "Bash"],
         permission_mode="default",
@@ -204,7 +338,7 @@ async def run_planner(
 
     outcome = await _run_query(
         label="planner", options=options, prompt=prompt,
-        query_fn=query_fn, stderr_lines=stderr_lines,
+        query_fn=query_fn, stderr_lines=stderr_lines, on_usage=on_usage,
     )
     result = outcome.result
     if result is None:
@@ -223,24 +357,31 @@ async def run_executor(
     prompt: str,
     system_prompt: str | None = None,
     model: str | None = None,
+    effort: str | None = None,
+    max_turns: int | None = None,
+    budget_usd: float | None = None,
     on_message: ProgressCallback | None = None,
+    on_usage: UsageCallback | None = None,
     query_fn: Callable[..., Any] = query,
 ) -> str:
     """Autonomous build pass. Writes files under ``cwd`` with full tools and
     ``bypassPermissions``. Returns the assistant transcript (the deliverable is
     on disk; the transcript is for logging/progress). ``on_message`` is invoked
-    for every streamed message so callers can emit progress events."""
+    for every streamed message so callers can emit progress events. When
+    ``budget_usd`` is set, raises :class:`CCBudgetExceeded` once the estimated
+    spend crosses it — the partial build is already on disk."""
     stderr_lines: list[str] = []
     options = ClaudeAgentOptions(
         cwd=str(cwd),
         model=model or EXECUTOR_MODEL,
         fallback_model=EXECUTOR_FALLBACK_MODEL,
+        effort=effort or EXECUTOR_EFFORT,
         allowed_tools=["Read", "Write", "Edit", "MultiEdit", "Bash", "Glob", "Grep", "Skill"],
         permission_mode="bypassPermissions",
         setting_sources=["project"],
         skills=SKILLS,
         system_prompt=system_prompt,
-        max_turns=_executor_max_turns(),
+        max_turns=max_turns if max_turns is not None else _executor_max_turns(),
         stderr=stderr_lines.append,
         # AMP runs the job container as root, and the CLI refuses
         # bypassPermissions (= --dangerously-skip-permissions) as root unless
@@ -251,7 +392,8 @@ async def run_executor(
 
     outcome = await _run_query(
         label="executor", options=options, prompt=prompt, query_fn=query_fn,
-        stderr_lines=stderr_lines, on_message=on_message,
+        stderr_lines=stderr_lines, on_message=on_message, on_usage=on_usage,
+        budget_usd=budget_usd,
     )
     if outcome.result is not None and getattr(outcome.result, "is_error", False):
         log.warning(

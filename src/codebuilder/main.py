@@ -120,6 +120,25 @@ def _emit_prompt_prepared(state: CodebuilderState, stage: str, prompt: str, **pa
     _emit_progress(state, "planner_inputs_prepared", stage=stage, prompt_chars=len(prompt), **payload)
 
 
+def _emit_usage(state: CodebuilderState, summary: dict) -> None:
+    """Surface per-agent-call token/cost to logs + the progress webhook. Fires on
+    success and failure so wasted spend on a crashed run is visible."""
+    _emit_progress(state, "llm_usage", **summary)
+
+
+def _run_cost_budget_usd() -> float | None:
+    """Cost cap for the build phase (executor + repairs). Unset = no cap."""
+    raw = os.environ.get("CODEBUILDER_MAX_RUN_COST_USD")
+    if not raw:
+        return None
+    try:
+        value = float(raw)
+    except ValueError:
+        log.warning("CODEBUILDER_MAX_RUN_COST_USD=%r is not a number; no cap applied", raw)
+        return None
+    return value if value > 0 else None
+
+
 def _zip_build(build_dir: str, out_dir: Path, project_name: str) -> Path:
     """Zip the built project into ``out_dir/<project>.zip``. Overwrites if present."""
     src = Path(build_dir).resolve()
@@ -324,6 +343,21 @@ def _repair_prompt(state: CodebuilderState, plan: Plan, report: QAReport) -> str
     )
 
 
+def _changelog_prompt(state: CodebuilderState, plan: Plan) -> str:
+    lang = state.language or "English"
+    return "\n\n".join(
+        [
+            "The build was stopped because it reached its cost budget. Do NOT "
+            "implement, fix, or write any more code — there is no budget left for that.",
+            "Your only task: inspect what is already on disk in the current directory "
+            f"and write a single file named CHANGELOG.md (in {lang}) with exactly these "
+            "sections:\n## What's done\n## What's left\n## What to do on the next run",
+            f"## Original plan (for reference)\n{plan.plan_markdown}",
+            "Write only CHANGELOG.md, then stop.",
+        ]
+    )
+
+
 class CodebuilderFlow(Flow[CodebuilderState]):
     """Single flow: ingest → plan (HITL) → build → finalize."""
 
@@ -389,7 +423,11 @@ class CodebuilderFlow(Flow[CodebuilderState]):
         prompt = _planner_prompt(self.state)
         _emit_prompt_prepared(self.state, "plan", prompt)
         plan_obj = validate_plan(
-            await cc_agent.run_planner(cwd=self.state.workspace_dir, prompt=prompt)
+            await cc_agent.run_planner(
+                cwd=self.state.workspace_dir,
+                prompt=prompt,
+                on_usage=lambda s: _emit_usage(self.state, s),
+            )
         )
         self.state.plan = plan_obj
         # Resolve the output language: caller override wins, else planner's
@@ -416,7 +454,11 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             prompt = _planner_prompt(self.state)
             _emit_prompt_prepared(self.state, "revise_plan", prompt, amend_cycle=self.state.amend_cycles)
             plan_obj = validate_plan(
-                await cc_agent.run_planner(cwd=self.state.workspace_dir, prompt=prompt)
+                await cc_agent.run_planner(
+                    cwd=self.state.workspace_dir,
+                    prompt=prompt,
+                    on_usage=lambda s: _emit_usage(self.state, s),
+                )
             )
         except Exception as exc:  # noqa: BLE001 — a revise failure must never brick the job
             fallback = self._prior_plan_snapshot(prior)
@@ -487,12 +529,34 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             git_tool.init_and_commit(build_dir)
 
         self._build_dir = build_dir
+        self._build_cost_usd = 0.0
         _install_skills(Path(build_dir))  # skills for the executor (cwd = build_dir)
-        _emit_progress(self.state, "build_started", mode=plan.mode, build_dir=build_dir)
+        budget = _run_cost_budget_usd()
+        _emit_progress(
+            self.state, "build_started", mode=plan.mode, build_dir=build_dir, cost_budget_usd=budget
+        )
         try:
             await cc_agent.run_executor(
                 cwd=build_dir,
                 prompt=_executor_prompt(self.state, plan, build_dir),
+                budget_usd=budget,
+                on_usage=self._record_executor_usage,
+            )
+        except cc_agent.CCBudgetExceeded as exc:
+            # Partial files are already on disk; leave the user something + a changelog.
+            log.warning("build stopped at cost budget: %s", exc)
+            self.state.status = "failed"
+            changelog_mode = await self._write_budget_changelog(build_dir, plan, exc.cost_usd)
+            self.state.qa_report = QAReport(
+                passed=False,
+                integration_notes=(
+                    f"Build stopped at the cost budget (est. ${exc.cost_usd:.2f} spent). "
+                    f"The partial package and CHANGELOG.md ({changelog_mode}) are included — "
+                    "re-run the job or raise CODEBUILDER_MAX_RUN_COST_USD to continue."
+                ),
+            )
+            _emit_progress(
+                self.state, "build_budget_exceeded", est_cost_usd=exc.cost_usd, changelog=changelog_mode
             )
         except Exception as exc:  # noqa: BLE001 — report a builder crash via QA, don't brick resume
             log.exception("executor agent failed")
@@ -505,17 +569,27 @@ class CodebuilderFlow(Flow[CodebuilderState]):
 
     @listen(build)
     async def finalize(self, _prior=None):
-        build_dir = getattr(self, "_build_dir", self.state.workspace_dir)
-        if self.state.status == "failed":
+        build_dir = getattr(self, "_build_dir", None)
+        plan = self.state.plan
+        build_failed = self.state.status == "failed"
+
+        # Nothing was built (e.g. "no plan to execute") — there's nothing to
+        # package. Any real build (even a failed/budget-stopped one) has a
+        # build_dir and falls through so its partial work is still delivered.
+        if plan is None or build_dir is None:
             try:
                 history.record(self.state)
             except Exception as exc:  # noqa: BLE001 — history is observability, never fatal
                 log.warning("history.record on build failure failed: %s", exc)
-            return self._completion_payload(build_dir)
+            return self._completion_payload(build_dir or self.state.workspace_dir)
 
-        _emit_progress(self.state, "final_qa_started")
-        self.state.qa_report = self._run_final_qa(build_dir)
-        await self._repair_final_qa_if_needed(build_dir)
+        # Only run (and repair) QA on a healthy build. A crashed/budget-stopped
+        # build already has its qa_report from build(); re-running QA would waste
+        # time/tokens — we still zip + upload the partial package below.
+        if not build_failed:
+            _emit_progress(self.state, "final_qa_started")
+            self.state.qa_report = self._run_final_qa(build_dir)
+            await self._repair_final_qa_if_needed(build_dir)
 
         if self.state.plan and self.state.plan.mode == "patch_existing":
             try:
@@ -606,6 +680,68 @@ class CodebuilderFlow(Flow[CodebuilderState]):
 
     # --- helpers ---------------------------------------------------------
 
+    def _record_executor_usage(self, summary: dict) -> None:
+        """Accumulate authoritative per-call cost toward the build budget, and
+        surface it. (Mid-run the cap uses cc_agent's estimate; this is the exact
+        total once each call finishes, used to size the remaining repair budget.)"""
+        cost = summary.get("cost_usd")
+        if isinstance(cost, (int, float)):
+            self._build_cost_usd = getattr(self, "_build_cost_usd", 0.0) + float(cost)
+        _emit_usage(self.state, summary)
+
+    def _remaining_budget(self) -> float | None:
+        budget = _run_cost_budget_usd()
+        if budget is None:
+            return None
+        return max(0.0, budget - getattr(self, "_build_cost_usd", 0.0))
+
+    async def _write_budget_changelog(self, build_dir: str, plan: Plan, est_cost: float) -> str:
+        """Leave a CHANGELOG.md when the build stops at budget. `agent` (default)
+        asks CC for a bounded wrap-up; `deterministic` builds one from the git
+        diff + plan for free; `off` skips. `agent` falls back to deterministic."""
+        mode = os.environ.get("CODEBUILDER_BUDGET_CHANGELOG", "agent").strip().lower()
+        if mode == "off":
+            return "off"
+        if mode == "agent":
+            try:
+                await cc_agent.run_executor(
+                    cwd=build_dir,
+                    prompt=_changelog_prompt(self.state, plan),
+                    effort="low",
+                    max_turns=8,
+                    on_usage=lambda s: _emit_usage(self.state, s),
+                )
+                if (Path(build_dir) / "CHANGELOG.md").is_file():
+                    return "agent"
+                log.warning("agent changelog produced no CHANGELOG.md; using deterministic")
+            except Exception as exc:  # noqa: BLE001 — never fail the wrap-up
+                log.warning("agent changelog failed (%s); using deterministic", exc)
+        self._write_deterministic_changelog(build_dir, plan, est_cost)
+        return "deterministic"
+
+    def _write_deterministic_changelog(self, build_dir: str, plan: Plan, est_cost: float) -> None:
+        try:
+            changed = git_tool.changed_files(build_dir) or []
+        except Exception:  # noqa: BLE001
+            changed = []
+        files = "\n".join(f"- {p}" for p in changed) or "- (no tracked changes detected)"
+        body = (
+            "# CodeBuilder — build stopped at cost budget\n\n"
+            "The build stopped because it reached the configured cost budget "
+            f"(`CODEBUILDER_MAX_RUN_COST_USD`). Estimated spend: ${est_cost:.2f}.\n\n"
+            "## Files created / modified so far\n"
+            f"{files}\n\n"
+            "## Original plan (full scope)\n\n"
+            f"{plan.plan_markdown}\n\n"
+            "## Next run\n"
+            "Re-run the job (or raise `CODEBUILDER_MAX_RUN_COST_USD`) to continue. "
+            "The files above are what got done; the plan above is the full scope.\n"
+        )
+        try:
+            (Path(build_dir) / "CHANGELOG.md").write_text(body, encoding="utf-8")
+        except OSError as exc:
+            log.warning("failed to write deterministic CHANGELOG.md: %s", exc)
+
     def _run_final_qa(self, build_dir: str) -> QAReport:
         plan = self.state.plan
         is_patch = bool(plan and plan.mode == "patch_existing")
@@ -617,6 +753,7 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             changed_paths=changed_paths,
             require_installable=bool(plan and plan.mode == "new_project"),
             allow_no_tests=bool(is_patch and not has_pytest_files(build_dir)),
+            run_tests=_env_bool("CODEBUILDER_RUN_TESTS", True),
         )
 
     def _max_final_qa_repairs(self) -> int:
@@ -630,13 +767,29 @@ class CodebuilderFlow(Flow[CodebuilderState]):
         for attempt in range(1, attempts + 1):
             if self.state.qa_report is None or self.state.qa_report.passed:
                 return
+            remaining = self._remaining_budget()
+            if remaining is not None and remaining <= 0:
+                _append_note(
+                    self.state.qa_report,
+                    "Skipped QA repair: cost budget already reached.",
+                )
+                return
             self.state.final_qa_repair_attempts = attempt
             _emit_progress(self.state, "final_qa_repair_started", attempt=attempt, max_attempts=attempts)
             try:
                 await cc_agent.run_executor(
                     cwd=build_dir,
                     prompt=_repair_prompt(self.state, plan, self.state.qa_report),
+                    budget_usd=remaining,
+                    on_usage=self._record_executor_usage,
                 )
+            except cc_agent.CCBudgetExceeded as exc:
+                log.warning("QA repair stopped at cost budget: %s", exc)
+                _append_note(
+                    self.state.qa_report,
+                    f"QA repair stopped at the cost budget (est. ${exc.cost_usd:.2f} spent this repair).",
+                )
+                return
             except Exception as exc:  # noqa: BLE001
                 log.warning("final QA repair attempt %s failed: %s", attempt, exc)
                 _append_note(self.state.qa_report, f"Repair attempt {attempt} errored: {exc}")

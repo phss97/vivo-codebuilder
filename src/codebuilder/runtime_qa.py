@@ -120,6 +120,7 @@ def run_final_qa(
     changed_paths: list[str] | None = None,
     require_installable: bool = False,
     allow_no_tests: bool = False,
+    run_tests: bool = True,
 ) -> QAReport:
     """Ruff + pytest + uv-installability over the build dir.
 
@@ -137,6 +138,9 @@ def run_final_qa(
     touched — pre-existing lint debt in untouched customer files must not fail
     the job. ``None`` lints the whole build dir. Pytest always runs over the
     whole dir so a change can't silently break the rest of the suite.
+
+    ``run_tests=False`` skips the pytest sweep entirely (the executor already
+    validates during its build) — QA then gates on ruff + installability only.
     """
     sync_error = ensure_project_env(build_dir)
     if sync_error and require_installable:
@@ -160,21 +164,27 @@ def run_final_qa(
     lint_ok = is_pass(lint_output)
 
     project_has_tests = has_pytest_files(build_dir)
-    test_tool = TestRunnerTool(workspace_dir=build_dir)
-    test_output = test_tool._run(".")
-    no_tests_warning = (
-        allow_no_tests
-        and not project_has_tests
-        and lint_ok
-        and is_no_tests_collected(test_output)
-    )
-    test_ok = is_pass(test_output) or no_tests_warning
+    if not run_tests:
+        test_output = "SKIP: tests disabled (CODEBUILDER_RUN_TESTS=false)"
+        no_tests_warning = False
+        test_ok = True  # tests don't gate when disabled; ruff + install still do
+    else:
+        test_tool = TestRunnerTool(workspace_dir=build_dir)
+        test_output = test_tool._run(".")
+        no_tests_warning = (
+            allow_no_tests
+            and not project_has_tests
+            and lint_ok
+            and is_no_tests_collected(test_output)
+        )
+        test_ok = is_pass(test_output) or no_tests_warning
 
     lint_scope = (
         "the whole build directory" if changed_paths is None
         else f"{len([p for p in changed_paths if p.endswith(('.py', '.pyi'))])} changed file(s)"
     )
-    notes = [f"Deterministic QA ran ruff over {lint_scope} and pytest over the build directory."]
+    test_scope = "pytest over the build directory" if run_tests else "with pytest disabled"
+    notes = [f"Deterministic QA ran ruff over {lint_scope} and {test_scope}."]
     if is_skip(lint_output):
         notes.append(f"Lint was not executed: {lint_output}")
     if no_tests_warning:
