@@ -32,10 +32,12 @@ class _FakeAssistant:
 
 
 class _FakeResult:
-    def __init__(self, structured_output=None, subtype="success", is_error=False) -> None:
+    def __init__(self, structured_output=None, subtype="success", is_error=False,
+                 api_error_status=None) -> None:
         self.structured_output = structured_output
         self.subtype = subtype
         self.is_error = is_error
+        self.api_error_status = api_error_status
 
 
 def _make_query(messages):
@@ -43,6 +45,28 @@ def _make_query(messages):
         for m in messages:
             yield m
 
+    return _q
+
+
+class _FakeProcessError(Exception):
+    """Stand-in for the SDK's ProcessError raised after an error result."""
+
+
+def _make_api_error_query(status, *, succeed_after=None):
+    """Query that yields an error ResultMessage (carrying api_error_status) then
+    raises, mimicking the CLI exiting non-zero. If succeed_after is set, the Nth+
+    call yields a good result instead (to test retry recovery)."""
+    calls = {"n": 0}
+
+    async def _q(**_kwargs):
+        calls["n"] += 1
+        if succeed_after is not None and calls["n"] > succeed_after:
+            yield _FakeResult(structured_output=VALID_PLAN)
+            return
+        yield _FakeResult(is_error=True, subtype="success", api_error_status=status)
+        raise _FakeProcessError(f"exit code 1 (status {status})")
+
+    _q.calls = calls
     return _q
 
 
@@ -114,6 +138,42 @@ def test_run_executor_transcript_and_progress():
     )
     assert "wrote file A" in out and "ran tests" in out
     assert len(seen) == 3
+
+
+# --- transient API error retry (the "error result: success" case) ----------
+
+
+async def _no_sleep(_seconds):
+    return None
+
+
+def test_transient_api_error_surfaces_status(monkeypatch):
+    # 529 exhausts retries → error message must carry the real HTTP status,
+    # not the useless "success" subtype.
+    monkeypatch.setattr(cc_agent.asyncio, "sleep", _no_sleep)
+    monkeypatch.setenv("CODEBUILDER_AGENT_API_RETRIES", "1")
+    q = _make_api_error_query(529)
+    with pytest.raises(CCAgentError, match="HTTP 529"):
+        asyncio.run(cc_agent.run_executor(cwd=".", prompt="x", query_fn=q))
+    assert q.calls["n"] == 2  # 1 attempt + 1 retry
+
+
+def test_transient_api_error_retries_then_succeeds(monkeypatch):
+    monkeypatch.setattr(cc_agent.asyncio, "sleep", _no_sleep)
+    monkeypatch.setenv("CODEBUILDER_AGENT_API_RETRIES", "3")
+    q = _make_api_error_query(429, succeed_after=2)
+    plan = asyncio.run(cc_agent.run_planner(cwd=".", prompt="x", query_fn=q))
+    assert isinstance(plan, Plan)
+    assert q.calls["n"] == 3  # failed twice, succeeded on the third
+
+
+def test_non_transient_api_error_is_not_retried(monkeypatch):
+    # A 400 (bad model / bad request) is a real bug — retrying just burns credits.
+    monkeypatch.setenv("CODEBUILDER_AGENT_API_RETRIES", "3")
+    q = _make_api_error_query(400)
+    with pytest.raises(CCAgentError, match="HTTP 400"):
+        asyncio.run(cc_agent.run_executor(cwd=".", prompt="x", query_fn=q))
+    assert q.calls["n"] == 1  # no retry
 
 
 # --- async-flow correctness (the resume-path gap) --------------------------

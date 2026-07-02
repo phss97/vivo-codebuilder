@@ -12,6 +12,7 @@ spawning the real ``claude`` subprocess — same pattern as the canary.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from pathlib import Path
@@ -35,11 +36,37 @@ EXECUTOR_FALLBACK_MODEL = os.environ.get("CODEBUILDER_EXECUTOR_FALLBACK_MODEL", 
 # workspace at ingest so the SDK discovers them from the agent's cwd.
 SKILLS = ["rpa", "code-review-gate"]
 
+# HTTP statuses where retrying the whole query() is worthwhile. When the CLI's
+# underlying API call fails with one of these, the SDK surfaces it as a result
+# with is_error=True, subtype="success", and api_error_status set (see the SDK's
+# ResultMessage.api_error_status). A 400/401/403/404 is NOT here — those are real
+# bugs (bad model id, bad key, too-long prompt) and retrying just burns credits.
+_TRANSIENT_API_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504, 529}
+
 ProgressCallback = Callable[[Any], None]
 
 
 class CCAgentError(RuntimeError):
     """The CC agent failed to produce usable output."""
+
+
+def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return max(minimum, int(raw))
+    except ValueError:
+        log.warning("%s=%r is not an int; using %s", name, raw, default)
+        return default
+
+
+def _api_attempts() -> int:
+    # Total attempts = retries + 1. Retries only fire on transient API errors
+    # (429/5xx). Default 1: an executor retry re-runs the whole build, so keep
+    # the credit multiplier low; bump CODEBUILDER_AGENT_API_RETRIES if the API
+    # is flaky.
+    return _env_int("CODEBUILDER_AGENT_API_RETRIES", 1, minimum=0) + 1
 
 
 def _executor_max_turns() -> int | None:
@@ -81,6 +108,74 @@ def _assistant_text(message: Any) -> str:
     return str(text) if text else ""
 
 
+class _Outcome:
+    """Carries the last result message + transcript out of one query() pass,
+    even when the pass ends by raising (the error result arrives just before the
+    subprocess exits non-zero and raises)."""
+
+    def __init__(self) -> None:
+        self.result: Any = None
+        self.parts: list[str] = []
+
+    @property
+    def transcript(self) -> str:
+        return "\n".join(self.parts)
+
+
+async def _drive_once(
+    options: ClaudeAgentOptions,
+    prompt: str,
+    query_fn: Callable[..., Any],
+    outcome: _Outcome,
+    on_message: ProgressCallback | None,
+) -> None:
+    async for message in query_fn(prompt=prompt, options=options):
+        if on_message is not None:
+            try:
+                on_message(message)
+            except Exception as exc:  # noqa: BLE001 — progress must never break the run
+                log.warning("progress callback failed: %s", exc)
+        text = _assistant_text(message)
+        if text:
+            outcome.parts.append(text)
+        if _is_result_message(message):
+            outcome.result = message
+
+
+async def _run_query(
+    *,
+    label: str,
+    options: ClaudeAgentOptions,
+    prompt: str,
+    query_fn: Callable[..., Any],
+    stderr_lines: list[str],
+    on_message: ProgressCallback | None = None,
+) -> _Outcome:
+    """Run query() with bounded retries on transient API errors. Raises
+    CCAgentError with the real HTTP status / CLI stderr on give-up."""
+    attempts = _api_attempts()
+    for attempt in range(1, attempts + 1):
+        outcome = _Outcome()
+        try:
+            await _drive_once(options, prompt, query_fn, outcome, on_message)
+            return outcome
+        except Exception as exc:  # noqa: BLE001 — classify, then retry or surface
+            status = getattr(outcome.result, "api_error_status", None)
+            if status in _TRANSIENT_API_STATUSES and attempt < attempts:
+                delay = min(30, 2 ** attempt)
+                log.warning(
+                    "%s: transient API error HTTP %s (attempt %d/%d); retrying in %ds",
+                    label, status, attempt, attempts, delay,
+                )
+                await asyncio.sleep(delay)
+                continue
+            suffix = f" (HTTP {status})" if status else ""
+            raise CCAgentError(
+                _with_stderr(f"{label} query failed{suffix}: {exc}", stderr_lines)
+            ) from exc
+    raise CCAgentError(f"{label} query failed after {attempts} attempts")  # unreachable
+
+
 async def run_planner(
     *,
     cwd: str | Path,
@@ -107,20 +202,18 @@ async def run_planner(
         stderr=stderr_lines.append,
     )
 
-    result = None
-    try:
-        async for message in query_fn(prompt=prompt, options=options):
-            if _is_result_message(message):
-                result = message
-    except Exception as exc:  # noqa: BLE001 — surface the CLI stderr, not the opaque wrapper
-        raise CCAgentError(_with_stderr(f"planner query failed: {exc}", stderr_lines)) from exc
+    outcome = await _run_query(
+        label="planner", options=options, prompt=prompt,
+        query_fn=query_fn, stderr_lines=stderr_lines,
+    )
+    result = outcome.result
     if result is None:
         raise CCAgentError(_with_stderr("planner produced no result message", stderr_lines))
     if getattr(result, "subtype", None) == "error_max_structured_output_retries":
         raise CCAgentError("planner exhausted structured-output retries without a valid Plan")
     data = getattr(result, "structured_output", None)
     if not data:
-        raise CCAgentError("planner returned no structured output")
+        raise CCAgentError(_with_stderr("planner returned no structured output", stderr_lines))
     return Plan.model_validate(data)
 
 
@@ -156,26 +249,13 @@ async def run_executor(
         env={"IS_SANDBOX": "1"},
     )
 
-    transcript: list[str] = []
-    result = None
-    try:
-        async for message in query_fn(prompt=prompt, options=options):
-            if on_message is not None:
-                try:
-                    on_message(message)
-                except Exception as exc:  # noqa: BLE001 — progress emission must never break the build
-                    log.warning("executor progress callback failed: %s", exc)
-            text = _assistant_text(message)
-            if text:
-                transcript.append(text)
-            if _is_result_message(message):
-                result = message
-    except Exception as exc:  # noqa: BLE001 — surface the CLI stderr, not the opaque wrapper
-        raise CCAgentError(_with_stderr(f"executor query failed: {exc}", stderr_lines)) from exc
-
-    if result is not None and getattr(result, "is_error", False):
+    outcome = await _run_query(
+        label="executor", options=options, prompt=prompt, query_fn=query_fn,
+        stderr_lines=stderr_lines, on_message=on_message,
+    )
+    if outcome.result is not None and getattr(outcome.result, "is_error", False):
         log.warning(
             "executor result reported an error (subtype=%s); QA will catch a bad build",
-            getattr(result, "subtype", "?"),
+            getattr(outcome.result, "subtype", "?"),
         )
-    return "\n".join(transcript)
+    return outcome.transcript
