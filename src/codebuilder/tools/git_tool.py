@@ -16,6 +16,7 @@ _HARNESS_EXCLUDES = (
     ".ruff_cache/",
     ".mypy_cache/",
     ".DS_Store",
+    ".claude/",  # copied CC skills — harness context, never part of the deliverable
 )
 
 
@@ -54,3 +55,20 @@ def diff(repo_dir: str) -> str:
     staged = repo.git.diff("--cached")
     unstaged = repo.git.diff()
     return "\n".join(p for p in (staged, unstaged) if p)
+
+
+def changed_files(repo_dir: str) -> list[str] | None:
+    """Repo-relative paths changed vs the baseline (staged after `git add -A`).
+
+    Used to scope patch-mode QA to what the executor touched, so pre-existing
+    lint debt / tests in untouched customer files don't fail the job. Returns
+    ``None`` when ``repo_dir`` isn't a git repo (caller falls back to whole-dir).
+    """
+    try:
+        repo = Repo(repo_dir)
+    except Exception:  # noqa: BLE001 — not a repo → caller uses whole-dir QA
+        return None
+    _ensure_harness_excludes(repo)
+    repo.git.add(A=True)
+    out = repo.git.diff("--cached", "--name-only")
+    return [line.strip() for line in out.splitlines() if line.strip()]

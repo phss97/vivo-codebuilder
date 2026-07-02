@@ -137,10 +137,11 @@ def record(state: "CodebuilderState") -> None:
     plan_json = state.plan.model_dump_json() if state.plan else None
     qa_json = _qa_json_for_history(state)
     mode = state.plan.mode if state.plan else ("patch_existing" if plan_json else "new_project")
-    files_touched = json.dumps(sorted({a.file_path for a in state.artifacts if a.file_path}))
-    reviewer_issues = json.dumps(
-        [issue for rr in state.review_results for issue in (rr.issues or [])]
-    )
+    # The executor writes files directly; we no longer track per-file artifacts
+    # or reviewer issues, so these history columns stay empty. QA notes + patch
+    # diff carry the run's signal.
+    files_touched = json.dumps([])
+    reviewer_issues = json.dumps([])
 
     try:
         with _connect() as conn:
