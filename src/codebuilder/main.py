@@ -33,6 +33,7 @@ from codebuilder.schemas import (
     Attachment,
     CodebuilderState,
     Plan,
+    ProductionReview,
     ProjectArchiveRef,
     QAReport,
 )
@@ -151,7 +152,7 @@ def _emit_usage(state: CodebuilderState, summary: dict) -> None:
 
 
 def _run_cost_budget_usd() -> float | None:
-    """Cost cap for the build phase (executor + repairs). Unset = no cap."""
+    """Cost cap for the build phase (executor + review + repairs). Unset = no cap."""
     raw = os.environ.get("CODEBUILDER_MAX_RUN_COST_USD")
     if not raw:
         return None
@@ -370,6 +371,10 @@ def _planner_prompt(state: CodebuilderState) -> str:
         "- Write the plan in `plan_markdown` as clear Markdown: overview, "
         "approach, the files/structure to create or change, and how it will be "
         "tested. This is shown verbatim to the human and handed to the builder.\n"
+        "- For an existing RPA project, trace the real production path from the "
+        "entry point through Settings, dependency composition, external adapters, "
+        "and login/connect cleanup. Do not trust tests that replace the complete "
+        "production adapter or reproduce a different fake contract.\n"
         "- Put only genuinely blocking decisions in `open_questions` (max 3, "
         "empty when possible — prefer stating `assumptions` instead).\n"
         "- Do NOT write any files; you are read-only."
@@ -404,7 +409,9 @@ def _executor_prompt(state: CodebuilderState, plan: Plan) -> str:
         "`uv sync --locked`, `ruff check .`, `ruff format --check .`, native "
         "`mypy`, configuration/dependency/entry-point validation, and the full "
         "`pytest` suite. Fix failures across the repository, including existing "
-        "debt that prevents the delivered package from passing."
+        "debt that prevents the delivered package from passing. For RPA projects, "
+        "exercise the real Settings, composition root, adapter contracts, and "
+        "login/connect cleanup while mocking only external transports."
     )
     return "\n\n".join(sections)
 
@@ -419,6 +426,35 @@ def _repair_prompt(state: CodebuilderState, plan: Plan, report: QAReport) -> str
             f"## Output language\nWrite all comments and docstrings in: {state.language or 'English'}.",
             f"## QA report\n{qa_report_for_repair(report)}",
             f"## Original plan\n{plan.plan_markdown}",
+        ]
+    )
+
+
+def _production_review_prompt(state: CodebuilderState, plan: Plan) -> str:
+    return "\n\n".join(
+        [
+            "You are the final production-wiring reviewer for an RPA package. "
+            "Read the implementation and return only blockers that could make the "
+            "installed package fail in production despite green lint, MyPy, and tests. "
+            "Do not report style preferences or unavailable customer infrastructure.",
+            "## Required trace\n"
+            "- Follow every console/module entry point through Settings and the "
+            "dependency-composition root into external adapters.\n"
+            "- Verify every settings attribute exists and every injected dependency "
+            "uses its real Protocol instead of Any/getattr.\n"
+            "- Verify secrets are fetched through the declared secret-provider API.\n"
+            "- Verify login/connect and logout/disconnect lifecycle is owned by the "
+            "orchestrator and cleanup runs on success and failure.\n"
+            "- Verify tests exercise those real production classes while replacing "
+            "only COM, HTTP, database, filesystem, or other external transports.\n"
+            "- Verify settings tests cannot accidentally read the developer's .env.",
+            "## Decision rule\n"
+            "Set passed=false only for concrete execution blockers. Every issue must "
+            "name the affected file or component and the broken contract. Return an "
+            "empty issues list when passed=true.",
+            f"## Original brief\n{state.brief or '(none)'}",
+            f"## Approved plan\n{plan.plan_markdown}",
+            f"## Output language\nWrite issues in: {state.language or 'English'}.",
         ]
     )
 
@@ -700,7 +736,7 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             self.state.qa_report.passed = False
             _append_note(self.state.qa_report, build_failure_note)
         if not build_failed:
-            await self._repair_final_qa_if_needed(build_dir)
+            await self._certify_and_repair(build_dir)
 
         if self.state.plan and self.state.plan.mode == "patch_existing":
             try:
@@ -827,11 +863,10 @@ class CodebuilderFlow(Flow[CodebuilderState]):
         return max(0.0, budget - getattr(self, "_build_cost_usd", 0.0))
 
     def _run_final_qa(self, build_dir: str) -> QAReport:
-        plan = self.state.plan
         return run_final_qa(
             build_dir,
             require_installable=(Path(build_dir) / "pyproject.toml").is_file(),
-            require_typecheck=bool(plan and plan.domain == "rpa"),
+            require_typecheck=self._is_rpa_build(build_dir),
             locked_sync=True,
         )
 
@@ -840,14 +875,97 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             "CODEBUILDER_MAX_FINAL_QA_REPAIRS", DEFAULT_MAX_FINAL_QA_REPAIRS
         )
 
-    async def _repair_final_qa_if_needed(self, build_dir: str) -> None:
+    def _is_rpa_build(self, build_dir: str) -> bool:
+        plan = self.state.plan
+        return bool(
+            plan
+            and (plan.domain.lower() == "rpa" or _looks_like_rpa(self.state, build_dir))
+        )
+
+    async def _apply_production_review(self, build_dir: str) -> bool:
+        """Apply the RPA-only semantic gate. False means review infrastructure failed."""
+        plan = self.state.plan
+        report = self.state.qa_report
+        if plan is None or report is None or not self._is_rpa_build(build_dir):
+            self.state.production_review = None
+            return True
+
+        remaining = self._remaining_budget()
+        if remaining is not None and remaining <= 0:
+            issue = (
+                "Production review skipped because the build cost budget was reached."
+            )
+            self.state.production_review = ProductionReview(
+                passed=False, issues=[issue]
+            )
+            report.passed = False
+            _append_note(report, issue)
+            return False
+
+        _emit_progress(self.state, "production_review_started")
+        try:
+            review = await cc_agent.run_reviewer(
+                cwd=build_dir,
+                prompt=_production_review_prompt(self.state, plan),
+                budget_usd=remaining,
+                on_usage=self._record_executor_usage,
+            )
+        except cc_agent.CCBudgetExceeded as exc:
+            issue = (
+                "Production review stopped at the cost budget "
+                f"(est. ${exc.cost_usd:.2f} spent this review)."
+            )
+            review = ProductionReview(passed=False, issues=[issue])
+            completed = False
+        except Exception as exc:  # noqa: BLE001 — fail certification, preserve archive
+            issue = f"Production review could not complete: {exc}"
+            review = ProductionReview(passed=False, issues=[issue])
+            completed = False
+        else:
+            completed = True
+
+        if review.passed and review.issues:
+            review.passed = False
+            review.issues.insert(
+                0, "Reviewer returned issues while marking the package as passed."
+            )
+        elif not review.passed and not review.issues:
+            review.issues.append(
+                "Production reviewer marked the package as failed without a concrete issue."
+            )
+            completed = False
+        self.state.production_review = review
+        if not review.passed:
+            report.passed = False
+            _append_note(
+                report,
+                "Production wiring review failed:\n"
+                + "\n".join(f"- {issue}" for issue in review.issues),
+            )
+        _emit_progress(
+            self.state,
+            "production_review_completed",
+            passed=review.passed,
+            issues=review.issues,
+        )
+        return completed
+
+    async def _certify_and_repair(self, build_dir: str) -> None:
+        """Require deterministic QA plus the RPA semantic gate within one repair cap."""
         attempts = self._max_final_qa_repairs()
         plan = self.state.plan
         if plan is None:
             return
-        for attempt in range(1, attempts + 1):
-            if self.state.qa_report is None or self.state.qa_report.passed:
-                return
+
+        while self.state.qa_report is not None:
+            if self.state.qa_report.passed:
+                review_completed = await self._apply_production_review(build_dir)
+                if not review_completed or self.state.qa_report.passed:
+                    return
+
+            attempt = self.state.final_qa_repair_attempts + 1
+            if attempt > attempts:
+                break
             remaining = self._remaining_budget()
             if remaining is not None and remaining <= 0:
                 _append_note(
@@ -855,7 +973,7 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                     "Skipped QA repair: cost budget already reached.",
                 )
                 return
-            self.state.final_qa_repair_attempts = attempt
+            self.state.final_qa_repair_attempts += 1
             _emit_progress(
                 self.state,
                 "final_qa_repair_started",
@@ -883,6 +1001,7 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                 )
                 return
             self.state.qa_report = self._run_final_qa(build_dir)
+
         if self.state.qa_report and not self.state.qa_report.passed:
             _append_note(
                 self.state.qa_report,

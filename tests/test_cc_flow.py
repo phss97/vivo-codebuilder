@@ -14,9 +14,15 @@ import codebuilder.runtime_qa as runtime_qa
 from codebuilder import cc_agent
 from codebuilder.cc_agent import CCAgentError
 from codebuilder.runtime_qa import run_final_qa, validate_plan
-from codebuilder.schemas import Attachment, Plan, QAReport
+from codebuilder.schemas import Attachment, Plan, ProductionReview, QAReport
 from codebuilder.tools.git_tool import _HARNESS_EXCLUDES
 from codebuilder.tools.s3_artifacts import SKIP_DIRS
+
+
+@pytest.fixture(autouse=True)
+def _disable_external_artifact_upload(monkeypatch):
+    """Keep local .env settings from turning unit tests into network tests."""
+    monkeypatch.delenv("CODEBUILDER_ARTIFACT_BUCKET", raising=False)
 
 
 # --- fake SDK messages / query --------------------------------------------
@@ -108,6 +114,8 @@ VALID_PLAN = {
     "open_questions": [],
     "assumptions": [],
 }
+
+VALID_REVIEW = {"passed": True, "issues": []}
 
 
 # --- validate_plan ---------------------------------------------------------
@@ -231,6 +239,18 @@ def test_run_planner_no_messages():
     q = _make_query([])
     with pytest.raises(CCAgentError):
         asyncio.run(cc_agent.run_planner(cwd=".", prompt="x", query_fn=q))
+
+
+def test_run_reviewer_is_structured_and_read_only():
+    q = _make_capturing_query([_FakeResult(structured_output=VALID_REVIEW)])
+
+    review = asyncio.run(cc_agent.run_reviewer(cwd=".", prompt="x", query_fn=q))
+
+    assert review == ProductionReview(passed=True)
+    options = q.captured["options"]
+    assert "Read" in options.allowed_tools
+    assert "Bash" in options.disallowed_tools
+    assert options.permission_mode == "default"
 
 
 # --- run_executor ----------------------------------------------------------
@@ -641,6 +661,144 @@ def test_pywin32_must_be_windows_scoped(tmp_path):
     assert "must be scoped to Windows" in output
 
 
+def test_rpa_production_contract_catches_dynamic_wiring_and_unused_lifecycle(
+    tmp_path,
+):
+    source = tmp_path / "src" / "demo"
+    source.mkdir(parents=True)
+    (source / "settings.py").write_text(
+        "from pydantic_settings import BaseSettings\n\n"
+        "class Settings(BaseSettings):\n"
+        "    sap_endpoint: str\n"
+        "    sap_password_secret: str\n"
+    )
+    (source / "sap_client.py").write_text(
+        "from typing import Any\n"
+        "from .settings import Settings\n\n"
+        "class SapClientImpl:\n"
+        "    def __init__(self, settings: Settings, secret_provider: Any):\n"
+        "        self._settings = settings\n"
+        "        self._secret_provider = secret_provider\n"
+        "    def login(self):\n"
+        "        getattr(self._settings, 'sap_system_id', '')\n"
+        "        return getattr(self._secret_provider, 'sap_password', '')\n"
+        "    def logout(self):\n"
+        "        return None\n"
+    )
+
+    output = runtime_qa.check_rpa_production_contract(str(tmp_path))
+
+    assert "sap_system_id" in output
+    assert "secret_provider" in output and "typed Any" in output
+    assert "production source never calls: login, logout" in output
+
+
+def test_rpa_production_contract_accepts_typed_and_orchestrated_client(tmp_path):
+    source = tmp_path / "src" / "demo"
+    source.mkdir(parents=True)
+    (source / "settings.py").write_text(
+        "from pydantic_settings import BaseSettings\n\n"
+        "class Settings(BaseSettings):\n"
+        "    sap_endpoint: str\n"
+        "    sap_password_secret: str\n"
+    )
+    (source / "sap_client.py").write_text(
+        "from typing import Protocol\n"
+        "from .settings import Settings\n\n"
+        "class SecretProvider(Protocol):\n"
+        "    def get_secret(self, name: str) -> str: ...\n\n"
+        "class SapClientImpl:\n"
+        "    def __init__(self, settings: Settings, secret_provider: SecretProvider):\n"
+        "        self._settings = settings\n"
+        "        self._secret_provider = secret_provider\n"
+        "    def login(self):\n"
+        "        return self._secret_provider.get_secret(self._settings.sap_password_secret)\n"
+        "    def logout(self):\n"
+        "        return None\n"
+    )
+    (source / "orchestrator.py").write_text(
+        "def run(client):\n"
+        "    client.login()\n"
+        "    try:\n"
+        "        return 0\n"
+        "    finally:\n"
+        "        client.logout()\n"
+    )
+
+    assert runtime_qa.check_rpa_production_contract(str(tmp_path)) == "PASS"
+
+
+def test_rpa_qa_reruns_tests_with_example_env_and_restores_workspace(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("CODEBUILDER_PROVISION_PROJECT_ENV", "0")
+    (tmp_path / ".env.example").write_text("TERRA_DATABASE_URL=example\n")
+    calls: list[bool] = []
+
+    def _tests(tool, _path):
+        active = (tmp_path / ".env").exists()
+        calls.append(active)
+        return "settings leaked from .env.example" if active else "PASS\n1 passed"
+
+    monkeypatch.setattr(runtime_qa.LintRunnerTool, "_run", lambda *_: "PASS")
+    monkeypatch.setattr(runtime_qa.TypeCheckRunnerTool, "_run", lambda *_: "PASS")
+    monkeypatch.setattr(runtime_qa.TestRunnerTool, "_run", _tests)
+    monkeypatch.setattr(runtime_qa, "check_env_example", lambda *_: "PASS")
+    monkeypatch.setattr(runtime_qa, "check_runtime_contract", lambda *_: "PASS")
+    monkeypatch.setattr(runtime_qa, "check_rpa_production_contract", lambda *_: "PASS")
+
+    report = run_final_qa(str(tmp_path), require_typecheck=True)
+
+    assert not report.passed
+    assert calls == [False, True]
+    assert "settings leaked" in report.test_output
+    assert "settings leaked" in report.integration_notes
+    assert not (tmp_path / ".env").exists()
+
+
+def test_rpa_entrypoint_help_smoke_is_blocking(tmp_path):
+    (tmp_path / "pyproject.toml").write_text(
+        "[project]\nname='demo'\nversion='0.1'\ndependencies=[]\n"
+        "[project.scripts]\ndemo='demo:main'\n"
+    )
+    (tmp_path / ".env").write_text("REAL_DATABASE_URL=do-not-use\n")
+    (tmp_path / "demo.py").write_text(
+        "import argparse\n"
+        "from pathlib import Path\n\n"
+        "def main():\n"
+        "    if Path('.env').exists():\n"
+        "        return 3\n"
+        "    argparse.ArgumentParser().parse_args()\n"
+    )
+    assert runtime_qa.check_runtime_contract(str(tmp_path), True) == "PASS"
+
+    (tmp_path / "demo.py").write_text("def main():\n    return 2\n")
+    output = runtime_qa.check_runtime_contract(str(tmp_path), True)
+    assert "demo --help" in output
+
+
+def test_final_qa_uses_rpa_heuristic_when_planner_domain_is_empty(
+    tmp_path, monkeypatch
+):
+    source = tmp_path / "src" / "demo"
+    source.mkdir(parents=True)
+    for name in ("orchestrator.py", "producer.py", "consumer.py"):
+        (source / name).write_text("x = 1\n")
+    captured: dict = {}
+
+    def _qa(path, **kwargs):
+        captured.update(path=path, **kwargs)
+        return QAReport(passed=True)
+
+    monkeypatch.setattr(main, "run_final_qa", _qa)
+    flow = main.CodebuilderFlow()
+    flow.state.plan = Plan.model_validate(VALID_PLAN)
+
+    flow._run_final_qa(str(tmp_path))
+
+    assert captured["require_typecheck"] is True
+
+
 def test_successful_archive_has_no_failure_report(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEBUILDER_HISTORY_ENABLED", "false")
     build_dir = tmp_path / "output"
@@ -663,6 +821,92 @@ def test_successful_archive_has_no_failure_report(tmp_path, monkeypatch):
     assert payload["status"] == "done"
     with zipfile.ZipFile(tmp_path / "demo.zip") as archive:
         assert "demo/CODEBUILDER_REPORT.md" not in archive.namelist()
+
+
+def test_rpa_semantic_failure_uses_existing_repair_loop(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEBUILDER_HISTORY_ENABLED", "false")
+    monkeypatch.setenv("CODEBUILDER_MAX_FINAL_QA_REPAIRS", "1")
+    build_dir = tmp_path / "output"
+    build_dir.mkdir()
+    (build_dir / "app.py").write_text("x = 1\n")
+    prompts: list[str] = []
+    reviews = iter(
+        [
+            ProductionReview(
+                passed=False,
+                issues=["orchestrator.py never calls SapClient.login()"],
+            ),
+            ProductionReview(passed=True),
+        ]
+    )
+
+    async def _reviewer(**_kwargs):
+        return next(reviews)
+
+    async def _executor(**kwargs):
+        prompts.append(kwargs["prompt"])
+        return "fixed"
+
+    flow = main.CodebuilderFlow()
+    flow.state.plan = Plan.model_validate({**VALID_PLAN, "domain": "rpa"})
+    flow.state.workspace_dir = str(tmp_path)
+    flow.state.project_name = "demo"
+    flow.state.status = "executing"
+    flow._build_dir = str(build_dir)
+    monkeypatch.setattr(
+        main.CodebuilderFlow,
+        "_run_final_qa",
+        lambda *_: QAReport(passed=True, integration_notes="deterministic PASS"),
+    )
+    monkeypatch.setattr(main.cc_agent, "run_reviewer", _reviewer)
+    monkeypatch.setattr(main.cc_agent, "run_executor", _executor)
+
+    payload = asyncio.run(flow.finalize())
+
+    assert payload["status"] == "done"
+    assert flow.state.final_qa_repair_attempts == 1
+    assert len(prompts) == 1
+    assert "never calls SapClient.login" in prompts[0]
+
+
+def test_rpa_reviewer_error_fails_closed_without_spending_on_repair(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("CODEBUILDER_HISTORY_ENABLED", "false")
+    build_dir = tmp_path / "output"
+    build_dir.mkdir()
+    (build_dir / "app.py").write_text("x = 1\n")
+    executor_called = False
+
+    async def _reviewer(**_kwargs):
+        raise CCAgentError("review service unavailable")
+
+    async def _executor(**_kwargs):
+        nonlocal executor_called
+        executor_called = True
+        return "unexpected"
+
+    flow = main.CodebuilderFlow()
+    flow.state.plan = Plan.model_validate({**VALID_PLAN, "domain": "rpa"})
+    flow.state.workspace_dir = str(tmp_path)
+    flow.state.project_name = "demo"
+    flow.state.status = "executing"
+    flow._build_dir = str(build_dir)
+    monkeypatch.setattr(
+        main.CodebuilderFlow,
+        "_run_final_qa",
+        lambda *_: QAReport(passed=True, integration_notes="deterministic PASS"),
+    )
+    monkeypatch.setattr(main.cc_agent, "run_reviewer", _reviewer)
+    monkeypatch.setattr(main.cc_agent, "run_executor", _executor)
+
+    payload = asyncio.run(flow.finalize())
+
+    assert payload["status"] == "failed"
+    assert not executor_called
+    assert "review service unavailable" in payload["qa_report"]["integration_notes"]
+    with zipfile.ZipFile(tmp_path / "demo.zip") as archive:
+        assert "demo/CODEBUILDER_REPORT.md" in archive.namelist()
 
 
 def test_final_qa_failure_is_archived_with_report(tmp_path, monkeypatch):

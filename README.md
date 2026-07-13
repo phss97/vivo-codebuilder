@@ -15,7 +15,7 @@ ingest + deterministic preflight ──▶ Claude plan ──▶ HITL approval
                                              Claude build
                                                     │
                                                     ▼
-                                  full deterministic QA + one repair
+                         deterministic QA + RPA wiring review + one repair
                                                     │
                                                     ▼
                                     verified or failed project archive
@@ -41,13 +41,19 @@ Preflight and final QA run the complete applicable project checks:
 - native project MyPy configuration (required for RPA projects);
 - `.env.example` versus Pydantic `BaseSettings` names and prefixes;
 - RPA runtime dependencies (`pyodbc`, Windows-scoped `pywin32`) and console entry-point
-  imports;
-- the full pytest suite, with a configurable 40-minute default timeout.
+  imports plus a safe `--help` smoke run;
+- RPA production wiring: declared settings fields, typed injected dependencies, and
+  externally managed client login/connect lifecycle;
+- the full pytest suite, plus a second RPA pass with `.env.example` active, with a
+  configurable 40-minute default timeout per pass.
 
 All checks run and are aggregated; a passing test suite cannot hide lint, formatting,
-typing, configuration, dependency, or entry-point failures. Final QA covers the whole
-repository in both modes. A normal QA failure permits at most one Claude repair pass by
-default. Builder crashes and exhausted budgets do not trigger repair or another model call.
+typing, configuration, dependency, entry-point, or production-wiring failures. Final QA
+covers the whole repository in both modes. Once deterministic QA passes, RPA jobs receive a
+read-only semantic review of the real entry point, composition root, adapters, secrets, and
+resource cleanup. Concrete review blockers use the same single Claude repair allowance as
+deterministic failures. Non-RPA jobs incur no review call. Builder/reviewer crashes and
+exhausted budgets do not trigger another model call.
 
 Every build directory is archived, even when the builder crashes, the budget is exhausted,
 or QA remains red. These responses keep `status="failed"` and `qa_passed=false`, but still
@@ -104,7 +110,7 @@ See `.env.example` for every setting. The main operational controls are:
 
 | Variable | Default | Purpose |
 |---|---:|---|
-| `CODEBUILDER_MAX_RUN_COST_USD` | unset | Build/repair cost safety cap. |
+| `CODEBUILDER_MAX_RUN_COST_USD` | unset | Build/review/repair cost safety cap. |
 | `CODEBUILDER_MAX_FINAL_QA_REPAIRS` | `1` | Repair attempts after a normal final-QA failure. |
 | `CODEBUILDER_TEST_TIMEOUT_SECONDS` | `2400` | Timeout for each full pytest run. |
 | `CODEBUILDER_PROVISION_PROJECT_ENV` | `true` | Allow project-local `uv sync`. |

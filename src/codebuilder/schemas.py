@@ -77,6 +77,13 @@ class QAReport(StrictOutputModel):
     artifact_urls: list[ArtifactRef] = Field(default_factory=list)
 
 
+class ProductionReview(StrictOutputModel):
+    """Blocker-only semantic review of an RPA package's production wiring."""
+
+    passed: bool
+    issues: list[str] = Field(default_factory=list)
+
+
 class CodebuilderState(FlowState):
     # Caller-supplied session identifier. Decoupled from `id` (= flow_id) on
     # purpose: passing `id` in kickoff inputs would override the auto-generated
@@ -102,6 +109,7 @@ class CodebuilderState(FlowState):
     amend_cycles: int = 0
     preflight_qa_report: QAReport | None = None
     qa_report: QAReport | None = None
+    production_review: ProductionReview | None = None
     final_qa_repair_attempts: int = 0
     patch: str = ""
     zip_path: str = ""

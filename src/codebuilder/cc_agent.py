@@ -16,11 +16,11 @@ import asyncio
 import logging
 import os
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal, cast
 
 from claude_agent_sdk import ClaudeAgentOptions, query
 
-from codebuilder.schemas import Plan
+from codebuilder.schemas import Plan, ProductionReview
 
 log = logging.getLogger(__name__)
 
@@ -45,7 +45,8 @@ SKILLS = ["rpa", "code-review-gate"]
 # bugs (bad model id, bad key, too-long prompt) and retrying just burns credits.
 _TRANSIENT_API_STATUSES = {408, 409, 425, 429, 500, 502, 503, 504, 529}
 
-_EFFORT_LEVELS = {"low", "medium", "high", "xhigh", "max"}
+Effort = Literal["low", "medium", "high", "xhigh", "max"]
+_EFFORT_LEVELS: set[str] = {"low", "medium", "high", "xhigh", "max"}
 
 ProgressCallback = Callable[[Any], None]
 UsageCallback = Callable[[dict], None]
@@ -90,7 +91,7 @@ def _env_float(name: str, default: float) -> float:
         return default
 
 
-def _effort(name: str, default: str) -> str:
+def _effort(name: str, default: Effort) -> Effort:
     val = os.environ.get(name, default)
     if val not in _EFFORT_LEVELS:
         log.warning(
@@ -101,7 +102,7 @@ def _effort(name: str, default: str) -> str:
             default,
         )
         return default
-    return val
+    return cast(Effort, val)
 
 
 # Reasoning effort — the biggest token lever. The CLI's own default is xhigh
@@ -388,13 +389,65 @@ async def run_planner(
     return Plan.model_validate(data)
 
 
+async def run_reviewer(
+    *,
+    cwd: str | Path,
+    prompt: str,
+    budget_usd: float | None = None,
+    on_usage: UsageCallback | None = None,
+    query_fn: Callable[..., Any] = query,
+) -> ProductionReview:
+    """Read-only, blocker-focused semantic review for an RPA build."""
+    stderr_lines: list[str] = []
+    options = ClaudeAgentOptions(
+        cwd=str(cwd),
+        model=EXECUTOR_MODEL,
+        fallback_model=EXECUTOR_FALLBACK_MODEL,
+        effort=EXECUTOR_EFFORT,
+        allowed_tools=["Read", "Grep", "Glob", "Skill"],
+        disallowed_tools=["Write", "Edit", "MultiEdit", "Bash"],
+        permission_mode="default",
+        setting_sources=["project"],
+        skills=SKILLS,
+        output_format={
+            "type": "json_schema",
+            "schema": ProductionReview.model_json_schema(),
+        },
+        stderr=stderr_lines.append,
+    )
+    outcome = await _run_query(
+        label="production_reviewer",
+        options=options,
+        prompt=prompt,
+        query_fn=query_fn,
+        stderr_lines=stderr_lines,
+        on_usage=on_usage,
+        budget_usd=budget_usd,
+    )
+    result = outcome.result
+    if result is None:
+        raise CCAgentError(
+            _with_stderr("production reviewer produced no result message", stderr_lines)
+        )
+    if getattr(result, "subtype", None) == "error_max_structured_output_retries":
+        raise CCAgentError("production reviewer exhausted structured-output retries")
+    data = getattr(result, "structured_output", None)
+    if not data:
+        raise CCAgentError(
+            _with_stderr(
+                "production reviewer returned no structured output", stderr_lines
+            )
+        )
+    return ProductionReview.model_validate(data)
+
+
 async def run_executor(
     *,
     cwd: str | Path,
     prompt: str,
     system_prompt: str | None = None,
     model: str | None = None,
-    effort: str | None = None,
+    effort: Effort | None = None,
     max_turns: int | None = None,
     budget_usd: float | None = None,
     on_message: ProgressCallback | None = None,

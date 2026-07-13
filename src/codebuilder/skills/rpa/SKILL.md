@@ -243,9 +243,27 @@ Antes de concluir, execute a suíte completa no pacote inteiro. Não considere
 - Se o código importar `win32com`, declare `pywin32` com marcador de Windows,
   por exemplo `pywin32>=306; sys_platform == 'win32'`.
 - Cada alvo em `[project.scripts]` deve importar no ambiente do projeto e apontar
-  para um callable real. Valide o comando e o import antes de entregar.
+  para um callable real. Valide o comando, o import e `<comando> --help` antes
+  de entregar; `--help` não pode abrir banco, SAP, CCM ou diretório de rede.
+- Campos de `BaseSettings` são o contrato único de configuração. Adapters não
+  podem acessar nomes alternativos via `getattr` nem receber Settings,
+  SecretProvider, repositórios ou clients como `Any`; use o tipo concreto ou o
+  `Protocol` real para que o MyPy encontre divergências.
+- Segredos são lidos exclusivamente por `SecretProvider.get_secret(nome)`, onde
+  `nome` vem de Settings. Não crie atributos paralelos como `sap_password` no
+  fake quando a implementação real expõe apenas `get_secret`.
+- Se um adapter exige `login/logout` ou `connect/disconnect`, esses métodos fazem
+  parte do `Protocol` e o orquestrador controla o ciclo com cleanup em `finally`,
+  tanto no sucesso quanto na falha.
+- Testes de integração devem atravessar Settings, container/composition root,
+  orquestrador e adapter reais. Substitua somente transportes externos (COM,
+  HTTP, SQL Server, filesystem); um fake do adapter completo não valida o wiring.
+- Testes de Settings usam `Settings(_env_file=None)` por padrão para não ler o
+  `.env` do desenvolvedor. Testes específicos de arquivo devem declarar e
+  controlar explicitamente o arquivo usado.
 - Rode sempre `uv run ruff check .`, `uv run ruff format --check .`, MyPy nativo
-  e a suíte completa de `pytest`.
+  e a suíte completa de `pytest`, inclusive com `.env.example` materializado
+  temporariamente como `.env`.
 
 ---
 

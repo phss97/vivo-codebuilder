@@ -6,7 +6,9 @@ import ast
 import json
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -63,6 +65,16 @@ def _python_files(root: Path) -> list[Path]:
         base = Path(directory)
         files.extend(base / name for name in filenames if name.endswith(".py"))
     return files
+
+
+def _production_python_files(root: Path) -> list[Path]:
+    """Return project source files, excluding tests and generated/build trees."""
+    source_root = root / "src" if (root / "src").is_dir() else root
+    return [
+        path
+        for path in _python_files(source_root)
+        if "tests" not in path.relative_to(source_root).parts
+    ]
 
 
 def artifact_refs(refs: list[dict] | list[ArtifactRef] | None) -> list[ArtifactRef]:
@@ -175,6 +187,166 @@ def _settings_fields(tree: ast.Module) -> list[str]:
     return found
 
 
+def _base_settings_field_names(tree: ast.Module) -> set[str]:
+    """Return Python attribute names declared on Pydantic BaseSettings classes."""
+    fields: set[str] = set()
+    for node in tree.body:
+        if not isinstance(node, ast.ClassDef):
+            continue
+        bases = {
+            base.id if isinstance(base, ast.Name) else base.attr
+            for base in node.bases
+            if isinstance(base, (ast.Name, ast.Attribute))
+        }
+        if "BaseSettings" not in bases:
+            continue
+        for item in node.body:
+            if not isinstance(item, ast.AnnAssign) or not isinstance(
+                item.target, ast.Name
+            ):
+                continue
+            name = item.target.id
+            if name.startswith("_") or name == "model_config":
+                continue
+            if (
+                isinstance(item.annotation, ast.Subscript)
+                and getattr(item.annotation.value, "id", "") == "ClassVar"
+            ):
+                continue
+            fields.add(name)
+    return fields
+
+
+def _is_any(annotation: ast.AST | None) -> bool:
+    return (isinstance(annotation, ast.Name) and annotation.id == "Any") or (
+        isinstance(annotation, ast.Attribute) and annotation.attr == "Any"
+    )
+
+
+def _self_attribute(node: ast.AST) -> str | None:
+    if (
+        isinstance(node, ast.Attribute)
+        and isinstance(node.value, ast.Name)
+        and node.value.id == "self"
+    ):
+        return node.attr
+    return None
+
+
+def check_rpa_production_contract(build_dir: str) -> str:
+    """Catch type-bypassing wiring and unused client lifecycle methods in RPA source."""
+    root = Path(build_dir)
+    parsed: list[tuple[Path, ast.Module]] = []
+    settings_fields: set[str] = set()
+    for path in _production_python_files(root):
+        try:
+            tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        except (OSError, SyntaxError, UnicodeError):
+            continue
+        parsed.append((path, tree))
+        settings_fields.update(_base_settings_field_names(tree))
+
+    failures: list[str] = []
+    lifecycle_classes: list[tuple[Path, str, tuple[str, str]]] = []
+    calls_by_file: dict[Path, set[str]] = {}
+    lifecycle_pairs = (("login", "logout"), ("connect", "disconnect"))
+
+    for path, tree in parsed:
+        relative = path.relative_to(root)
+        calls_by_file[path] = {
+            node.func.attr
+            for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+        }
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call) or not (
+                isinstance(node.func, ast.Name) and node.func.id == "getattr"
+            ):
+                continue
+            if len(node.args) < 2 or not isinstance(node.args[1], ast.Constant):
+                continue
+            attribute = node.args[1].value
+            if not isinstance(attribute, str):
+                continue
+            receiver = _self_attribute(node.args[0])
+            if receiver in {"settings", "_settings"} and settings_fields:
+                if attribute not in settings_fields:
+                    failures.append(
+                        f"{relative}:{node.lineno}: settings field {attribute!r} "
+                        "is not declared by BaseSettings."
+                    )
+
+        for class_node in (n for n in tree.body if isinstance(n, ast.ClassDef)):
+            method_names = {
+                item.name
+                for item in class_node.body
+                if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+            }
+            if any(token in class_node.name.lower() for token in ("client", "adapter")):
+                for pair in lifecycle_pairs:
+                    if set(pair).issubset(method_names):
+                        lifecycle_classes.append((path, class_node.name, pair))
+
+            init = next(
+                (
+                    item
+                    for item in class_node.body
+                    if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and item.name == "__init__"
+                ),
+                None,
+            )
+            if init is None:
+                continue
+            any_parameters = {
+                argument.arg
+                for argument in [*init.args.posonlyargs, *init.args.args]
+                if argument.arg != "self" and _is_any(argument.annotation)
+            }
+            injected: dict[str, str] = {}
+            for item in ast.walk(init):
+                if not isinstance(item, ast.Assign) or not isinstance(
+                    item.value, ast.Name
+                ):
+                    continue
+                if item.value.id not in any_parameters:
+                    continue
+                for target in item.targets:
+                    target_name = _self_attribute(target)
+                    if target_name:
+                        injected[target_name] = item.value.id
+            for item in ast.walk(class_node):
+                if not isinstance(item, ast.Call) or not (
+                    isinstance(item.func, ast.Name) and item.func.id == "getattr"
+                ):
+                    continue
+                dependency = _self_attribute(item.args[0]) if item.args else None
+                if dependency in injected:
+                    failures.append(
+                        f"{relative}:{item.lineno}: injected dependency "
+                        f"{injected[dependency]!r} is typed Any and accessed dynamically; "
+                        "use its real Protocol or concrete contract."
+                    )
+
+    for defining_path, class_name, (open_method, close_method) in lifecycle_classes:
+        external_calls = set().union(
+            *(calls for path, calls in calls_by_file.items() if path != defining_path)
+        )
+        missing = [
+            method
+            for method in (open_method, close_method)
+            if method not in external_calls
+        ]
+        if missing:
+            relative = defining_path.relative_to(root)
+            failures.append(
+                f"{relative}: {class_name} defines {open_method}()/{close_method}() "
+                f"but production source never calls: {', '.join(missing)}."
+            )
+
+    return "PASS" if not failures else "\n".join(dict.fromkeys(failures))
+
+
 def check_env_example(build_dir: str) -> str:
     """Compare documented env keys with names declared by BaseSettings fields."""
     root = Path(build_dir)
@@ -275,7 +447,9 @@ def _source_signals(root: Path) -> tuple[bool, bool]:
     return uses_pyodbc_url, imports_win32com
 
 
-def _check_entry_points(root: Path, pyproject: dict[str, Any]) -> str:
+def _check_entry_points(
+    root: Path, pyproject: dict[str, Any], *, smoke: bool = False
+) -> str:
     scripts = (pyproject.get("project") or {}).get("scripts") or {}
     if not scripts:
         return "SKIP: no [project.scripts] entries"
@@ -286,6 +460,13 @@ def _check_entry_points(root: Path, pyproject: dict[str, Any]) -> str:
         "obj=functools.reduce(getattr, sys.argv[2].split('.'), "
         "importlib.import_module(sys.argv[1])); "
         "assert callable(obj), f'{sys.argv[1]}:{sys.argv[2]} is not callable'"
+    )
+    smoke_code = (
+        "import functools,importlib,sys; "
+        "name,module,target=sys.argv[1:4]; "
+        "obj=functools.reduce(getattr,target.split('.'),importlib.import_module(module)); "
+        "sys.argv=[name,'--help']; result=obj(); "
+        "raise SystemExit(result if isinstance(result,int) else 0)"
     )
     failures: list[str] = []
     for name, target in scripts.items():
@@ -310,6 +491,41 @@ def _check_entry_points(root: Path, pyproject: dict[str, Any]) -> str:
             failures.append(
                 f"{name} ({target}): {output or f'exit {process.returncode}'}"
             )
+            continue
+        if smoke:
+            try:
+                with tempfile.TemporaryDirectory(
+                    prefix="codebuilder-entrypoint-"
+                ) as smoke_cwd:
+                    env = dict(os.environ)
+                    python_path = env.get("PYTHONPATH")
+                    env["PYTHONPATH"] = str(root) + (
+                        os.pathsep + python_path if python_path else ""
+                    )
+                    process = subprocess.run(
+                        [
+                            project_python(str(root)),
+                            "-c",
+                            smoke_code,
+                            name,
+                            module,
+                            callable_name,
+                        ],
+                        cwd=smoke_cwd,
+                        capture_output=True,
+                        text=True,
+                        timeout=30,
+                        env=env,
+                    )
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                failures.append(f"{name} --help: {exc}")
+                continue
+            if process.returncode != 0:
+                output = ((process.stdout or "") + (process.stderr or "")).strip()
+                failures.append(
+                    f"{name} --help ({target}): "
+                    f"{output or f'exit {process.returncode}'}"
+                )
     return (
         "PASS"
         if not failures
@@ -317,7 +533,7 @@ def _check_entry_points(root: Path, pyproject: dict[str, Any]) -> str:
     )
 
 
-def check_runtime_contract(build_dir: str) -> str:
+def check_runtime_contract(build_dir: str, smoke_entry_points: bool = False) -> str:
     """Validate dependency declarations and installed console entry points."""
     root = Path(build_dir)
     pyproject, load_note = _load_pyproject(root)
@@ -347,10 +563,37 @@ def check_runtime_contract(build_dir: str) -> str:
             failures.append(
                 "`pywin32` must be scoped to Windows with a `sys_platform == 'win32'` marker."
             )
-    entry_points = _check_entry_points(root, pyproject)
+    entry_points = _check_entry_points(root, pyproject, smoke=smoke_entry_points)
     if not is_pass(entry_points) and not is_skip(entry_points):
         failures.append(entry_points)
     return "PASS" if not failures else "\n".join(failures)
+
+
+def _run_with_example_env(build_dir: str) -> str:
+    """Run tests with .env.example active, restoring the workspace afterward."""
+    root = Path(build_dir)
+    env_path = root / ".env"
+    example_path = root / ".env.example"
+    if env_path.exists():
+        return "SKIP: existing .env was already active during the main pytest run"
+    if not example_path.is_file():
+        return "SKIP: no .env.example"
+    output = ""
+    cleanup_error = ""
+    try:
+        shutil.copyfile(example_path, env_path)
+        output = TestRunnerTool(
+            workspace_dir=build_dir,
+            provision_environment=False,
+        )._run(".")
+    except OSError as exc:
+        output = f"Could not activate .env.example for tests: {exc}"
+    finally:
+        try:
+            env_path.unlink(missing_ok=True)
+        except OSError as exc:
+            cleanup_error = f"Could not remove temporary .env after tests: {exc}"
+    return "\n".join(part for part in (output, cleanup_error) if part)
 
 
 def run_final_qa(
@@ -384,14 +627,32 @@ def run_final_qa(
 
     env_output = check_env_example(build_dir)
     env_ok = is_pass(env_output)
-    runtime_output = check_runtime_contract(build_dir)
+    runtime_output = check_runtime_contract(build_dir, require_typecheck)
     runtime_ok = is_pass(runtime_output) or is_skip(runtime_output)
+
+    wiring_output = (
+        check_rpa_production_contract(build_dir)
+        if require_typecheck
+        else "SKIP: not RPA"
+    )
+    wiring_ok = is_pass(wiring_output) or is_skip(wiring_output)
 
     test_output = TestRunnerTool(
         workspace_dir=build_dir,
         provision_environment=False,
     )._run(".")
     test_ok = is_pass(test_output)
+    example_env_test_output = (
+        _run_with_example_env(build_dir) if require_typecheck else "SKIP: not RPA"
+    )
+    example_env_test_ok = is_pass(example_env_test_output) or is_skip(
+        example_env_test_output
+    )
+    combined_test_output = test_output
+    if require_typecheck:
+        combined_test_output = (
+            f"{test_output}\n\n.env.example environment:\n{example_env_test_output}"
+        )
 
     checks = [
         f"uv sync --locked: {'PASS' if not sync_output else 'FAIL'}",
@@ -399,7 +660,9 @@ def run_final_qa(
         f"mypy: {'PASS' if type_ok else 'FAIL'}",
         f".env.example consistency: {'PASS' if env_ok else 'FAIL'}",
         f"runtime dependencies and entry points: {'PASS' if runtime_ok else 'FAIL'}",
+        f"RPA production wiring: {'PASS' if wiring_ok else 'FAIL'}",
         f"pytest: {'PASS' if test_ok else 'FAIL'}",
+        f"pytest with .env.example: {'PASS' if example_env_test_ok else 'FAIL'}",
     ]
     details: list[str] = []
     if sync_output:
@@ -410,13 +673,28 @@ def run_final_qa(
         details.append(f"Configuration contract:\n{env_output}")
     if not runtime_ok:
         details.append(f"Runtime contract:\n{runtime_output}")
+    if not wiring_ok:
+        details.append(f"RPA production wiring:\n{wiring_output}")
+    if not example_env_test_ok:
+        details.append(
+            "Pytest with .env.example:\n" + truncate(example_env_test_output)
+        )
     notes = "\n".join([*checks, *details])
 
     return QAReport(
-        passed=sync_ok and lint_ok and type_ok and env_ok and runtime_ok and test_ok,
+        passed=(
+            sync_ok
+            and lint_ok
+            and type_ok
+            and env_ok
+            and runtime_ok
+            and wiring_ok
+            and test_ok
+            and example_env_test_ok
+        ),
         lint_output=truncate(lint_output),
         type_output=truncate(type_output),
-        test_output=truncate(test_output),
+        test_output=truncate(combined_test_output),
         integration_notes=truncate(notes),
         artifact_urls=artifact_refs(artifact_urls),
     )
