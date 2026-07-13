@@ -72,7 +72,6 @@ class QAReport(StrictOutputModel):
     passed: bool
     lint_output: str = ""
     test_output: str = ""
-    # Kept for completion-payload compatibility; unused by the light QA path.
     type_output: str = ""
     integration_notes: str = ""
     artifact_urls: list[ArtifactRef] = Field(default_factory=list)
@@ -101,6 +100,7 @@ class CodebuilderState(FlowState):
     plan: Plan | None = None
     amendments: str = ""
     amend_cycles: int = 0
+    preflight_qa_report: QAReport | None = None
     qa_report: QAReport | None = None
     final_qa_repair_attempts: int = 0
     patch: str = ""

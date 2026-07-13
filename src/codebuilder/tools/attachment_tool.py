@@ -68,13 +68,27 @@ def materialize(attachments: list[dict], workspace_dir: str) -> list[dict]:
                 dest = inputs_dir / dest_name
             git_tool.clone(url, str(dest))
             origin = _sanitized_git_origin(url) or "(private source)"
-            records.append({"kind": "git", "name": name, "path": str(dest.relative_to(workspace_dir)), "summary": f"git repo cloned from {origin}"})
+            records.append(
+                {
+                    "kind": "git",
+                    "name": name,
+                    "path": str(dest.relative_to(workspace_dir)),
+                    "summary": f"git repo cloned from {origin}",
+                }
+            )
         elif kind == "zip":
             data = base64.b64decode(att.get("content_b64", ""))
             extract_to = inputs_dir / (Path(name).stem or "archive")
             extract_to.mkdir(parents=True, exist_ok=True)
             _extract_zip_safely(data, extract_to)
-            records.append({"kind": "zip", "name": name, "path": str(extract_to.relative_to(workspace_dir)), "summary": f"extracted {name}"})
+            records.append(
+                {
+                    "kind": "zip",
+                    "name": name,
+                    "path": str(extract_to.relative_to(workspace_dir)),
+                    "summary": f"extracted {name}",
+                }
+            )
         elif kind == "pdf":
             data = base64.b64decode(att.get("content_b64", ""))
             pdf_path = inputs_dir / name
@@ -87,12 +101,26 @@ def materialize(attachments: list[dict], workspace_dir: str) -> list[dict]:
                 text = f"(failed to extract PDF text: {exc})"
             txt_path = pdf_path.with_suffix(".txt")
             txt_path.write_text(text, encoding="utf-8")
-            records.append({"kind": "pdf", "name": name, "path": str(pdf_path.relative_to(workspace_dir)), "summary": f"PDF with {len(text)} chars of text"})
+            records.append(
+                {
+                    "kind": "pdf",
+                    "name": name,
+                    "path": str(pdf_path.relative_to(workspace_dir)),
+                    "summary": f"PDF with {len(text)} chars of text",
+                }
+            )
         elif kind == "image":
             data = base64.b64decode(att.get("content_b64", ""))
             img_path = inputs_dir / name
             img_path.write_bytes(data)
-            records.append({"kind": "image", "name": name, "path": str(img_path.relative_to(workspace_dir)), "summary": f"image ({len(data)} bytes)"})
+            records.append(
+                {
+                    "kind": "image",
+                    "name": name,
+                    "path": str(img_path.relative_to(workspace_dir)),
+                    "summary": f"image ({len(data)} bytes)",
+                }
+            )
         else:
             continue
 

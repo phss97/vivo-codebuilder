@@ -33,6 +33,8 @@ def _run_tool_module(
     args: list[str],
     workspace_dir: str,
     timeout: int = 120,
+    *,
+    provision_environment: bool = True,
 ) -> tuple[int, str]:
     """Run ``python -m <module>`` preferring the project's own venv.
 
@@ -44,11 +46,20 @@ def _run_tool_module(
     appears when ``-m`` itself fails; import errors inside test runs quote the
     module name, so they don't trigger the fallback.
     """
-    ensure_project_env(workspace_dir)
+    if provision_environment:
+        ensure_project_env(workspace_dir)
     interpreter = project_python(workspace_dir)
-    code, out = _run([interpreter, "-m", module, *args], cwd=workspace_dir, timeout=timeout)
-    if interpreter != sys.executable and f"No module named {module}" in out:
-        code, out = _run([sys.executable, "-m", module, *args], cwd=workspace_dir, timeout=timeout)
+    code, out = _run(
+        [interpreter, "-m", module, *args], cwd=workspace_dir, timeout=timeout
+    )
+    if (
+        provision_environment
+        and interpreter != sys.executable
+        and f"No module named {module}" in out
+    ):
+        code, out = _run(
+            [sys.executable, "-m", module, *args], cwd=workspace_dir, timeout=timeout
+        )
     return code, out
 
 
@@ -61,7 +72,9 @@ _PYTHON_SUFFIXES = {".py", ".pyi"}
 
 # "SKIP: <reason>" signals the reviewer that the tool was unavailable rather
 # than that the code is broken.
-_SKIP_MISSING_MODULE = "SKIP: {module} not installed in the runtime; review logic manually."
+_SKIP_MISSING_MODULE = (
+    "SKIP: {module} not installed in the runtime; review logic manually."
+)
 
 
 class _LintInput(BaseModel):
@@ -71,11 +84,12 @@ class _LintInput(BaseModel):
 class LintRunnerTool(BaseTool):
     name: str = "lint_runner"
     description: str = (
-        "Run ruff check on a path in the workspace and return the output. "
+        "Run ruff lint and format checks on a path in the workspace. "
         "Returns 'PASS' if clean, otherwise the ruff report."
     )
     args_schema: Type[BaseModel] = _LintInput
     workspace_dir: str
+    provision_environment: bool = True
 
     def _run(self, path: str = ".") -> str:
         try:
@@ -88,12 +102,26 @@ class LintRunnerTool(BaseTool):
             "ruff",
             ["check", str(target)],
             self.workspace_dir,
+            provision_environment=self.provision_environment,
         )
-        if code == 0:
-            return "PASS"
         if "No module named ruff" in out:
             return _SKIP_MISSING_MODULE.format(module="ruff")
-        return out or f"ruff exit {code}"
+        failures: list[str] = []
+        if code != 0:
+            failures.append(f"ruff check:\n{out or f'ruff exit {code}'}")
+        format_code, format_out = _run_tool_module(
+            "ruff",
+            ["format", "--check", str(target)],
+            self.workspace_dir,
+            provision_environment=self.provision_environment,
+        )
+        if "No module named ruff" in format_out:
+            return _SKIP_MISSING_MODULE.format(module="ruff")
+        if format_code != 0:
+            failures.append(
+                f"ruff format --check:\n{format_out or f'ruff exit {format_code}'}"
+            )
+        return "\n\n".join(failures) if failures else "PASS"
 
 
 class _TypeCheckInput(BaseModel):
@@ -123,11 +151,8 @@ def _write_mypy_config(workspace_dir: str) -> str:
     pydantic model construction as missing all fields and emits bogus
     ``call-arg`` errors on correct code (the BaseSettings false positive).
     """
-    # follow_imports = silent: dependencies are analyzed for type info but only
-    # the files passed as targets report errors. This makes patch-mode scoping
-    # real (a changed file is checked against unchanged deps without failing on
-    # the deps' pre-existing debt) and is a no-op for new_project, where the whole
-    # package is the target.
+    # follow_imports = silent keeps this compatibility mode focused on the
+    # explicit target. Strict package QA uses native_config=True instead.
     lines = ["[mypy]", "ignore_missing_imports = True", "follow_imports = silent"]
     if _module_importable(workspace_dir, "pydantic"):
         lines.append("plugins = pydantic.mypy")
@@ -145,6 +170,8 @@ class TypeCheckRunnerTool(BaseTool):
     )
     args_schema: Type[BaseModel] = _TypeCheckInput
     workspace_dir: str
+    native_config: bool = False
+    provision_environment: bool = True
 
     def _run(self, path: str = ".") -> str:
         try:
@@ -154,28 +181,32 @@ class TypeCheckRunnerTool(BaseTool):
         if target.is_file() and target.suffix not in _PYTHON_SUFFIXES:
             return "PASS"
         # ensure the env first so pydantic-plugin detection sees the project venv.
-        ensure_project_env(self.workspace_dir)
-        config = _write_mypy_config(self.workspace_dir)
+        if self.provision_environment:
+            ensure_project_env(self.workspace_dir)
+        config = None if self.native_config else _write_mypy_config(self.workspace_dir)
+        args = [
+            "--no-error-summary",
+            "--hide-error-context",
+            "--no-color-output",
+            "--no-pretty",
+            str(target),
+        ]
+        if config:
+            args[0:0] = ["--config-file", config]
         try:
             code, out = _run_tool_module(
                 "mypy",
-                [
-                    "--config-file",
-                    config,
-                    "--no-error-summary",
-                    "--hide-error-context",
-                    "--no-color-output",
-                    "--no-pretty",
-                    str(target),
-                ],
+                args,
                 self.workspace_dir,
                 timeout=180,
+                provision_environment=self.provision_environment,
             )
         finally:
-            try:
-                os.unlink(config)
-            except OSError:
-                pass
+            if config:
+                try:
+                    os.unlink(config)
+                except OSError:
+                    pass
         if "No module named mypy" in out:
             return _SKIP_MISSING_MODULE.format(module="mypy")
         if code == 0:
@@ -189,36 +220,40 @@ class _TestInput(BaseModel):
 
 class TestRunnerTool(BaseTool):
     name: str = "test_runner"
-    description: str = (
-        "Run pytest against a path in the workspace. Returns 'PASS' or the pytest output."
-    )
+    description: str = "Run pytest against a path in the workspace. Returns 'PASS' or the pytest output."
     args_schema: Type[BaseModel] = _TestInput
     workspace_dir: str
+    provision_environment: bool = True
 
     def _run(self, path: str = ".") -> str:
         try:
             target = resolve_within(self.workspace_dir, path)
         except ValueError as exc:
             return f"ERROR: {exc}"
-        # The runner owns its flags. A target project's pyproject may declare
-        # addopts requiring plugins not installed here (e.g. --cov needs
-        # pytest-cov), which crashes pytest at arg parsing before any test runs.
+        # Keep the project's native pytest configuration (including coverage
+        # gates), but disable fail-fast so the report covers the full suite.
+        raw_timeout = os.environ.get("CODEBUILDER_TEST_TIMEOUT_SECONDS", "2400")
+        try:
+            timeout = max(1, int(raw_timeout))
+        except ValueError:
+            timeout = 2400
         code, out = _run_tool_module(
             "pytest",
             [
                 "-q",
                 "--no-header",
-                "--override-ini=addopts=",
+                "--maxfail=0",
                 str(target),
             ],
             self.workspace_dir,
-            timeout=300,
+            timeout=timeout,
+            provision_environment=self.provision_environment,
         )
         if code == 0:
             return "PASS\n" + out
         if "No module named pytest" in out:
             return _SKIP_MISSING_MODULE.format(module="pytest")
-        # pytest exits 5 when no tests are collected — not a failure.
+        # Let package QA decide whether no collected tests are acceptable.
         if code == 5:
             return "SKIP: no tests collected under this path."
         return out or f"pytest exit {code}"

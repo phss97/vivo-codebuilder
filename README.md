@@ -1,145 +1,146 @@
-# codebuilder
+# CodeBuilder
 
-A CrewAI **Flow** that turns a project brief into working code. It plans the work with a human-in-the-loop (HITL) gate, builds the code in an isolated per-job workspace, and reviews every artifact through deterministic checks plus a domain architecture gate (dispatched on `plan.domain`; e.g. `rpa`).
+CodeBuilder is a CrewAI Flow that turns a brief and optional project attachment into a
+reviewable plan, pauses for human approval, and delegates implementation to Claude Code
+agents. CrewAI provides the AMP/HITL lifecycle; one Claude planner and one Claude executor
+perform the planning and coding.
 
+```text
+brief + attachment
+        │
+        ▼
+ingest + deterministic preflight ──▶ Claude plan ──▶ HITL approval
+                                                    │
+                                                    ▼
+                                             Claude build
+                                                    │
+                                                    ▼
+                                  full deterministic QA + one repair
+                                                    │
+                                                    ▼
+                                    verified or failed project archive
 ```
-brief.json ──▶ ingest ──▶ plan ──▶ [HITL approve/amend/reject]
-                                         │
-                                         ▼
-                          build (writer ↔ reviewer loop) ──▶ finalize (QA + history)
-```
 
-Two modes:
+Two modes are supported:
 
-- **`new_project`** — agents scaffold a fresh project under `workspaces/<session_id>/output/` and `git init` it.
-- **`patch_existing`** — the Git or zip attachment is materialized under `workspaces/<session_id>/inputs/`, agents edit the resolved project root in place, a diff is captured, and the complete repaired project is zipped even when final QA still reports failures.
+- `new_project`: build in `workspaces/<session_id>/output/`.
+- `patch_existing`: materialize a Git/zip attachment under `inputs/`, resolve its project
+  root, edit it in place, return its diff, and archive the complete project.
 
-## Requirements
+## Quality contract
+
+When an attached project can be resolved, CodeBuilder runs preflight QA before planning.
+Failures are non-terminal and are included, with bounded per-category output, in both the
+planner and executor prompts. This lets the approved plan address observed defects instead
+of discovering them after the build.
+
+Preflight and final QA run the complete applicable project checks:
+
+- `uv sync --locked` for installable Python projects;
+- `ruff check .` and `ruff format --check .`;
+- native project MyPy configuration (required for RPA projects);
+- `.env.example` versus Pydantic `BaseSettings` names and prefixes;
+- RPA runtime dependencies (`pyodbc`, Windows-scoped `pywin32`) and console entry-point
+  imports;
+- the full pytest suite, with a configurable 40-minute default timeout.
+
+All checks run and are aggregated; a passing test suite cannot hide lint, formatting,
+typing, configuration, dependency, or entry-point failures. Final QA covers the whole
+repository in both modes. A normal QA failure permits at most one Claude repair pass by
+default. Builder crashes and exhausted budgets do not trigger repair or another model call.
+
+Every build directory is archived, even when the builder crashes, the budget is exhausted,
+or QA remains red. These responses keep `status="failed"` and `qa_passed=false`, but still
+return `project_archive`, `zip_path`/`zip_url`, artifacts, and a patch when available. Failed
+archives contain a deterministic `CODEBUILDER_REPORT.md` with the reason, changed files,
+preflight/final results, repair count, approved plan, and remaining work. The report is
+injected into the zip and is not written into the customer source tree. Successful archives
+do not contain it.
+
+## Requirements and setup
 
 - Python `>=3.10, <3.14`
-- [`uv`](https://docs.astral.sh/uv/) for dependency management
-- An OpenAI API key
-
-## Setup
+- [`uv`](https://docs.astral.sh/uv/)
+- `ANTHROPIC_API_KEY` for the Claude Agent SDK
+- `OPENAI_API_KEY` only when using the default OpenAI HITL classifier
 
 ```bash
-# Install deps
-uv sync
-
-# Configure environment
+uv sync --locked
 cp .env.example .env
-# then edit .env and fill in OPENAI_API_KEY
+uv run pytest -q
+uv run ruff check src tests
+uv run ruff format --check src tests
 ```
 
-Optional environment variables (see `.env.example`):
+CrewAI remains pinned in `pyproject.toml`; dependency upgrades are deliberate changes, not
+part of generated-project remediation.
 
-| Variable | Default | Purpose |
-|---|---|---|
-| `OPENAI_API_KEY` | — | Required for the default OpenAI models. |
-| `ANTHROPIC_API_KEY` | — | Required only when changing `agents.yaml` to an `anthropic/...` model. |
-| `CODEBUILDER_WORKSPACE_ROOT` | `./workspaces` | Where each job's `inputs/`/`output/` lives. |
-| `CODEBUILDER_HISTORY_DB` | `./data/codebuilder_history.db` | Per-project history SQLite log. |
-| `CODEBUILDER_APPROVAL_WEBHOOK` | *(unset)* | POST target for HITL plan approvals. Falls back to a console prompt when unset. |
-| Agent model settings | `agents.yaml` | Planner/writer/reviewer models and reasoning/planning settings live in each crew's YAML. Edit YAML instead of using Python env override plumbing. |
-| `CODEBUILDER_GUARDRAIL_LLM` | `openai/gpt-5.4-mini` | Override the model used by the `@human_feedback` guardrail when classifying user replies. |
-| `CODEBUILDER_MAX_SUBTASK_RETRIES` | `3` | Per-subtask writer retry count after deterministic/reviewer failure. Total attempts are initial write + this retry count. |
-| `CODEBUILDER_MAX_FINAL_QA_REPAIRS` | `1` for `patch_existing`, `2` for `new_project` | Whole-workspace repair attempts after final QA failure. |
-| `CODEBUILDER_PATCH_TEST_SCOPE` | full when tests exist | Patch jobs run the full pytest suite when test files exist. With no test files, no-tests collection is a non-blocking warning. |
-| `CODEBUILDER_PROGRESS_WEBHOOK` | *(unset)* | Optional best-effort progress callback after subtasks and final QA. |
-| `CODEBUILDER_PROGRESS_WEBHOOK_SECRET` | *(unset)* | Optional shared secret sent as `X-Codebuilder-Progress-Secret`. |
-| `CODEBUILDER_UPLOAD_FILE_ARTIFACTS` | `false` for `patch_existing`, `true` otherwise | Upload individual file artifacts in addition to the project archive. Keep disabled for patch jobs unless callers need per-file inspection URLs. |
+## Inputs and execution
 
-## Running a job
-
-Inputs are passed as top-level keys to `CodebuilderFlow().kickoff(inputs={...})`. The flow expects:
+Call `CodebuilderFlow().kickoff(inputs={...})` with:
 
 | Input | Type | Notes |
 |---|---|---|
-| `session_id` | str | Caller-controlled UI/session id. Names the workspace and webhook correlation key. Do not pass `id`; `state.id` is the CrewAI flow id/resume token. |
-| `project_name` | str | Display name; also keys per-project history when no git attachment is present. |
-| `brief` | str | Free-text description of the project. |
-| `goals` | list[str] | High-level goals. |
-| `tech_stack` | list[str] | Languages / libraries. |
-| `attachments` | list[Attachment] | Each entry is `git` (cloned), `zip` / `pdf` / `image` (base64 or path). |
-
-### Entrypoints
+| `session_id` | `str` | Caller/UI identity and workspace key. Never pass `id`; CrewAI owns `state.id`. |
+| `project_name` | `str` | Display name and history fallback key. |
+| `brief` | `str` | Requested behavior and acceptance criteria. |
+| `goals` | `list[str]` | High-level goals. |
+| `tech_stack` | `list[str]` | Technology hints. |
+| `attachments` | `list[Attachment]` | Git, zip, PDF, or image inputs. |
+| `language` | `str` | Optional output-language override. |
 
 ```bash
-# Start a new job with the hardcoded test inputs from src/codebuilder/main.py::kickoff()
-uv run kickoff
-
-# Render the flow graph
-uv run plot          # writes codebuilder_flow.html
+uv run kickoff  # local hardcoded smoke input
+uv run plot     # render the Flow graph
 ```
 
-For programmatic kickoff (HTTP handlers, codebuilder-web, AMP), call `codebuilder.main.kickoff()` after editing the inputs in that function, or call `CodebuilderFlow().kickoff(inputs={...})` directly with your own dict.
+The plan pauses at `@human_feedback`. With `CODEBUILDER_APPROVAL_WEBHOOK`, the provider
+posts the pending approval and the caller later invokes `codebuilder.main.resume(job_id,
+feedback)`. Without a webhook, the provider uses the console.
 
-### HITL approval
+## Important configuration
 
-After the planner runs, the flow pauses and either:
+See `.env.example` for every setting. The main operational controls are:
 
-- POSTs the plan to `$CODEBUILDER_APPROVAL_WEBHOOK` and returns — your webhook later calls `codebuilder.main.resume(job_id, feedback)` (e.g. `from codebuilder.main import resume; resume("…", "approved")`) once a human responds, **or**
-- (no webhook configured) prompts on the console for `approved` / `amend: …` / `rejected: …`.
+| Variable | Default | Purpose |
+|---|---:|---|
+| `CODEBUILDER_MAX_RUN_COST_USD` | unset | Build/repair cost safety cap. |
+| `CODEBUILDER_MAX_FINAL_QA_REPAIRS` | `1` | Repair attempts after a normal final-QA failure. |
+| `CODEBUILDER_TEST_TIMEOUT_SECONDS` | `2400` | Timeout for each full pytest run. |
+| `CODEBUILDER_PROVISION_PROJECT_ENV` | `true` | Allow project-local `uv sync`. |
+| `CODEBUILDER_WORKSPACE_ROOT` | `./workspaces` | Per-job workspace root. |
+| `CODEBUILDER_HISTORY_ENABLED` | `true` | Enable project-history observations. |
+| `CODEBUILDER_APPROVAL_WEBHOOK` | unset | HITL notification target. |
+| `CODEBUILDER_PROGRESS_WEBHOOK` | unset | Best-effort progress callback. |
+| `CODEBUILDER_ARTIFACT_BUCKET` | unset | S3 artifact/archive bucket. |
 
-`amend` loops back through the planner with the prior plan + the amendment and gates again.
+## Completion contract
 
-### Completion payload
+Consumers must gate on `qa_passed` or `qa_report.passed`, never on archive presence.
 
-Completion payloads distinguish the project archive from file-level audit artifacts. Failed QA payloads can still include the archive plus a Markdown QA report so users can salvage or resubmit the package with concrete failure context.
+- `project_archive`: primary complete-package deliverable, local path and optional URL.
+- `zip_path` / `zip_url`: backward-compatible aliases.
+- `artifact_urls`: uploaded archive and optional per-file artifacts.
+- `patch`: audit diff for `patch_existing`.
+- `preflight_qa_report`: original attached-project QA evidence when preflight ran.
+- `qa_report` / `qa_report_markdown`: final deterministic results.
+- `final_qa_repair_attempts`: number of repair model calls.
 
-- `project_archive` — primary package deliverable for both `new_project` and `patch_existing`; contains the local archive path and, when S3 upload is enabled, the downloadable URL. Check `qa_passed` before treating it as verified.
-- `zip_path` / `zip_url` — backward-compatible aliases for the same archive.
-- `artifact_urls` — the archive and, when per-file uploads are enabled, individual uploaded files. These are useful for inspection, but callers should use `project_archive` / `zip_url` when they need a runnable project.
-- `patch` — diff for `patch_existing` jobs only. It is an audit/review aid, not the primary runnable deliverable.
-- `qa_report_markdown` — deterministic Markdown summary of failed lint/type/test/subtask issues and a copyable next-fix request.
+## Repository layout
 
-Failed QA payloads return `status="failed"` and `qa_passed=false` even when `project_archive`, `zip_path`, `zip_url`, or archive entries in `artifact_urls` are present. Callers must treat `qa_passed` / `qa_report.passed` as the safety signal.
-
-### Patch QA contract
-
-For `patch_existing`, Codebuilder runs deterministic preflight QA against the attached project before planning when the project root can be resolved. The truncated preflight `QAReport` is planner context, so patch plans must be grounded in concrete lint/type/test output rather than speculative diagnostic tasks.
-
-Patch plans must name real production, test, or build target files. Placeholder paths such as `FILES_TO_BE_DETERMINED_BY_*`, `TESTS_TO_BE_DETERMINED_BY_*`, `TBD`, and `PLACEHOLDER` are rejected, and diagnostic-only RPA/code plans are invalid.
-
-Final QA is package-level. When tests exist, patch jobs run the full pytest suite even if lint/type gates fail first, so repair receives real acceptance-test failures too. With no test files, "no tests collected" is a non-blocking warning. The type gate includes generated tests so drift between tests and production APIs fails QA.
-
-## Project layout
-
-```
+```text
 src/codebuilder/
-├── main.py                 # CodebuilderFlow: ingest → plan → build → finalize
-├── runtime_qa.py           # Deterministic review, final QA, and domain architecture gate registry
-├── schemas.py              # Plan, SubTask, CodeBundleArtifact, CodeArtifact, ReviewResult, QAReport, …
-├── history.py              # Per-project SQLite history (observability only)
-├── feedback_provider.py    # WebhookFeedbackProvider + ConsoleProvider fallback
-├── crews/
-│   ├── planner_crew/       # FileRead + DirectoryRead; produces a Plan
-│   ├── writer_crew/        # Workspace tools only; produces CodeBundleArtifact bundles
-│   └── reviewer_crew/      # Lint/test + read/list; fallback review + QA task
-├── tools/
-│   ├── workspace_tool.py   # Sandboxed read/write/list within a job workspace
-│   ├── lint_runner_tool.py # ruff check + pytest -q
-│   ├── git_tool.py         # clone / init+commit / diff
-│   └── attachment_tool.py  # Materialise brief attachments into inputs/
-└── skills/                 # CrewAI skills: rpa (canonical RPA standard) + code-review-gate (domain-agnostic)
+├── cc_agent.py             # Claude planner/executor SDK wrappers and cost controls
+├── main.py                 # CrewAI Flow, prompts, salvage packaging, completion payload
+├── runtime_qa.py           # Package QA and deterministic config/runtime checks
+├── schemas.py              # Plan, state, QA, and artifact contracts
+├── history.py              # Best-effort per-project SQLite history
+├── feedback_provider.py    # Webhook/console HITL provider
+├── tools/                  # Project env, QA runners, git, attachments, S3
+└── skills/                 # Claude rpa and code-review-gate skills
+tests/                      # Flow, QA, security, and artifact regressions
 ```
 
-Cross-run context comes from a `project_history` SQLite table — a summary of past runs (mode, files touched, reviewer issues, QA notes) is fed to the planner on every new run against the same project.
-
-## Dev commands
-
-```bash
-uv run ruff check src
-uv run pytest -q
-uv add <pkg>                 # prefer this over hand-editing pyproject
-```
-
-## Notes
-
-- Workspaces, history DB, and the local `.env` are gitignored — see `.gitignore`.
-- All file I/O from agents is routed through `Workspace*Tool`, which enforces that relative paths cannot escape the job workspace. Never give agents a raw `FileReadTool` pointed at a real filesystem path.
-- Final QA runs deterministic `ruff`, mypy symbol-drift checks, `.env.example` consistency checks, and pytest. Patch jobs lint/type changed files and run the full pytest suite when tests exist; pytest still runs when lint/type fails so repair gets the real failures.
-- Patch jobs plan and report only changed files, but the user-facing deliverable is the complete repaired project archive. Consumers must not reconstruct a project from changed-file artifacts.
-- Patch jobs feed planner/writer crews compact attachment records and scoped parent-directory listings, not a full recursive repository tree.
-- New-project jobs whose plan declares a `domain` (e.g. `rpa`) also run that domain's architecture gate before completion. For `rpa`, missing orchestrator/producer/consumer, Clean Architecture layers, `.env.example`/CCM config, tests, or traceability marks the job failed even if lint/tests pass. Plans without a registered `domain` finalize on lint/test alone.
-- Crew outputs are validated through pydantic schemas with guardrails (e.g. the planner's `Plan` must have 1–24 bundled work packages, each with 1–8 planned files and non-empty `test_criteria`; deterministic review rejects placeholder paths, diagnostic-only plans, missing/extra bundle paths, and placeholder/TODO-only files).
+Keep `plan`, `revise_plan`, `build`, and `finalize` asynchronous: AMP resumes them inside an
+existing event loop. Preserve `session_id` versus CrewAI `state.id`, and keep `.claude/`,
+virtual environments, caches, and Git metadata out of diffs and archives.

@@ -29,7 +29,9 @@ def _ensure_harness_excludes(repo: Repo) -> None:
     if not missing:
         return
     prefix = "" if not existing or existing.endswith("\n") else "\n"
-    exclude_path.write_text(existing + prefix + "\n".join(missing) + "\n", encoding="utf-8")
+    exclude_path.write_text(
+        existing + prefix + "\n".join(missing) + "\n", encoding="utf-8"
+    )
 
 
 def clone(url: str, dest: str) -> str:

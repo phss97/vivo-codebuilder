@@ -23,7 +23,9 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-DB_PATH = Path(os.environ.get("CODEBUILDER_HISTORY_DB", "./data/codebuilder_history.db")).resolve()
+DB_PATH = Path(
+    os.environ.get("CODEBUILDER_HISTORY_DB", "./data/codebuilder_history.db")
+).resolve()
 MAX_HISTORY_PATCH_CHARS = 50_000
 
 
@@ -32,7 +34,9 @@ def _enabled() -> bool:
     (e.g. CrewAI AMP) where the local SQLite file is wiped between invocations.
     Default true so local development keeps working unchanged.
     """
-    return os.environ.get("CODEBUILDER_HISTORY_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+    return os.environ.get(
+        "CODEBUILDER_HISTORY_ENABLED", "true"
+    ).strip().lower() not in {"0", "false", "no", "off"}
 
 
 _SCHEMA = """
@@ -136,7 +140,11 @@ def record(state: "CodebuilderState") -> None:
 
     plan_json = state.plan.model_dump_json() if state.plan else None
     qa_json = _qa_json_for_history(state)
-    mode = state.plan.mode if state.plan else ("patch_existing" if plan_json else "new_project")
+    mode = (
+        state.plan.mode
+        if state.plan
+        else ("patch_existing" if plan_json else "new_project")
+    )
     # The executor writes files directly; we no longer track per-file artifacts
     # or reviewer issues, so these history columns stay empty. QA notes + patch
     # diff carry the run's signal.
@@ -165,7 +173,8 @@ def record(state: "CodebuilderState") -> None:
                 """,
                 (
                     state.project_key,
-                    state.project_name or (state.plan.project_name if state.plan else ""),
+                    state.project_name
+                    or (state.plan.project_name if state.plan else ""),
                     state.id,
                     mode,
                     datetime.now(timezone.utc).isoformat(),

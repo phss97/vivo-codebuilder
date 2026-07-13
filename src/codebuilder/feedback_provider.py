@@ -47,7 +47,9 @@ class WebhookFeedbackProvider(HumanFeedbackProvider):
             "flow_class": context.flow_class,
             "method_name": context.method_name,
             "message": context.message,
-            "method_output": PendingFeedbackContext._make_json_safe(context.method_output),
+            "method_output": PendingFeedbackContext._make_json_safe(
+                context.method_output
+            ),
             "outcomes": list(context.emit or []),
             "default_outcome": context.default_outcome,
         }

@@ -219,7 +219,7 @@ Lint e formatação.
 
 ```bash
 uv run ruff check .
-uv run ruff format .
+uv run ruff format --check .
 ```
 
 ### 7.4. `mypy`
@@ -229,6 +229,23 @@ Verificação estática de tipos. Toda função pública tem type hints.
 ```bash
 uv run mypy src/
 ```
+
+### 7.5. Contratos de configuração e runtime
+
+Antes de concluir, execute a suíte completa no pacote inteiro. Não considere
+`pytest` verde suficiente se lint, formatação ou MyPy ainda falharem.
+
+- Rode `uv sync --locked`; mantenha `uv.lock` atualizado e versionado.
+- Todo nome documentado em `.env.example` deve corresponder ao nome efetivo do
+  `BaseSettings`, incluindo `env_prefix`. Exemplo: `env_prefix="TERRA_"` e campo
+  `db_url` exigem `TERRA_DB_URL`, não `DB_URL`.
+- Se uma URL `mssql+pyodbc` for usada, declare `pyodbc` nas dependências de runtime.
+- Se o código importar `win32com`, declare `pywin32` com marcador de Windows,
+  por exemplo `pywin32>=306; sys_platform == 'win32'`.
+- Cada alvo em `[project.scripts]` deve importar no ambiente do projeto e apontar
+  para um callable real. Valide o comando e o import antes de entregar.
+- Rode sempre `uv run ruff check .`, `uv run ruff format --check .`, MyPy nativo
+  e a suíte completa de `pytest`.
 
 ---
 
@@ -386,6 +403,17 @@ dev = [
     "ruff>=0.6",
     "mypy>=1.11",
     "pyinstaller>=6",
+]
+```
+
+Dependências acionadas em runtime ficam em `[project].dependencies`, não apenas
+no grupo `dev`. Para uma automação que usa SQL Server e SAP GUI, por exemplo:
+
+```toml
+[project]
+dependencies = [
+    "pyodbc>=5",
+    "pywin32>=306; sys_platform == 'win32'",
 ]
 ```
 

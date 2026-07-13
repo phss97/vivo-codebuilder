@@ -23,7 +23,7 @@ from crewai.flow.human_feedback import human_feedback
 from codebuilder import cc_agent, history
 from codebuilder.runtime_qa import (
     artifact_refs,
-    has_pytest_files,
+    qa_report_for_prompt,
     qa_report_for_repair,
     run_final_qa,
     validate_plan,
@@ -37,12 +37,19 @@ from codebuilder.schemas import (
     QAReport,
 )
 from codebuilder.tools import attachment_tool, git_tool
-from codebuilder.tools.s3_artifacts import SKIP_DIRS, SKIP_FILES, upload_file, upload_workspace
+from codebuilder.tools.s3_artifacts import (
+    SKIP_DIRS,
+    SKIP_FILES,
+    upload_file,
+    upload_workspace,
+)
 
 
 log = logging.getLogger(__name__)
 
-WORKSPACE_ROOT = Path(os.environ.get("CODEBUILDER_WORKSPACE_ROOT", "./workspaces")).resolve()
+WORKSPACE_ROOT = Path(
+    os.environ.get("CODEBUILDER_WORKSPACE_ROOT", "./workspaces")
+).resolve()
 SKILLS_SRC = Path(__file__).parent / "skills"
 DEFAULT_MAX_FINAL_QA_REPAIRS = 1
 PROGRESS_WEBHOOK_TIMEOUT_SECONDS = 5
@@ -78,7 +85,9 @@ def _env_bool(name: str, default: bool) -> bool:
 
 
 def _append_note(report: QAReport, note: str) -> None:
-    report.integration_notes = " ".join(part for part in (report.integration_notes, note) if part)
+    report.integration_notes = " ".join(
+        part for part in (report.integration_notes, note) if part
+    )
 
 
 def _markdown_excerpt(value: str, limit: int = 6000) -> str:
@@ -109,15 +118,30 @@ def _emit_progress(state: CodebuilderState, event_type: str, **payload: Any) -> 
         headers["X-Codebuilder-Progress-Secret"] = secret
 
     try:
-        resp = requests.post(webhook, json=body, headers=headers, timeout=PROGRESS_WEBHOOK_TIMEOUT_SECONDS)
+        resp = requests.post(
+            webhook,
+            json=body,
+            headers=headers,
+            timeout=PROGRESS_WEBHOOK_TIMEOUT_SECONDS,
+        )
         if resp.status_code >= 400:
-            log.warning("progress webhook POST for %s returned %s", event_type, resp.status_code)
+            log.warning(
+                "progress webhook POST for %s returned %s", event_type, resp.status_code
+            )
     except requests.RequestException as exc:
         log.warning("progress webhook POST failed for %s: %s", event_type, exc)
 
 
-def _emit_prompt_prepared(state: CodebuilderState, stage: str, prompt: str, **payload: Any) -> None:
-    _emit_progress(state, "planner_inputs_prepared", stage=stage, prompt_chars=len(prompt), **payload)
+def _emit_prompt_prepared(
+    state: CodebuilderState, stage: str, prompt: str, **payload: Any
+) -> None:
+    _emit_progress(
+        state,
+        "planner_inputs_prepared",
+        stage=stage,
+        prompt_chars=len(prompt),
+        **payload,
+    )
 
 
 def _emit_usage(state: CodebuilderState, summary: dict) -> None:
@@ -134,12 +158,20 @@ def _run_cost_budget_usd() -> float | None:
     try:
         value = float(raw)
     except ValueError:
-        log.warning("CODEBUILDER_MAX_RUN_COST_USD=%r is not a number; no cap applied", raw)
+        log.warning(
+            "CODEBUILDER_MAX_RUN_COST_USD=%r is not a number; no cap applied", raw
+        )
         return None
     return value if value > 0 else None
 
 
-def _zip_build(build_dir: str, out_dir: Path, project_name: str) -> Path:
+def _zip_build(
+    build_dir: str,
+    out_dir: Path,
+    project_name: str,
+    *,
+    failure_report: str = "",
+) -> Path:
     """Zip the built project into ``out_dir/<project>.zip``. Overwrites if present."""
     src = Path(build_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -150,16 +182,20 @@ def _zip_build(build_dir: str, out_dir: Path, project_name: str) -> Path:
     arcroot = out_path.stem  # wrap contents under a top-level folder in the archive
     with zipfile.ZipFile(out_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for path in src.rglob("*"):
-            if not path.is_file():
+            if path.is_symlink() or not path.is_file():
                 continue
             if path.resolve() == out_path.resolve():
                 continue
             if path.name in SKIP_FILES:
                 continue
             rel = path.relative_to(src)
+            if failure_report and rel.as_posix() == "CODEBUILDER_REPORT.md":
+                continue
             if any(part in SKIP_DIRS for part in rel.parts):
                 continue
             zf.write(path, arcname=f"{arcroot}/{rel.as_posix()}")
+        if failure_report:
+            zf.writestr(f"{arcroot}/CODEBUILDER_REPORT.md", failure_report)
     return out_path
 
 
@@ -195,7 +231,9 @@ def _resolve_patch_root(workspace_dir: str) -> str | None:
     inputs_dir = Path(workspace_dir) / "inputs"
     if not inputs_dir.is_dir():
         return None
-    candidates = sorted((c for c in inputs_dir.iterdir() if c.is_dir()), key=lambda c: c.name)
+    candidates = sorted(
+        (c for c in inputs_dir.iterdir() if c.is_dir()), key=lambda c: c.name
+    )
     if not candidates:
         return None
     repos = [c for c in candidates if c.name.startswith("repo")]
@@ -252,12 +290,42 @@ def _install_skills(target_dir: Path) -> None:
 
 
 def _language_hint(state: CodebuilderState) -> str:
-    return state.language or "(detect the language from the brief and goals, and write all comments/docstrings in it)"
+    return (
+        state.language
+        or "(detect the language from the brief and goals, and write all comments/docstrings in it)"
+    )
+
+
+def _looks_like_rpa(state: CodebuilderState, project_root: str | None = None) -> bool:
+    request_text = " ".join(
+        [state.brief, state.project_name, *state.goals, *state.tech_stack]
+    ).lower()
+    if "rpa" in request_text or "robotic process automation" in request_text:
+        return True
+    if not project_root:
+        return False
+    root = Path(project_root)
+    pyproject = root / "pyproject.toml"
+    try:
+        if (
+            pyproject.is_file()
+            and "pyinstaller" in pyproject.read_text(encoding="utf-8").lower()
+        ):
+            return True
+    except OSError:
+        pass
+    source_root = root / "src" if (root / "src").is_dir() else root
+    names = {
+        path.name for path in source_root.rglob("*.py") if ".venv" not in path.parts
+    }
+    return {"producer.py", "consumer.py", "orchestrator.py"}.issubset(names)
 
 
 def _planner_prompt(state: CodebuilderState) -> str:
     records = _format_attachment_records(state.attachment_records)
-    prior_history = history.summarize_for_planner(state.project_key) if state.project_key else ""
+    prior_history = (
+        history.summarize_for_planner(state.project_key) if state.project_key else ""
+    )
     goals = "\n".join(f"- {g}" for g in state.goals) or "(none)"
     tech_stack = ", ".join(state.tech_stack) or "(unspecified)"
 
@@ -276,6 +344,13 @@ def _planner_prompt(state: CodebuilderState) -> str:
     ]
     if prior_history:
         sections.append(f"## Prior runs for this project\n{prior_history}")
+    if state.preflight_qa_report is not None:
+        sections.append(
+            "## Deterministic preflight QA for the attached project\n"
+            "These failures are diagnostic, not a reason to stop planning. Plan concrete "
+            "fixes for them alongside the requested work.\n\n"
+            f"{qa_report_for_prompt(state.preflight_qa_report)}"
+        )
 
     if state.amendments and state.plan is not None:
         sections.append(
@@ -302,58 +377,48 @@ def _planner_prompt(state: CodebuilderState) -> str:
     return "\n\n".join(sections)
 
 
-def _executor_prompt(state: CodebuilderState, plan: Plan, build_dir: str) -> str:
+def _executor_prompt(state: CodebuilderState, plan: Plan) -> str:
     mode_note = (
         "You are modifying an EXISTING project in place at the current directory. "
         "Make targeted changes; do not rewrite unrelated files."
         if plan.mode == "patch_existing"
         else "You are creating a NEW project in the current directory (empty)."
     )
-    installable = (
-        "Ensure the project installs cleanly (`uv sync`) and that `ruff check` and "
-        "`pytest` pass before you finish."
-        if plan.mode == "new_project"
-        else "Run the project's tests and `ruff` on what you changed before you finish."
+    sections = [
+        "You are the build agent for CodeBuilder. Implement the approved plan "
+        "below in the current working directory. Write complete, working code — "
+        "no placeholders, TODOs, or stubbed functions. Use the `rpa` and "
+        "`code-review-gate` skills for standards when they apply.",
+        mode_note,
+        f"## Output language\nWrite all comments and docstrings in: {state.language or 'English'}.",
+        f"## Original brief\n{state.brief or '(none)'}",
+        f"## Approved plan\n{plan.plan_markdown}",
+    ]
+    if state.preflight_qa_report is not None:
+        sections.append(
+            "## Preflight failures to fix\n"
+            f"{qa_report_for_prompt(state.preflight_qa_report)}"
+        )
+    sections.append(
+        "## Definition of done\nRun the complete package checks before finishing: "
+        "`uv sync --locked`, `ruff check .`, `ruff format --check .`, native "
+        "`mypy`, configuration/dependency/entry-point validation, and the full "
+        "`pytest` suite. Fix failures across the repository, including existing "
+        "debt that prevents the delivered package from passing."
     )
-    return "\n\n".join(
-        [
-            "You are the build agent for CodeBuilder. Implement the approved plan "
-            "below in the current working directory. Write complete, working code — "
-            "no placeholders, TODOs, or stubbed functions. Use the `rpa` and "
-            "`code-review-gate` skills for standards when they apply.",
-            mode_note,
-            f"## Output language\nWrite all comments and docstrings in: {state.language or 'English'}.",
-            f"## Original brief\n{state.brief or '(none)'}",
-            f"## Approved plan\n{plan.plan_markdown}",
-            f"## Definition of done\n{installable}",
-        ]
-    )
+    return "\n\n".join(sections)
 
 
 def _repair_prompt(state: CodebuilderState, plan: Plan, report: QAReport) -> str:
     return "\n\n".join(
         [
             "The project you built failed QA. Fix the failures below in the current "
-            "working directory, then re-run the relevant checks (`ruff`, `pytest`, "
-            "and `uv sync` for a new project) to confirm they pass.",
+            "working directory, then re-run `uv sync --locked`, `ruff check .`, "
+            "`ruff format --check .`, native `mypy`, configuration/runtime contract "
+            "checks, and the full `pytest` suite.",
             f"## Output language\nWrite all comments and docstrings in: {state.language or 'English'}.",
             f"## QA report\n{qa_report_for_repair(report)}",
             f"## Original plan\n{plan.plan_markdown}",
-        ]
-    )
-
-
-def _changelog_prompt(state: CodebuilderState, plan: Plan) -> str:
-    lang = state.language or "English"
-    return "\n\n".join(
-        [
-            "The build was stopped because it reached its cost budget. Do NOT "
-            "implement, fix, or write any more code — there is no budget left for that.",
-            "Your only task: inspect what is already on disk in the current directory "
-            f"and write a single file named CHANGELOG.md (in {lang}) with exactly these "
-            "sections:\n## What's done\n## What's left\n## What to do on the next run",
-            f"## Original plan (for reference)\n{plan.plan_markdown}",
-            "Write only CHANGELOG.md, then stop.",
         ]
     )
 
@@ -399,6 +464,28 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             )
             project_key = session_key
         self.state.project_key = project_key
+
+        patch_root = _resolve_patch_root(self.state.workspace_dir)
+        if patch_root is not None:
+            _emit_progress(self.state, "preflight_qa_started", build_dir=patch_root)
+            try:
+                self.state.preflight_qa_report = run_final_qa(
+                    patch_root,
+                    require_installable=(Path(patch_root) / "pyproject.toml").is_file(),
+                    require_typecheck=_looks_like_rpa(self.state, patch_root),
+                    locked_sync=True,
+                )
+            except Exception as exc:  # noqa: BLE001 — preflight is diagnostic
+                log.exception("preflight QA failed unexpectedly")
+                self.state.preflight_qa_report = QAReport(
+                    passed=False,
+                    integration_notes=f"Preflight QA could not complete: {exc}",
+                )
+            _emit_progress(
+                self.state,
+                "preflight_qa_completed",
+                passed=self.state.preflight_qa_report.passed,
+            )
 
         # NOTE: do not mutate CREWAI_STORAGE_DIR here — HITL resume depends on the
         # default SQLiteFlowPersistence location staying stable.
@@ -452,7 +539,9 @@ class CodebuilderFlow(Flow[CodebuilderState]):
         # the prior plan (annotated) and let @human_feedback re-gate.
         try:
             prompt = _planner_prompt(self.state)
-            _emit_prompt_prepared(self.state, "revise_plan", prompt, amend_cycle=self.state.amend_cycles)
+            _emit_prompt_prepared(
+                self.state, "revise_plan", prompt, amend_cycle=self.state.amend_cycles
+            )
             plan_obj = validate_plan(
                 await cc_agent.run_planner(
                     cwd=self.state.workspace_dir,
@@ -506,6 +595,10 @@ class CodebuilderFlow(Flow[CodebuilderState]):
         plan = self.state.plan
         if plan is None:
             self.state.status = "failed"
+            self.state.qa_report = QAReport(
+                passed=False,
+                integration_notes="Build could not start because no approved plan was available.",
+            )
             return {"status": "failed", "reason": "no plan to execute"}
 
         if plan.mode == "patch_existing":
@@ -522,7 +615,9 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                 # Extracted zips aren't git repos; commit a pristine baseline so
                 # finalize's git diff captures exactly the repair.
                 if not (Path(build_dir) / ".git").exists():
-                    git_tool.init_and_commit(build_dir, "codebuilder baseline (pre-patch)")
+                    git_tool.init_and_commit(
+                        build_dir, "codebuilder baseline (pre-patch)"
+                    )
         else:
             build_dir = str(Path(self.state.workspace_dir) / "output")
             Path(build_dir).mkdir(parents=True, exist_ok=True)
@@ -533,30 +628,34 @@ class CodebuilderFlow(Flow[CodebuilderState]):
         _install_skills(Path(build_dir))  # skills for the executor (cwd = build_dir)
         budget = _run_cost_budget_usd()
         _emit_progress(
-            self.state, "build_started", mode=plan.mode, build_dir=build_dir, cost_budget_usd=budget
+            self.state,
+            "build_started",
+            mode=plan.mode,
+            build_dir=build_dir,
+            cost_budget_usd=budget,
         )
         try:
             await cc_agent.run_executor(
                 cwd=build_dir,
-                prompt=_executor_prompt(self.state, plan, build_dir),
+                prompt=_executor_prompt(self.state, plan),
                 budget_usd=budget,
                 on_usage=self._record_executor_usage,
             )
         except cc_agent.CCBudgetExceeded as exc:
-            # Partial files are already on disk; leave the user something + a changelog.
+            # Partial files are already on disk. Finalize runs deterministic QA
+            # and injects a failure report into the archive without another LLM call.
             log.warning("build stopped at cost budget: %s", exc)
             self.state.status = "failed"
-            changelog_mode = await self._write_budget_changelog(build_dir, plan, exc.cost_usd)
             self.state.qa_report = QAReport(
                 passed=False,
                 integration_notes=(
                     f"Build stopped at the cost budget (est. ${exc.cost_usd:.2f} spent). "
-                    f"The partial package and CHANGELOG.md ({changelog_mode}) are included — "
+                    "The partial package will be delivered with CODEBUILDER_REPORT.md; "
                     "re-run the job or raise CODEBUILDER_MAX_RUN_COST_USD to continue."
                 ),
             )
             _emit_progress(
-                self.state, "build_budget_exceeded", est_cost_usd=exc.cost_usd, changelog=changelog_mode
+                self.state, "build_budget_exceeded", est_cost_usd=exc.cost_usd
             )
         except Exception as exc:  # noqa: BLE001 — report a builder crash via QA, don't brick resume
             log.exception("executor agent failed")
@@ -583,12 +682,24 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                 log.warning("history.record on build failure failed: %s", exc)
             return self._completion_payload(build_dir or self.state.workspace_dir)
 
-        # Only run (and repair) QA on a healthy build. A crashed/budget-stopped
-        # build already has its qa_report from build(); re-running QA would waste
-        # time/tokens — we still zip + upload the partial package below.
-        if not build_failed:
-            _emit_progress(self.state, "final_qa_started")
+        build_failure_note = (
+            self.state.qa_report.integration_notes
+            if build_failed and self.state.qa_report is not None
+            else ""
+        )
+        _emit_progress(self.state, "final_qa_started")
+        try:
             self.state.qa_report = self._run_final_qa(build_dir)
+        except Exception as exc:  # noqa: BLE001 — preserve the partial package
+            log.exception("final QA failed unexpectedly")
+            self.state.qa_report = QAReport(
+                passed=False,
+                integration_notes=f"Final QA could not complete: {exc}",
+            )
+        if build_failure_note:
+            self.state.qa_report.passed = False
+            _append_note(self.state.qa_report, build_failure_note)
+        if not build_failed:
             await self._repair_final_qa_if_needed(build_dir)
 
         if self.state.plan and self.state.plan.mode == "patch_existing":
@@ -600,10 +711,17 @@ class CodebuilderFlow(Flow[CodebuilderState]):
 
         if self.state.plan:
             try:
+                failure_report = (
+                    self._failure_report_markdown(build_dir)
+                    if self.state.qa_report is not None
+                    and not self.state.qa_report.passed
+                    else ""
+                )
                 zip_path = _zip_build(
                     build_dir,
                     Path(self.state.workspace_dir),
                     self.state.project_name or self.state.id,
+                    failure_report=failure_report,
                 )
                 self.state.zip_path = str(zip_path)
                 self.state.project_archive = ProjectArchiveRef(
@@ -616,10 +734,15 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                 log.warning("zip generation failed: %s", exc)
                 if self.state.qa_report:
                     self.state.qa_report.passed = False
-                    _append_note(self.state.qa_report, f"Project archive generation failed: {exc}")
+                    _append_note(
+                        self.state.qa_report,
+                        f"Project archive generation failed: {exc}",
+                    )
 
         if self.state.qa_report:
-            session_segment = self.state.project_key or self.state.session_id or self.state.id
+            session_segment = (
+                self.state.project_key or self.state.session_id or self.state.id
+            )
             prefix = f"{session_segment}/{self.state.id}"
             uploaded_refs: list[ArtifactRef] = []
 
@@ -642,9 +765,13 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                         "but no downloadable archive URL was returned.",
                     )
 
-            if self.state.qa_report.passed and _upload_file_artifacts_enabled(self.state.plan):
+            if self.state.qa_report.passed and _upload_file_artifacts_enabled(
+                self.state.plan
+            ):
                 try:
-                    uploaded_refs.extend(artifact_refs(upload_workspace(build_dir, prefix=prefix)))
+                    uploaded_refs.extend(
+                        artifact_refs(upload_workspace(build_dir, prefix=prefix))
+                    )
                 except Exception as exc:  # noqa: BLE001
                     log.warning("workspace artifact upload failed: %s", exc)
             elif self.state.qa_report.passed:
@@ -657,7 +784,9 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             self.state.qa_report.artifact_urls = uploaded_refs
 
         self.state.status = (
-            "done" if self.state.qa_report is None or self.state.qa_report.passed else "failed"
+            "done"
+            if self.state.qa_report is None or self.state.qa_report.passed
+            else "failed"
         )
         log.info("job %s complete", self.state.id)
 
@@ -668,7 +797,9 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             **completion,
             passed=bool(self.state.qa_report and self.state.qa_report.passed),
             repair_attempts=self.state.final_qa_repair_attempts,
-            integration_notes=self.state.qa_report.integration_notes if self.state.qa_report else "",
+            integration_notes=self.state.qa_report.integration_notes
+            if self.state.qa_report
+            else "",
         )
 
         try:
@@ -695,69 +826,19 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             return None
         return max(0.0, budget - getattr(self, "_build_cost_usd", 0.0))
 
-    async def _write_budget_changelog(self, build_dir: str, plan: Plan, est_cost: float) -> str:
-        """Leave a CHANGELOG.md when the build stops at budget. `agent` (default)
-        asks CC for a bounded wrap-up; `deterministic` builds one from the git
-        diff + plan for free; `off` skips. `agent` falls back to deterministic."""
-        mode = os.environ.get("CODEBUILDER_BUDGET_CHANGELOG", "agent").strip().lower()
-        if mode == "off":
-            return "off"
-        if mode == "agent":
-            try:
-                await cc_agent.run_executor(
-                    cwd=build_dir,
-                    prompt=_changelog_prompt(self.state, plan),
-                    effort="low",
-                    max_turns=8,
-                    on_usage=lambda s: _emit_usage(self.state, s),
-                )
-                if (Path(build_dir) / "CHANGELOG.md").is_file():
-                    return "agent"
-                log.warning("agent changelog produced no CHANGELOG.md; using deterministic")
-            except Exception as exc:  # noqa: BLE001 — never fail the wrap-up
-                log.warning("agent changelog failed (%s); using deterministic", exc)
-        self._write_deterministic_changelog(build_dir, plan, est_cost)
-        return "deterministic"
-
-    def _write_deterministic_changelog(self, build_dir: str, plan: Plan, est_cost: float) -> None:
-        try:
-            changed = git_tool.changed_files(build_dir) or []
-        except Exception:  # noqa: BLE001
-            changed = []
-        files = "\n".join(f"- {p}" for p in changed) or "- (no tracked changes detected)"
-        body = (
-            "# CodeBuilder — build stopped at cost budget\n\n"
-            "The build stopped because it reached the configured cost budget "
-            f"(`CODEBUILDER_MAX_RUN_COST_USD`). Estimated spend: ${est_cost:.2f}.\n\n"
-            "## Files created / modified so far\n"
-            f"{files}\n\n"
-            "## Original plan (full scope)\n\n"
-            f"{plan.plan_markdown}\n\n"
-            "## Next run\n"
-            "Re-run the job (or raise `CODEBUILDER_MAX_RUN_COST_USD`) to continue. "
-            "The files above are what got done; the plan above is the full scope.\n"
-        )
-        try:
-            (Path(build_dir) / "CHANGELOG.md").write_text(body, encoding="utf-8")
-        except OSError as exc:
-            log.warning("failed to write deterministic CHANGELOG.md: %s", exc)
-
     def _run_final_qa(self, build_dir: str) -> QAReport:
         plan = self.state.plan
-        is_patch = bool(plan and plan.mode == "patch_existing")
-        # Patch jobs: scope ruff to the files the executor touched so pre-existing
-        # lint debt in the customer's untouched files can't fail QA.
-        changed_paths = git_tool.changed_files(build_dir) if is_patch else None
         return run_final_qa(
             build_dir,
-            changed_paths=changed_paths,
-            require_installable=bool(plan and plan.mode == "new_project"),
-            allow_no_tests=bool(is_patch and not has_pytest_files(build_dir)),
-            run_tests=_env_bool("CODEBUILDER_RUN_TESTS", True),
+            require_installable=(Path(build_dir) / "pyproject.toml").is_file(),
+            require_typecheck=bool(plan and plan.domain == "rpa"),
+            locked_sync=True,
         )
 
     def _max_final_qa_repairs(self) -> int:
-        return _env_int("CODEBUILDER_MAX_FINAL_QA_REPAIRS", DEFAULT_MAX_FINAL_QA_REPAIRS)
+        return _env_int(
+            "CODEBUILDER_MAX_FINAL_QA_REPAIRS", DEFAULT_MAX_FINAL_QA_REPAIRS
+        )
 
     async def _repair_final_qa_if_needed(self, build_dir: str) -> None:
         attempts = self._max_final_qa_repairs()
@@ -775,7 +856,12 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                 )
                 return
             self.state.final_qa_repair_attempts = attempt
-            _emit_progress(self.state, "final_qa_repair_started", attempt=attempt, max_attempts=attempts)
+            _emit_progress(
+                self.state,
+                "final_qa_repair_started",
+                attempt=attempt,
+                max_attempts=attempts,
+            )
             try:
                 await cc_agent.run_executor(
                     cwd=build_dir,
@@ -792,7 +878,9 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                 return
             except Exception as exc:  # noqa: BLE001
                 log.warning("final QA repair attempt %s failed: %s", attempt, exc)
-                _append_note(self.state.qa_report, f"Repair attempt {attempt} errored: {exc}")
+                _append_note(
+                    self.state.qa_report, f"Repair attempt {attempt} errored: {exc}"
+                )
                 return
             self.state.qa_report = self._run_final_qa(build_dir)
         if self.state.qa_report and not self.state.qa_report.passed:
@@ -812,6 +900,10 @@ class CodebuilderFlow(Flow[CodebuilderState]):
         }
         if build_dir:
             payload["build_dir"] = build_dir
+        if self.state.preflight_qa_report:
+            payload["preflight_qa_report"] = self.state.preflight_qa_report.model_dump(
+                mode="json"
+            )
         if self.state.qa_report:
             qa = self.state.qa_report.model_dump(mode="json")
             payload["qa_report"] = qa
@@ -823,10 +915,51 @@ class CodebuilderFlow(Flow[CodebuilderState]):
         if self.state.zip_url:
             payload["zip_url"] = self.state.zip_url
         if self.state.project_archive:
-            payload["project_archive"] = self.state.project_archive.model_dump(mode="json")
+            payload["project_archive"] = self.state.project_archive.model_dump(
+                mode="json"
+            )
         if self.state.patch:
             payload["patch"] = self.state.patch
         return payload
+
+    def _failure_report_markdown(self, build_dir: str) -> str:
+        """Build the deterministic report injected into a failed archive."""
+        report = self.state.qa_report or QAReport(
+            passed=False,
+            integration_notes="No final QA report was produced.",
+        )
+        try:
+            changed = git_tool.changed_files(build_dir) or []
+        except Exception:  # noqa: BLE001 — reporting must never block salvage
+            changed = []
+        changed_markdown = (
+            "\n".join(f"- `{path}`" for path in changed) or "- None detected"
+        )
+        stage = "builder" if self.state.status == "failed" else "final QA"
+        preflight = qa_report_for_prompt(self.state.preflight_qa_report)
+        plan_markdown = (
+            self.state.plan.plan_markdown if self.state.plan else "(no approved plan)"
+        )
+        return (
+            "# CodeBuilder Delivery Report\n\n"
+            "> This package is a concrete partial deliverable. It did not pass all "
+            "acceptance checks and must not be treated as production-ready.\n\n"
+            f"- Failure stage: {stage}\n"
+            f"- Repair attempts: {self.state.final_qa_repair_attempts}\n"
+            f"- Reason: {report.integration_notes or 'One or more deterministic checks failed.'}\n\n"
+            "## Files created or changed\n\n"
+            f"{changed_markdown}\n\n"
+            "## Preflight QA\n\n"
+            f"{preflight}\n\n"
+            "## Final QA\n\n"
+            f"{qa_report_for_prompt(report)}\n\n"
+            "## Original approved plan\n\n"
+            f"{plan_markdown}\n\n"
+            "## Work still required\n\n"
+            "1. Resolve every final QA category marked FAIL using its exact output above.\n"
+            "2. Complete any approved-plan item not represented in the changed-files list.\n"
+            "3. Re-run the full package QA until every required check passes.\n"
+        )
 
     def _qa_report_markdown(self, build_dir: str | None = None) -> str:
         report = self.state.qa_report
@@ -848,12 +981,15 @@ class CodebuilderFlow(Flow[CodebuilderState]):
         sections = [
             ("Integration Notes", report.integration_notes),
             ("Lint Output", report.lint_output),
+            ("MyPy Output", report.type_output),
             ("Test Output", report.test_output),
         ]
         for title, value in sections:
             if not value:
                 continue
-            lines.extend(["", f"## {title}", "", "```text", _markdown_excerpt(value), "```"])
+            lines.extend(
+                ["", f"## {title}", "", "```text", _markdown_excerpt(value), "```"]
+            )
         if not report.passed:
             lines.extend(
                 [

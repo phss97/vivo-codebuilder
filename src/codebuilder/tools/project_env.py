@@ -28,7 +28,7 @@ from pathlib import Path
 
 log = logging.getLogger(__name__)
 
-SYNC_TIMEOUT_SECONDS = 300
+SYNC_TIMEOUT_SECONDS = 2400
 _HASH_MARKER = ".codebuilder-pyproject-hash"
 
 
@@ -50,11 +50,13 @@ def project_python(workspace_dir: str) -> str:
     return str(python) if python.is_file() else sys.executable
 
 
-def ensure_project_env(workspace_dir: str) -> str:
+def ensure_project_env(workspace_dir: str, *, locked: bool = False) -> str:
     """Sync ``<workspace>/.venv`` from the workspace's ``pyproject.toml``.
 
-    Returns ``""`` on success or benign no-op (no pyproject, uv missing,
-    provisioning disabled, already in sync), otherwise the ``uv sync`` error
+    ``locked=True`` validates the committed lock without allowing uv to change it.
+
+    Returns ``""`` on success or benign no-op (no pyproject, provisioning
+    disabled, already in sync), otherwise the ``uv sync`` error
     output — which doubles as the "generated project is not installable"
     QA signal for new-project jobs.
     """
@@ -65,17 +67,22 @@ def ensure_project_env(workspace_dir: str) -> str:
     uv = shutil.which("uv")
     if uv is None:
         log.warning("uv not on PATH; QA falls back to the orchestrator's interpreter")
-        return ""
+        return "uv is not installed; project environment could not be synchronized"
 
-    digest = hashlib.sha256(pyproject.read_bytes()).hexdigest()
+    lockfile = build_dir / "uv.lock"
+    digest_input = pyproject.read_bytes()
+    if lockfile.is_file():
+        digest_input += lockfile.read_bytes()
+    digest = hashlib.sha256(digest_input).hexdigest()
+    marker_value = f"locked:{digest}" if locked else digest
     marker = build_dir / ".venv" / _HASH_MARKER
     try:
-        if (
-            marker.is_file()
-            and marker.read_text(encoding="utf-8").strip() == digest
-            and _venv_python(build_dir).is_file()
-        ):
-            return ""
+        if marker.is_file() and _venv_python(build_dir).is_file():
+            current = marker.read_text(encoding="utf-8").strip()
+            if current == marker_value or (
+                not locked and current == f"locked:{digest}"
+            ):
+                return ""
     except OSError:
         pass
 
@@ -83,8 +90,11 @@ def ensure_project_env(workspace_dir: str) -> str:
     # venv when launched via `uv run`) but warn loudly; drop it for clean output.
     env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
     try:
+        command = [uv, "sync", "--no-progress"]
+        if locked:
+            command.append("--locked")
         proc = subprocess.run(
-            [uv, "sync", "--no-progress"],
+            command,
             cwd=str(build_dir),
             capture_output=True,
             text=True,
@@ -95,7 +105,7 @@ def ensure_project_env(workspace_dir: str) -> str:
         return f"uv sync timed out after {SYNC_TIMEOUT_SECONDS}s"
     except OSError as exc:
         log.warning("uv sync could not be spawned: %s", exc)
-        return ""
+        return f"uv sync could not be spawned: {exc}"
 
     output = ((proc.stdout or "") + (proc.stderr or "")).strip()
     if proc.returncode != 0:
@@ -104,7 +114,7 @@ def ensure_project_env(workspace_dir: str) -> str:
     if _venv_python(build_dir).is_file():
         try:
             marker.parent.mkdir(parents=True, exist_ok=True)
-            marker.write_text(digest, encoding="utf-8")
+            marker.write_text(marker_value, encoding="utf-8")
         except OSError:
             pass
     return ""

@@ -30,7 +30,9 @@ log = logging.getLogger(__name__)
 PLANNER_MODEL = os.environ.get("CODEBUILDER_PLANNER_MODEL", "claude-opus-4-8")
 EXECUTOR_MODEL = os.environ.get("CODEBUILDER_EXECUTOR_MODEL", "claude-sonnet-5")
 PLANNER_FALLBACK_MODEL = os.environ.get("CODEBUILDER_PLANNER_FALLBACK_MODEL", "opus")
-EXECUTOR_FALLBACK_MODEL = os.environ.get("CODEBUILDER_EXECUTOR_FALLBACK_MODEL", "sonnet")
+EXECUTOR_FALLBACK_MODEL = os.environ.get(
+    "CODEBUILDER_EXECUTOR_FALLBACK_MODEL", "sonnet"
+)
 
 # Domain skills packaged under src/codebuilder/skills/ and copied into the job
 # workspace at ingest so the SDK discovers them from the agent's cwd.
@@ -59,7 +61,9 @@ class CCBudgetExceeded(CCAgentError):
     already on disk."""
 
     def __init__(self, cost_usd: float, transcript: str) -> None:
-        super().__init__(f"executor stopped at cost budget (est. ${cost_usd:.2f} spent)")
+        super().__init__(
+            f"executor stopped at cost budget (est. ${cost_usd:.2f} spent)"
+        )
         self.cost_usd = cost_usd
         self.transcript = transcript
 
@@ -89,7 +93,13 @@ def _env_float(name: str, default: float) -> float:
 def _effort(name: str, default: str) -> str:
     val = os.environ.get(name, default)
     if val not in _EFFORT_LEVELS:
-        log.warning("%s=%r invalid (want one of %s); using %s", name, val, sorted(_EFFORT_LEVELS), default)
+        log.warning(
+            "%s=%r invalid (want one of %s); using %s",
+            name,
+            val,
+            sorted(_EFFORT_LEVELS),
+            default,
+        )
         return default
     return val
 
@@ -123,7 +133,9 @@ def _rates_for(model: str) -> tuple[float, float]:
 
 _default_rates = _rates_for(EXECUTOR_MODEL)
 _COST_PER_MTOK_INPUT = _env_float("CODEBUILDER_COST_PER_MTOK_INPUT", _default_rates[0])
-_COST_PER_MTOK_OUTPUT = _env_float("CODEBUILDER_COST_PER_MTOK_OUTPUT", _default_rates[1])
+_COST_PER_MTOK_OUTPUT = _env_float(
+    "CODEBUILDER_COST_PER_MTOK_OUTPUT", _default_rates[1]
+)
 
 
 def _usage_get(usage: Any, key: str) -> int:
@@ -142,7 +154,9 @@ def _estimate_cost_usd(usage: Any) -> float:
     cache_w = _usage_get(usage, "cache_creation_input_tokens")
     cache_r = _usage_get(usage, "cache_read_input_tokens")
     out = _usage_get(usage, "output_tokens")
-    input_cost = (inp + cache_w * 1.25 + cache_r * 0.1) * _COST_PER_MTOK_INPUT / 1_000_000
+    input_cost = (
+        (inp + cache_w * 1.25 + cache_r * 0.1) * _COST_PER_MTOK_INPUT / 1_000_000
+    )
     output_cost = out * _COST_PER_MTOK_OUTPUT / 1_000_000
     return input_cost + output_cost
 
@@ -169,8 +183,13 @@ def _report_usage(result: Any, stage: str, on_usage: UsageCallback | None) -> No
         return
     log.info(
         "agent usage [%s]: cost=$%s turns=%s in=%s out=%s cache_read=%s cache_write=%s",
-        stage, summary["cost_usd"], summary["num_turns"], summary["input_tokens"],
-        summary["output_tokens"], summary["cache_read_tokens"], summary["cache_creation_tokens"],
+        stage,
+        summary["cost_usd"],
+        summary["num_turns"],
+        summary["input_tokens"],
+        summary["output_tokens"],
+        summary["cache_read_tokens"],
+        summary["cache_creation_tokens"],
     )
     if on_usage is not None:
         try:
@@ -199,7 +218,9 @@ def _executor_max_turns() -> int | None:
 
 
 def _is_result_message(message: Any) -> bool:
-    return type(message).__name__ == "ResultMessage" or hasattr(message, "structured_output")
+    return type(message).__name__ == "ResultMessage" or hasattr(
+        message, "structured_output"
+    )
 
 
 def _with_stderr(msg: str, stderr_lines: list[str]) -> str:
@@ -285,7 +306,9 @@ async def _run_query(
     for attempt in range(1, attempts + 1):
         outcome = _Outcome()
         try:
-            await _drive_once(options, prompt, query_fn, outcome, on_message, budget_usd)
+            await _drive_once(
+                options, prompt, query_fn, outcome, on_message, budget_usd
+            )
             _report_usage(outcome.result, label, on_usage)
             return outcome
         except CCBudgetExceeded:
@@ -293,10 +316,14 @@ async def _run_query(
         except Exception as exc:  # noqa: BLE001 — classify, then retry or surface
             status = getattr(outcome.result, "api_error_status", None)
             if status in _TRANSIENT_API_STATUSES and attempt < attempts:
-                delay = min(30, 2 ** attempt)
+                delay = min(30, 2**attempt)
                 log.warning(
                     "%s: transient API error HTTP %s (attempt %d/%d); retrying in %ds",
-                    label, status, attempt, attempts, delay,
+                    label,
+                    status,
+                    attempt,
+                    attempts,
+                    delay,
                 )
                 await asyncio.sleep(delay)
                 continue
@@ -337,17 +364,27 @@ async def run_planner(
     )
 
     outcome = await _run_query(
-        label="planner", options=options, prompt=prompt,
-        query_fn=query_fn, stderr_lines=stderr_lines, on_usage=on_usage,
+        label="planner",
+        options=options,
+        prompt=prompt,
+        query_fn=query_fn,
+        stderr_lines=stderr_lines,
+        on_usage=on_usage,
     )
     result = outcome.result
     if result is None:
-        raise CCAgentError(_with_stderr("planner produced no result message", stderr_lines))
+        raise CCAgentError(
+            _with_stderr("planner produced no result message", stderr_lines)
+        )
     if getattr(result, "subtype", None) == "error_max_structured_output_retries":
-        raise CCAgentError("planner exhausted structured-output retries without a valid Plan")
+        raise CCAgentError(
+            "planner exhausted structured-output retries without a valid Plan"
+        )
     data = getattr(result, "structured_output", None)
     if not data:
-        raise CCAgentError(_with_stderr("planner returned no structured output", stderr_lines))
+        raise CCAgentError(
+            _with_stderr("planner returned no structured output", stderr_lines)
+        )
     return Plan.model_validate(data)
 
 
@@ -376,7 +413,16 @@ async def run_executor(
         model=model or EXECUTOR_MODEL,
         fallback_model=EXECUTOR_FALLBACK_MODEL,
         effort=effort or EXECUTOR_EFFORT,
-        allowed_tools=["Read", "Write", "Edit", "MultiEdit", "Bash", "Glob", "Grep", "Skill"],
+        allowed_tools=[
+            "Read",
+            "Write",
+            "Edit",
+            "MultiEdit",
+            "Bash",
+            "Glob",
+            "Grep",
+            "Skill",
+        ],
         permission_mode="bypassPermissions",
         setting_sources=["project"],
         skills=SKILLS,
@@ -391,8 +437,13 @@ async def run_executor(
     )
 
     outcome = await _run_query(
-        label="executor", options=options, prompt=prompt, query_fn=query_fn,
-        stderr_lines=stderr_lines, on_message=on_message, on_usage=on_usage,
+        label="executor",
+        options=options,
+        prompt=prompt,
+        query_fn=query_fn,
+        stderr_lines=stderr_lines,
+        on_message=on_message,
+        on_usage=on_usage,
         budget_usd=budget_usd,
     )
     if outcome.result is not None and getattr(outcome.result, "is_error", False):
