@@ -253,6 +253,23 @@ def test_run_reviewer_is_structured_and_read_only():
     assert options.permission_mode == "default"
 
 
+def test_production_review_prompt_uses_only_current_source():
+    flow = main.CodebuilderFlow()
+    flow.state.brief = "Verify the package"
+    flow.state.plan = Plan.model_validate(
+        {**VALID_PLAN, "plan_markdown": "STALE_PLAN_DIAGNOSIS"}
+    )
+
+    prompt = main._production_review_prompt(flow.state)
+
+    assert "STALE_PLAN_DIAGNOSIS" not in prompt
+    assert (
+        "current files in the working directory are the only source of truth" in prompt
+    )
+    assert "Do not use the approved plan, CODEBUILDER_REPORT.md" in prompt
+    assert "current file and symbol or line" in prompt
+
+
 # --- run_executor ----------------------------------------------------------
 
 
@@ -632,6 +649,29 @@ def test_env_example_prefix_mismatch_is_blocking(tmp_path, monkeypatch):
     report = run_final_qa(str(tmp_path))
     assert not report.passed
     assert "TERRA_DB_URL" in report.integration_notes
+
+
+def test_readme_env_snippet_must_match_env_example(tmp_path):
+    (tmp_path / ".env.example").write_text("TERRA_DB_URL=sqlite:///demo.db\n")
+    (tmp_path / "settings.py").write_text(
+        "from pydantic_settings import BaseSettings, SettingsConfigDict\n\n"
+        "class Settings(BaseSettings):\n"
+        "    model_config = SettingsConfigDict(env_prefix='TERRA_')\n"
+        "    db_url: str\n"
+    )
+    readme = tmp_path / "README.md"
+    readme.write_text("```dotenv\nDB_SERVER=localhost\n```")
+
+    output = runtime_qa.check_env_example(str(tmp_path))
+
+    assert "README.md documents environment keys" in output
+    assert "DB_SERVER" in output
+
+    readme.write_text("```env\nexport TERRA_DB_URL=sqlite:///demo.db\n```")
+    assert runtime_qa.check_env_example(str(tmp_path)) == "PASS"
+
+    readme.write_text("Copy `.env.example` to `.env` and fill in real values.\n")
+    assert runtime_qa.check_env_example(str(tmp_path)) == "PASS"
 
 
 def test_rpa_runtime_dependencies_and_entrypoint_are_blocking(tmp_path, monkeypatch):

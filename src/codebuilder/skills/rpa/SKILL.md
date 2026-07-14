@@ -239,6 +239,13 @@ Antes de concluir, execute a suíte completa no pacote inteiro. Não considere
 - Todo nome documentado em `.env.example` deve corresponder ao nome efetivo do
   `BaseSettings`, incluindo `env_prefix`. Exemplo: `env_prefix="TERRA_"` e campo
   `db_url` exigem `TERRA_DB_URL`, não `DB_URL`.
+- `.env.example` é a fonte única dos nomes de configuração. Prefira o README
+  apontando para esse arquivo em vez de duplicá-lo; qualquer bloco `env`/`dotenv`
+  mantido no README deve usar somente chaves presentes em `.env.example`.
+- Configuração externa obrigatória continua obrigatória: não adicione defaults
+  fictícios para endpoints ou credenciais. Na ausência dela, o CLI deve sair com
+  código diferente de zero e orientar a copiar/preencher `.env.example` ou usar
+  `--env-file`.
 - Se uma URL `mssql+pyodbc` for usada, declare `pyodbc` nas dependências de runtime.
 - Se o código importar `win32com`, declare `pywin32` com marcador de Windows,
   por exemplo `pywin32>=306; sys_platform == 'win32'`.
@@ -255,6 +262,9 @@ Antes de concluir, execute a suíte completa no pacote inteiro. Não considere
 - Se um adapter exige `login/logout` ou `connect/disconnect`, esses métodos fazem
   parte do `Protocol` e o orquestrador controla o ciclo com cleanup em `finally`,
   tanto no sucesso quanto na falha.
+- Cada `main()` mantido como entry point direto e que controla clients externos
+  precisa de um teste do ciclo de vida. Remova alegações de CLI standalone quando
+  esse caminho não faz parte do produto, em vez de criar comandos especulativos.
 - Testes de integração devem atravessar Settings, container/composition root,
   orquestrador e adapter reais. Substitua somente transportes externos (COM,
   HTTP, SQL Server, filesystem); um fake do adapter completo não valida o wiring.

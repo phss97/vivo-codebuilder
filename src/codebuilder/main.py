@@ -411,7 +411,9 @@ def _executor_prompt(state: CodebuilderState, plan: Plan) -> str:
         "`pytest` suite. Fix failures across the repository, including existing "
         "debt that prevents the delivered package from passing. For RPA projects, "
         "exercise the real Settings, composition root, adapter contracts, and "
-        "login/connect cleanup while mocking only external transports."
+        "login/connect cleanup while mocking only external transports. Keep README "
+        "environment examples aligned with .env.example, and make missing required "
+        "configuration fail with actionable setup guidance instead of unsafe defaults."
     )
     return "\n\n".join(sections)
 
@@ -430,13 +432,19 @@ def _repair_prompt(state: CodebuilderState, plan: Plan, report: QAReport) -> str
     )
 
 
-def _production_review_prompt(state: CodebuilderState, plan: Plan) -> str:
+def _production_review_prompt(state: CodebuilderState) -> str:
     return "\n\n".join(
         [
             "You are the final production-wiring reviewer for an RPA package. "
             "Read the implementation and return only blockers that could make the "
             "installed package fail in production despite green lint, MyPy, and tests. "
             "Do not report style preferences or unavailable customer infrastructure.",
+            "## Evidence boundary\n"
+            "The current files in the working directory are the only source of truth. "
+            "Re-read the affected file before reporting an issue. Do not use the "
+            "approved plan, CODEBUILDER_REPORT.md, prior QA reports, previous reviews, "
+            "or comments describing old defects as evidence. Deterministic QA already "
+            "passed this current tree; treat that as context, not proof.",
             "## Required trace\n"
             "- Follow every console/module entry point through Settings and the "
             "dependency-composition root into external adapters.\n"
@@ -449,11 +457,11 @@ def _production_review_prompt(state: CodebuilderState, plan: Plan) -> str:
             "only COM, HTTP, database, filesystem, or other external transports.\n"
             "- Verify settings tests cannot accidentally read the developer's .env.",
             "## Decision rule\n"
-            "Set passed=false only for concrete execution blockers. Every issue must "
-            "name the affected file or component and the broken contract. Return an "
-            "empty issues list when passed=true.",
+            "Set passed=false only for concrete execution blockers visible in the "
+            "current source. Every issue must name the current file and symbol or line, "
+            "state what the code currently does, and identify the broken runtime "
+            "contract. Return an empty issues list when passed=true.",
             f"## Original brief\n{state.brief or '(none)'}",
-            f"## Approved plan\n{plan.plan_markdown}",
             f"## Output language\nWrite issues in: {state.language or 'English'}.",
         ]
     )
@@ -906,7 +914,7 @@ class CodebuilderFlow(Flow[CodebuilderState]):
         try:
             review = await cc_agent.run_reviewer(
                 cwd=build_dir,
-                prompt=_production_review_prompt(self.state, plan),
+                prompt=_production_review_prompt(self.state),
                 budget_usd=remaining,
                 on_usage=self._record_executor_usage,
             )

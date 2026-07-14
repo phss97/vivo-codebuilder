@@ -39,7 +39,8 @@ Preflight and final QA run the complete applicable project checks:
 - `uv sync --locked` for installable Python projects;
 - `ruff check .` and `ruff format --check .`;
 - native project MyPy configuration (required for RPA projects);
-- `.env.example` versus Pydantic `BaseSettings` names and prefixes;
+- `.env.example` versus Pydantic `BaseSettings` names/prefixes and README
+  `env`/`dotenv` snippets;
 - RPA runtime dependencies (`pyodbc`, Windows-scoped `pywin32`) and console entry-point
   imports plus a safe `--help` smoke run;
 - RPA production wiring: declared settings fields, typed injected dependencies, and
@@ -51,9 +52,11 @@ All checks run and are aggregated; a passing test suite cannot hide lint, format
 typing, configuration, dependency, entry-point, or production-wiring failures. Final QA
 covers the whole repository in both modes. Once deterministic QA passes, RPA jobs receive a
 read-only semantic review of the real entry point, composition root, adapters, secrets, and
-resource cleanup. Concrete review blockers use the same single Claude repair allowance as
-deterministic failures. Non-RPA jobs incur no review call. Builder/reviewer crashes and
-exhausted budgets do not trigger another model call.
+resource cleanup. The current source tree is its only evidence: approved plans, prior reports,
+and old review findings are explicitly excluded, and every blocker must cite the current
+file/symbol and broken runtime contract. Concrete blockers use the same single Claude repair
+allowance as deterministic failures. Non-RPA jobs incur no review call. Builder/reviewer
+crashes and exhausted budgets do not trigger another model call.
 
 Every build directory is archived, even when the builder crashes, the budget is exhausted,
 or QA remains red. These responses keep `status="failed"` and `qa_passed=false`, but still

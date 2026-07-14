@@ -40,6 +40,8 @@ _QA_SKIP_DIRS = {
     ".ruff_cache",
 }
 _DEPENDENCY_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*")
+_ENV_FENCE = re.compile(r"```(?:dotenv|env)\s*\n(.*?)```", re.IGNORECASE | re.DOTALL)
+_ENV_ASSIGNMENT = re.compile(r"^\s*(?:export\s+)?([A-Z][A-Z0-9_]*)\s*=", re.MULTILINE)
 
 
 def is_pass(output: str) -> bool:
@@ -348,7 +350,7 @@ def check_rpa_production_contract(build_dir: str) -> str:
 
 
 def check_env_example(build_dir: str) -> str:
-    """Compare documented env keys with names declared by BaseSettings fields."""
+    """Compare Settings and README env snippets with the canonical example."""
     root = Path(build_dir)
     settings: list[str] = []
     parse_errors: list[str] = []
@@ -376,12 +378,30 @@ def check_env_example(build_dir: str) -> str:
         if line.strip() and not line.lstrip().startswith("#") and "=" in line
     }
     missing = sorted(set(settings) - documented)
-    if not missing and not parse_errors:
+    readme_keys: set[str] = set()
+    readme_path = root / "README.md"
+    if readme_path.is_file():
+        try:
+            readme = readme_path.read_text(encoding="utf-8")
+            readme_keys = {
+                match.group(1)
+                for block in _ENV_FENCE.findall(readme)
+                for match in _ENV_ASSIGNMENT.finditer(block)
+            }
+        except (OSError, UnicodeError) as exc:
+            parse_errors.append(f"README.md: {exc}")
+    stale_readme = sorted(readme_keys - documented)
+    if not missing and not stale_readme and not parse_errors:
         return "PASS"
     messages: list[str] = []
     if missing:
         messages.append(
             ".env.example is missing BaseSettings keys: " + ", ".join(missing)
+        )
+    if stale_readme:
+        messages.append(
+            "README.md documents environment keys not present in .env.example: "
+            + ", ".join(stale_readme)
         )
     if parse_errors:
         messages.append("AST scan warnings:\n" + "\n".join(parse_errors))
