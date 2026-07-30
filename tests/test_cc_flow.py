@@ -16,6 +16,7 @@ from codebuilder.cc_agent import CCAgentError
 from codebuilder.runtime_qa import run_final_qa, validate_plan
 from codebuilder.schemas import Attachment, Plan, ProductionReview, QAReport
 from codebuilder.tools.git_tool import _HARNESS_EXCLUDES
+from codebuilder.tools.lint_runner_tool import apply_ruff_fixes
 from codebuilder.tools.s3_artifacts import SKIP_DIRS
 
 
@@ -268,6 +269,24 @@ def test_production_review_prompt_uses_only_current_source():
     )
     assert "Do not use the approved plan, CODEBUILDER_REPORT.md" in prompt
     assert "current file and symbol or line" in prompt
+
+
+def test_repair_prompt_requires_root_cause_and_green_qa():
+    flow = main.CodebuilderFlow()
+    plan = Plan.model_validate(VALID_PLAN)
+
+    prompt = main._repair_prompt(
+        flow.state,
+        plan,
+        QAReport(passed=False, test_output="7 failed"),
+        2,
+        3,
+    )
+
+    assert "QA repair attempt 2/3" in prompt
+    assert "inspect every caller" in prompt
+    assert "Do not weaken tests, typing" in prompt
+    assert "Do not finish while any required check is still failing" in prompt
 
 
 # --- run_executor ----------------------------------------------------------
@@ -863,6 +882,46 @@ def test_successful_archive_has_no_failure_report(tmp_path, monkeypatch):
         assert "demo/CODEBUILDER_REPORT.md" not in archive.namelist()
 
 
+def test_default_repair_loop_uses_three_high_effort_attempts(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEBUILDER_HISTORY_ENABLED", "false")
+    monkeypatch.delenv("CODEBUILDER_MAX_FINAL_QA_REPAIRS", raising=False)
+    build_dir = tmp_path / "output"
+    build_dir.mkdir()
+    (build_dir / "app.py").write_text("x = 1\n")
+    reports = iter(
+        [
+            QAReport(passed=False, test_output="7 failed"),
+            QAReport(passed=False, test_output="4 failed"),
+            QAReport(passed=False, test_output="1 failed"),
+            QAReport(passed=True, test_output="52 passed"),
+        ]
+    )
+    calls: list[dict] = []
+
+    async def _executor(**kwargs):
+        calls.append(kwargs)
+        return "fixed"
+
+    flow = main.CodebuilderFlow()
+    flow.state.plan = Plan.model_validate(VALID_PLAN)
+    flow.state.workspace_dir = str(tmp_path)
+    flow.state.project_name = "demo"
+    flow.state.status = "executing"
+    flow._build_dir = str(build_dir)
+    monkeypatch.setattr(flow, "_apply_safe_generated_fixes", lambda _: None)
+    monkeypatch.setattr(flow, "_run_final_qa", lambda _: next(reports))
+    monkeypatch.setattr(main.cc_agent, "run_executor", _executor)
+
+    payload = asyncio.run(flow.finalize())
+
+    assert payload["status"] == "done"
+    assert flow.state.final_qa_repair_attempts == 3
+    assert [call["effort"] for call in calls] == [cc_agent.REPAIR_EFFORT] * 3
+    assert all(
+        f"QA repair attempt {n}/3" in call["prompt"] for n, call in enumerate(calls, 1)
+    )
+
+
 def test_rpa_semantic_failure_uses_existing_repair_loop(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEBUILDER_HISTORY_ENABLED", "false")
     monkeypatch.setenv("CODEBUILDER_MAX_FINAL_QA_REPAIRS", "1")
@@ -907,6 +966,14 @@ def test_rpa_semantic_failure_uses_existing_repair_loop(tmp_path, monkeypatch):
     assert flow.state.final_qa_repair_attempts == 1
     assert len(prompts) == 1
     assert "never calls SapClient.login" in prompts[0]
+
+
+def test_apply_ruff_fixes_removes_safe_lint_and_format_errors(tmp_path):
+    source = tmp_path / "app.py"
+    source.write_text("import os\n\nitems=[1,2,3]\n")
+
+    assert apply_ruff_fixes(str(tmp_path)) == "PASS"
+    assert source.read_text() == "items = [1, 2, 3]\n"
 
 
 def test_rpa_reviewer_error_fails_closed_without_spending_on_repair(

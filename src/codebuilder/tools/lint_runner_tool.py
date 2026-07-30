@@ -77,6 +77,21 @@ _SKIP_MISSING_MODULE = (
 )
 
 
+def apply_ruff_fixes(workspace_dir: str) -> str:
+    """Apply Ruff's safe fixes and formatter to a generated project."""
+    outputs: list[str] = []
+    for args in (["check", "--fix", "."], ["format", "."]):
+        code, out = _run(
+            [sys.executable, "-m", "ruff", *args],
+            cwd=workspace_dir,
+        )
+        if "No module named ruff" in out:
+            return _SKIP_MISSING_MODULE.format(module="ruff")
+        if code != 0:
+            outputs.append(out or f"ruff {' '.join(args)} exit {code}")
+    return "\n".join(outputs) if outputs else "PASS"
+
+
 class _LintInput(BaseModel):
     path: str = Field(default=".", description="Relative path to lint")
 

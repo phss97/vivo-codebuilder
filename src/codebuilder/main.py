@@ -38,6 +38,7 @@ from codebuilder.schemas import (
     QAReport,
 )
 from codebuilder.tools import attachment_tool, git_tool
+from codebuilder.tools.lint_runner_tool import apply_ruff_fixes
 from codebuilder.tools.s3_artifacts import (
     SKIP_DIRS,
     SKIP_FILES,
@@ -52,7 +53,7 @@ WORKSPACE_ROOT = Path(
     os.environ.get("CODEBUILDER_WORKSPACE_ROOT", "./workspaces")
 ).resolve()
 SKILLS_SRC = Path(__file__).parent / "skills"
-DEFAULT_MAX_FINAL_QA_REPAIRS = 1
+DEFAULT_MAX_FINAL_QA_REPAIRS = 3
 PROGRESS_WEBHOOK_TIMEOUT_SECONDS = 5
 
 GUARDRAIL_LLM = os.environ.get("CODEBUILDER_GUARDRAIL_LLM", "openai/gpt-5.4-mini")
@@ -418,13 +419,23 @@ def _executor_prompt(state: CodebuilderState, plan: Plan) -> str:
     return "\n\n".join(sections)
 
 
-def _repair_prompt(state: CodebuilderState, plan: Plan, report: QAReport) -> str:
+def _repair_prompt(
+    state: CodebuilderState,
+    plan: Plan,
+    report: QAReport,
+    attempt: int,
+    max_attempts: int,
+) -> str:
     return "\n\n".join(
         [
-            "The project you built failed QA. Fix the failures below in the current "
-            "working directory, then re-run `uv sync --locked`, `ruff check .`, "
-            "`ruff format --check .`, native `mypy`, configuration/runtime contract "
-            "checks, and the full `pytest` suite.",
+            f"QA repair attempt {attempt}/{max_attempts}. Fix every current failure "
+            "in the working directory. Cluster related errors, inspect every caller "
+            "of a contract before changing it, and fix the shared root cause once. "
+            "Do not weaken tests, typing, lint configuration, or acceptance criteria. "
+            "Run targeted failing checks while repairing, then re-run `uv sync --locked`, "
+            "`ruff check .`, `ruff format --check .`, native `mypy`, configuration/runtime "
+            "contract checks, and the full `pytest` suite. Do not finish while any "
+            "required check is still failing.",
             f"## Output language\nWrite all comments and docstrings in: {state.language or 'English'}.",
             f"## QA report\n{qa_report_for_repair(report)}",
             f"## Original plan\n{plan.plan_markdown}",
@@ -731,6 +742,8 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             if build_failed and self.state.qa_report is not None
             else ""
         )
+        if not build_failed:
+            self._apply_safe_generated_fixes(build_dir)
         _emit_progress(self.state, "final_qa_started")
         try:
             self.state.qa_report = self._run_final_qa(build_dir)
@@ -883,6 +896,14 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             "CODEBUILDER_MAX_FINAL_QA_REPAIRS", DEFAULT_MAX_FINAL_QA_REPAIRS
         )
 
+    def _apply_safe_generated_fixes(self, build_dir: str) -> None:
+        plan = self.state.plan
+        if plan is None or plan.mode != "new_project":
+            return
+        output = apply_ruff_fixes(build_dir)
+        if output != "PASS":
+            log.warning("Ruff safe fixes did not complete cleanly: %s", output)
+
     def _is_rpa_build(self, build_dir: str) -> bool:
         plan = self.state.plan
         return bool(
@@ -991,7 +1012,14 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             try:
                 await cc_agent.run_executor(
                     cwd=build_dir,
-                    prompt=_repair_prompt(self.state, plan, self.state.qa_report),
+                    prompt=_repair_prompt(
+                        self.state,
+                        plan,
+                        self.state.qa_report,
+                        attempt,
+                        attempts,
+                    ),
+                    effort=cc_agent.REPAIR_EFFORT,
                     budget_usd=remaining,
                     on_usage=self._record_executor_usage,
                 )
@@ -1008,6 +1036,7 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                     self.state.qa_report, f"Repair attempt {attempt} errored: {exc}"
                 )
                 return
+            self._apply_safe_generated_fixes(build_dir)
             self.state.qa_report = self._run_final_qa(build_dir)
 
         if self.state.qa_report and not self.state.qa_report.passed:

@@ -109,6 +109,7 @@ def _effort(name: str, default: Effort) -> Effort:
 # (most expensive); default the executor to medium for cost, planner to high.
 PLANNER_EFFORT = _effort("CODEBUILDER_PLANNER_EFFORT", "high")
 EXECUTOR_EFFORT = _effort("CODEBUILDER_EXECUTOR_EFFORT", "medium")
+REPAIR_EFFORT = _effort("CODEBUILDER_REPAIR_EFFORT", "high")
 
 # Per-MTok rates for the MID-RUN cost estimate that drives the budget cap.
 # Defaults are derived from the executor model (so pointing it at Opus doesn't

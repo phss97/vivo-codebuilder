@@ -15,7 +15,7 @@ ingest + deterministic preflight ──▶ Claude plan ──▶ HITL approval
                                              Claude build
                                                     │
                                                     ▼
-                         deterministic QA + RPA wiring review + one repair
+                     deterministic QA + RPA wiring review + up to three repairs
                                                     │
                                                     ▼
                                     verified or failed project archive
@@ -54,9 +54,10 @@ covers the whole repository in both modes. Once deterministic QA passes, RPA job
 read-only semantic review of the real entry point, composition root, adapters, secrets, and
 resource cleanup. The current source tree is its only evidence: approved plans, prior reports,
 and old review findings are explicitly excluded, and every blocker must cite the current
-file/symbol and broken runtime contract. Concrete blockers use the same single Claude repair
-allowance as deterministic failures. Non-RPA jobs incur no review call. Builder/reviewer
-crashes and exhausted budgets do not trigger another model call.
+file/symbol and broken runtime contract. Concrete blockers use the same bounded Claude repair
+loop as deterministic failures. New projects receive Ruff's safe fixes and formatter before
+each QA pass so model repairs can focus on semantic failures. Non-RPA jobs incur no review
+call. Builder/reviewer crashes and exhausted budgets do not trigger another model call.
 
 Every build directory is archived, even when the builder crashes, the budget is exhausted,
 or QA remains red. These responses keep `status="failed"` and `qa_passed=false`, but still
@@ -114,7 +115,8 @@ See `.env.example` for every setting. The main operational controls are:
 | Variable | Default | Purpose |
 |---|---:|---|
 | `CODEBUILDER_MAX_RUN_COST_USD` | unset | Build/review/repair cost safety cap. |
-| `CODEBUILDER_MAX_FINAL_QA_REPAIRS` | `1` | Repair attempts after a normal final-QA failure. |
+| `CODEBUILDER_MAX_FINAL_QA_REPAIRS` | `3` | Repair attempts after a normal final-QA failure. |
+| `CODEBUILDER_REPAIR_EFFORT` | `high` | Claude reasoning effort for QA repair calls. |
 | `CODEBUILDER_TEST_TIMEOUT_SECONDS` | `2400` | Timeout for each full pytest run. |
 | `CODEBUILDER_PROVISION_PROJECT_ENV` | `true` | Allow project-local `uv sync`. |
 | `CODEBUILDER_WORKSPACE_ROOT` | `./workspaces` | Per-job workspace root. |
