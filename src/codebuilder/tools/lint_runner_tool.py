@@ -257,6 +257,7 @@ class TestRunnerTool(BaseTool):
             [
                 "-q",
                 "--no-header",
+                "--tb=short",
                 "--maxfail=0",
                 str(target),
             ],

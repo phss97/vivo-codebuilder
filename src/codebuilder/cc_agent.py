@@ -27,7 +27,7 @@ log = logging.getLogger(__name__)
 # Model IDs are env-configurable. Defaults target the latest tier; the CLI
 # accepts the "opus"/"sonnet" aliases as a fallback if a pinned ID isn't
 # recognized by the bundled CLI version.
-PLANNER_MODEL = os.environ.get("CODEBUILDER_PLANNER_MODEL", "claude-opus-4-8")
+PLANNER_MODEL = os.environ.get("CODEBUILDER_PLANNER_MODEL", "claude-opus-5")
 EXECUTOR_MODEL = os.environ.get("CODEBUILDER_EXECUTOR_MODEL", "claude-sonnet-5")
 PLANNER_FALLBACK_MODEL = os.environ.get("CODEBUILDER_PLANNER_FALLBACK_MODEL", "opus")
 EXECUTOR_FALLBACK_MODEL = os.environ.get(
@@ -105,8 +105,8 @@ def _effort(name: str, default: Effort) -> Effort:
     return cast(Effort, val)
 
 
-# Reasoning effort — the biggest token lever. The CLI's own default is xhigh
-# (most expensive); default the executor to medium for cost, planner to high.
+# Reasoning effort — the biggest token lever. Claude 5 defaults to high;
+# explicitly keep the executor at medium for simple builds and the planner high.
 PLANNER_EFFORT = _effort("CODEBUILDER_PLANNER_EFFORT", "high")
 EXECUTOR_EFFORT = _effort("CODEBUILDER_EXECUTOR_EFFORT", "medium")
 REPAIR_EFFORT = _effort("CODEBUILDER_REPAIR_EFFORT", "high")
@@ -167,8 +167,14 @@ def _usage_summary(result: Any, stage: str) -> dict | None:
     if result is None:
         return None
     usage = getattr(result, "usage", None)
+    model_usage = getattr(result, "model_usage", None)
     return {
         "stage": stage,
+        "actual_models": (
+            sorted(str(model) for model in model_usage)
+            if isinstance(model_usage, dict)
+            else []
+        ),
         "cost_usd": getattr(result, "total_cost_usd", None),
         "num_turns": getattr(result, "num_turns", None),
         "duration_ms": getattr(result, "duration_ms", None),
@@ -179,13 +185,22 @@ def _usage_summary(result: Any, stage: str) -> dict | None:
     }
 
 
-def _report_usage(result: Any, stage: str, on_usage: UsageCallback | None) -> None:
+def _report_usage(
+    result: Any,
+    stage: str,
+    requested_model: str | None,
+    on_usage: UsageCallback | None,
+) -> None:
     summary = _usage_summary(result, stage)
     if summary is None:
         return
+    summary["requested_model"] = requested_model
     log.info(
-        "agent usage [%s]: cost=$%s turns=%s in=%s out=%s cache_read=%s cache_write=%s",
+        "agent usage [%s]: requested_model=%s actual_models=%s cost=$%s turns=%s "
+        "in=%s out=%s cache_read=%s cache_write=%s",
         stage,
+        requested_model,
+        summary["actual_models"],
         summary["cost_usd"],
         summary["num_turns"],
         summary["input_tokens"],
@@ -311,7 +326,7 @@ async def _run_query(
             await _drive_once(
                 options, prompt, query_fn, outcome, on_message, budget_usd
             )
-            _report_usage(outcome.result, label, on_usage)
+            _report_usage(outcome.result, label, options.model, on_usage)
             return outcome
         except CCBudgetExceeded:
             raise  # a hard stop — never retried, never wrapped
@@ -329,7 +344,9 @@ async def _run_query(
                 )
                 await asyncio.sleep(delay)
                 continue
-            _report_usage(outcome.result, label, on_usage)  # surface the wasted spend
+            _report_usage(
+                outcome.result, label, options.model, on_usage
+            )  # surface the wasted spend
             suffix = f" (HTTP {status})" if status else ""
             raise CCAgentError(
                 _with_stderr(f"{label} query failed{suffix}: {exc}", stderr_lines)

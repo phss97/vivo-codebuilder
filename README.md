@@ -114,9 +114,12 @@ See `.env.example` for every setting. The main operational controls are:
 
 | Variable | Default | Purpose |
 |---|---:|---|
+| `CODEBUILDER_PLANNER_MODEL` | `claude-opus-5` | Exact model requested for planning. |
+| `CODEBUILDER_EXECUTOR_MODEL` | `claude-sonnet-5` | Exact model requested for build, review, and repair. |
 | `CODEBUILDER_MAX_RUN_COST_USD` | unset | Build/review/repair cost safety cap. |
 | `CODEBUILDER_MAX_FINAL_QA_REPAIRS` | `3` | Repair attempts after a normal final-QA failure. |
 | `CODEBUILDER_REPAIR_EFFORT` | `high` | Claude reasoning effort for QA repair calls. |
+| `CODEBUILDER_EXECUTOR_EFFORT` | `medium` | Base build effort; RPA and failed attached packages are elevated to `high`. |
 | `CODEBUILDER_TEST_TIMEOUT_SECONDS` | `2400` | Timeout for each full pytest run. |
 | `CODEBUILDER_PROVISION_PROJECT_ENV` | `true` | Allow project-local `uv sync`. |
 | `CODEBUILDER_WORKSPACE_ROOT` | `./workspaces` | Per-job workspace root. |

@@ -323,6 +323,20 @@ def _looks_like_rpa(state: CodebuilderState, project_root: str | None = None) ->
     return {"producer.py", "consumer.py", "orchestrator.py"}.issubset(names)
 
 
+def _build_effort(state: CodebuilderState, build_dir: str) -> cc_agent.Effort:
+    plan = state.plan
+    failed_preflight = bool(
+        state.preflight_qa_report and not state.preflight_qa_report.passed
+    )
+    if (
+        (plan and plan.domain.lower() == "rpa")
+        or _looks_like_rpa(state, build_dir)
+        or failed_preflight
+    ):
+        return "high"
+    return cc_agent.EXECUTOR_EFFORT
+
+
 def _planner_prompt(state: CodebuilderState) -> str:
     records = _format_attachment_records(state.attachment_records)
     prior_history = (
@@ -374,8 +388,13 @@ def _planner_prompt(state: CodebuilderState) -> str:
         "tested. This is shown verbatim to the human and handed to the builder.\n"
         "- For an existing RPA project, trace the real production path from the "
         "entry point through Settings, dependency composition, external adapters, "
-        "and login/connect cleanup. Do not trust tests that replace the complete "
-        "production adapter or reproduce a different fake contract.\n"
+        "and login/connect cleanup. Include a `Canonical contracts` section that "
+        "selects one coherent contract for entity IDs/statuses, DTO fields, Protocol "
+        "and repository/adapter signatures, Settings/environment names, and the "
+        "owner of each external-resource lifecycle. Base it on the current README, "
+        "database scripts, production path, and tested behavior. Do not trust tests "
+        "that replace the complete production adapter or reproduce a different fake "
+        "contract.\n"
         "- Put only genuinely blocking decisions in `open_questions` (max 3, "
         "empty when possible — prefer stating `assumptions` instead).\n"
         "- Do NOT write any files; you are read-only."
@@ -405,6 +424,17 @@ def _executor_prompt(state: CodebuilderState, plan: Plan) -> str:
             "## Preflight failures to fix\n"
             f"{qa_report_for_prompt(state.preflight_qa_report)}"
         )
+    if plan.mode == "patch_existing":
+        sections.append(
+            "## Repair strategy\n"
+            "Establish the canonical contracts before editing. Repair one root-cause "
+            "cluster at a time, update every producer and consumer of that contract, "
+            "then run targeted MyPy and tests for the cluster before continuing. "
+            "Existing tests are acceptance evidence, but when a test contradicts the "
+            "README, database scripts, and selected production contract, update the "
+            "test and every caller together. For full-package recovery, run Ruff safe "
+            "fixes and formatting before semantic repairs."
+        )
     sections.append(
         "## Definition of done\nRun the complete package checks before finishing: "
         "`uv sync --locked`, `ruff check .`, `ruff format --check .`, native "
@@ -414,7 +444,9 @@ def _executor_prompt(state: CodebuilderState, plan: Plan) -> str:
         "exercise the real Settings, composition root, adapter contracts, and "
         "login/connect cleanup while mocking only external transports. Keep README "
         "environment examples aligned with .env.example, and make missing required "
-        "configuration fail with actionable setup guidance instead of unsafe defaults."
+        "configuration fail with actionable setup guidance instead of unsafe defaults. "
+        "Do not remove or weaken tests, lower coverage thresholds, relax Ruff/MyPy, "
+        "or add fake configuration or credential defaults."
     )
     return "\n\n".join(sections)
 
@@ -682,17 +714,21 @@ class CodebuilderFlow(Flow[CodebuilderState]):
         self._build_cost_usd = 0.0
         _install_skills(Path(build_dir))  # skills for the executor (cwd = build_dir)
         budget = _run_cost_budget_usd()
+        build_effort = _build_effort(self.state, build_dir)
         _emit_progress(
             self.state,
             "build_started",
             mode=plan.mode,
             build_dir=build_dir,
+            requested_model=cc_agent.EXECUTOR_MODEL,
+            effort=build_effort,
             cost_budget_usd=budget,
         )
         try:
             await cc_agent.run_executor(
                 cwd=build_dir,
                 prompt=_executor_prompt(self.state, plan),
+                effort=build_effort,
                 budget_usd=budget,
                 on_usage=self._record_executor_usage,
             )

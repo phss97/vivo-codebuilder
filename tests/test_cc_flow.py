@@ -12,6 +12,7 @@ import pytest
 import codebuilder.main as main
 import codebuilder.runtime_qa as runtime_qa
 from codebuilder import cc_agent
+from codebuilder.tools import lint_runner_tool
 from codebuilder.cc_agent import CCAgentError
 from codebuilder.runtime_qa import run_final_qa, validate_plan
 from codebuilder.schemas import Attachment, Plan, ProductionReview, QAReport
@@ -51,6 +52,7 @@ class _FakeResult:
         total_cost_usd=None,
         num_turns=None,
         duration_ms=None,
+        model_usage=None,
     ) -> None:
         self.structured_output = structured_output
         self.subtype = subtype
@@ -60,6 +62,7 @@ class _FakeResult:
         self.total_cost_usd = total_cost_usd
         self.num_turns = num_turns
         self.duration_ms = duration_ms
+        self.model_usage = model_usage
 
 
 def _make_query(messages):
@@ -210,8 +213,19 @@ def test_preflight_prompt_is_bounded_per_category():
             integration_notes="I" * 10_000,
         )
     )
-    assert len(prompt) < 12_000
+    assert len(prompt) < 26_000
     assert prompt.count("[truncated ") == 4
+
+
+def test_qa_truncation_preserves_first_failure_and_final_summary():
+    output = "FIRST_FAILURE\n" + ("x" * 30_000) + "\n143 failed, 8 passed"
+
+    truncated = runtime_qa.truncate(output, 1_000)
+
+    assert len(truncated) <= 1_000
+    assert truncated.startswith("FIRST_FAILURE")
+    assert truncated.endswith("143 failed, 8 passed")
+    assert "[truncated " in truncated
 
 
 # --- run_planner -----------------------------------------------------------
@@ -252,6 +266,7 @@ def test_run_reviewer_is_structured_and_read_only():
     assert "Read" in options.allowed_tools
     assert "Bash" in options.disallowed_tools
     assert options.permission_mode == "default"
+    assert options.model == "claude-sonnet-5"
 
 
 def test_production_review_prompt_uses_only_current_source():
@@ -287,6 +302,24 @@ def test_repair_prompt_requires_root_cause_and_green_qa():
     assert "inspect every caller" in prompt
     assert "Do not weaken tests, typing" in prompt
     assert "Do not finish while any required check is still failing" in prompt
+
+
+def test_existing_rpa_prompts_require_canonical_contract_repair():
+    flow = main.CodebuilderFlow()
+    flow.state.preflight_qa_report = QAReport(passed=False, test_output="143 failed")
+    plan = Plan.model_validate(
+        {**VALID_PLAN, "mode": "patch_existing", "domain": "rpa"}
+    )
+
+    planner = main._planner_prompt(flow.state)
+    executor = main._executor_prompt(flow.state, plan)
+
+    assert "`Canonical contracts`" in planner
+    assert "entity IDs/statuses" in planner
+    assert "Repair one root-cause cluster at a time" in executor
+    assert "run targeted MyPy and tests" in executor
+    assert "Do not remove or weaken tests" in executor
+    assert "lower coverage thresholds" in executor
 
 
 # --- run_executor ----------------------------------------------------------
@@ -347,12 +380,14 @@ def test_executor_effort_default_is_medium():
     q = _make_capturing_query([_FakeResult()])
     asyncio.run(cc_agent.run_executor(cwd=".", prompt="x", query_fn=q))
     assert q.captured["options"].effort == "medium"
+    assert q.captured["options"].model == "claude-sonnet-5"
 
 
 def test_planner_effort_default_is_high():
     q = _make_capturing_query([_FakeResult(structured_output=VALID_PLAN)])
     asyncio.run(cc_agent.run_planner(cwd=".", prompt="x", query_fn=q))
     assert q.captured["options"].effort == "high"
+    assert q.captured["options"].model == "claude-opus-5"
 
 
 def test_executor_effort_override():
@@ -368,6 +403,19 @@ def test_effort_invalid_falls_back(monkeypatch):
     assert cc_agent._effort("CB_TEST_EFFORT", "high") == "low"  # valid → honored
 
 
+def test_build_effort_is_high_for_rpa_or_failed_attached_package(tmp_path):
+    flow = main.CodebuilderFlow()
+    flow.state.plan = Plan.model_validate(VALID_PLAN)
+    assert main._build_effort(flow.state, str(tmp_path)) == "medium"
+
+    flow.state.preflight_qa_report = QAReport(passed=False)
+    assert main._build_effort(flow.state, str(tmp_path)) == "high"
+
+    flow.state.preflight_qa_report = QAReport(passed=True)
+    flow.state.plan = Plan.model_validate({**VALID_PLAN, "domain": "rpa"})
+    assert main._build_effort(flow.state, str(tmp_path)) == "high"
+
+
 # --- usage / cost logging --------------------------------------------------
 
 
@@ -379,6 +427,7 @@ def test_on_usage_fires_on_success():
                 structured_output=VALID_PLAN,
                 total_cost_usd=0.42,
                 num_turns=3,
+                model_usage={"claude-opus-5": {"inputTokens": 100}},
                 usage={
                     "input_tokens": 100,
                     "output_tokens": 50,
@@ -395,6 +444,8 @@ def test_on_usage_fires_on_success():
     assert seen[0]["stage"] == "planner"
     assert seen[0]["cost_usd"] == 0.42
     assert seen[0]["input_tokens"] == 100 and seen[0]["output_tokens"] == 50
+    assert seen[0]["requested_model"] == "claude-opus-5"
+    assert seen[0]["actual_models"] == ["claude-opus-5"]
 
 
 def test_on_usage_fires_on_failure():
@@ -571,8 +622,13 @@ def test_no_asyncio_run_in_main():
 
 def test_install_skills_and_exclusions(tmp_path):
     main._install_skills(tmp_path)
-    assert (tmp_path / ".claude" / "skills" / "rpa" / "SKILL.md").is_file()
+    rpa_skill = tmp_path / ".claude" / "skills" / "rpa" / "SKILL.md"
+    assert rpa_skill.is_file()
     assert (tmp_path / ".claude" / "skills" / "code-review-gate" / "SKILL.md").is_file()
+    skill_text = rpa_skill.read_text()
+    assert 'requires-python = ">=3.13,<3.14"' in skill_text
+    assert "responsabilidade coesa" in skill_text
+    assert "**exatamente uma**" not in skill_text
     # never shipped in artifacts / diffs
     assert ".claude" in SKIP_DIRS
     assert ".claude/" in _HARNESS_EXCLUDES
@@ -974,6 +1030,30 @@ def test_apply_ruff_fixes_removes_safe_lint_and_format_errors(tmp_path):
 
     assert apply_ruff_fixes(str(tmp_path)) == "PASS"
     assert source.read_text() == "items = [1, 2, 3]\n"
+
+
+def test_test_runner_uses_short_tracebacks(tmp_path, monkeypatch):
+    captured: dict = {}
+
+    def _run_tool(module, args, workspace_dir, timeout=120, **kwargs):
+        captured.update(
+            module=module,
+            args=args,
+            workspace_dir=workspace_dir,
+            timeout=timeout,
+            kwargs=kwargs,
+        )
+        return 0, "1 passed"
+
+    monkeypatch.setattr(lint_runner_tool, "_run_tool_module", _run_tool)
+
+    output = lint_runner_tool.TestRunnerTool(
+        workspace_dir=str(tmp_path), provision_environment=False
+    )._run(".")
+
+    assert output == "PASS\n1 passed"
+    assert "--tb=short" in captured["args"]
+    assert "--maxfail=0" in captured["args"]
 
 
 def test_rpa_reviewer_error_fails_closed_without_spending_on_repair(

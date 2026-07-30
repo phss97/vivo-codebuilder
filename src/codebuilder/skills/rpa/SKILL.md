@@ -28,7 +28,7 @@ description: Apply the required Python RPA project architecture, packaging, conf
 
 **Stack padrão:**
 
-- Python 3.13
+- Python 3.13, com `requires-python = ">=3.13,<3.14"` no `pyproject.toml`
 - `uv` para gerenciamento de dependências e ambiente virtual
 - `hatchling` como build backend
 - `pytest` + `pytest-cov` para testes (mínimo 80% de cobertura)
@@ -316,31 +316,18 @@ app-meu-projeto/
 └── uv.lock
 ```
 
-### Regra: um módulo = uma responsabilidade
+### Regra: um módulo = uma responsabilidade coesa
 
-Cada arquivo `.py` deve conter **exatamente uma** classe pública principal
-(entidade, Protocol, caso de uso, service ou adapter). Exemplos concretos:
+Organize cada arquivo `.py` em torno de uma responsabilidade clara. Uma classe
+principal por módulo continua sendo uma boa escolha quando o conceito é grande
+ou muda de forma independente, mas não é uma obrigação.
 
-- `domain/entities/job.py` → `class Job`
-- `domain/entities/work_queue_item.py` → `class WorkQueueItem`
-- `domain/exceptions/job_locked_error.py` → `class JobLockedError(Exception)`
-- `domain/repositories/job_repository.py` → `class JobRepository(Protocol)`
-- `domain/repositories/sap_client.py` → `class SapClient(Protocol)`
-- `domain/repositories/excel_reader.py` → `class ExcelReader(Protocol)`
-- `application/use_cases/process_job.py` → `class ProcessJobUseCase`
-- `application/use_cases/acquire_job_lock.py` → `class AcquireJobLockUseCase`
-- `infrastructure/integrations/excel/excel_invoice_reader.py` → `class ExcelInvoiceReader`
-- `infrastructure/integrations/sap/sap_client_impl.py` → `class SapClientImpl`
-
-Nunca agrupe múltiplas entidades, múltiplos Protocols, múltiplas exceções, nem
-múltiplos casos de uso em um único arquivo. O planner deve manter um arquivo
-por responsabilidade pública, mas pode agrupar vários arquivos relacionados em
-um mesmo subtask de execução. O writer deve gerar exatamente um artefato por
-arquivo planejado dentro do subtask. Helpers privados (funções `_foo`) ficam no
-mesmo arquivo da classe que os usa — não fragmente por fragmentar.
-Configuração, logging e glue de CLI podem viver em um arquivo coeso por
-concern; a regra de um-por-arquivo vale apenas para entidades, Protocols,
-exceções, casos de uso, services e adapters.
+DTOs, Protocols, entidades pequenas ou exceções intimamente relacionados podem
+compartilhar um módulo quando mudam juntos e isso reduz imports e contratos
+duplicados. Não agrupe conceitos sem relação e não crie interfaces, arquivos ou
+classes apenas para antecipar extensões futuras. O planner deve preferir o menor
+grafo de módulos que preserve as camadas `domain`, `application` e
+`infrastructure`; helpers privados ficam junto de quem os usa.
 
 ---
 

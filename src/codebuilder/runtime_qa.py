@@ -26,7 +26,7 @@ from codebuilder.tools.project_env import (
 )
 
 MAX_QA_OUTPUT_CHARS = 12000
-MAX_PROMPT_SECTION_CHARS = 2500
+MAX_PROMPT_SECTION_CHARS = 6000
 
 _QA_SKIP_DIRS = {
     ".git",
@@ -57,7 +57,14 @@ def truncate(value: str, limit: int = MAX_QA_OUTPUT_CHARS) -> str:
     if len(value) <= limit:
         return value
     omitted = len(value) - limit
-    return f"{value[:limit]}\n\n[truncated {omitted} chars]"
+    for _ in range(2):
+        marker = f"\n\n[truncated {omitted} chars]\n\n"
+        available = max(0, limit - len(marker))
+        head = available * 2 // 3
+        tail = available - head
+        omitted = len(value) - head - tail
+    marker = f"\n\n[truncated {omitted} chars]\n\n"
+    return f"{value[:head]}{marker}{value[-tail:] if tail else ''}"
 
 
 def _python_files(root: Path) -> list[Path]:
@@ -116,7 +123,7 @@ def qa_report_for_prompt(report: QAReport | None) -> str:
 
 
 def qa_report_for_repair(report: QAReport) -> str:
-    """Compact JSON view of a failed QA report for the single repair pass."""
+    """Compact JSON view of a failed QA report for a repair pass."""
     payload = report.model_dump()
     payload["artifact_urls"] = []
     for key in ("lint_output", "type_output", "test_output", "integration_notes"):
