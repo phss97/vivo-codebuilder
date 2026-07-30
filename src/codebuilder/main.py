@@ -149,6 +149,7 @@ def _emit_prompt_prepared(
 def _emit_usage(state: CodebuilderState, summary: dict) -> None:
     """Surface per-agent-call token/cost to logs + the progress webhook. Fires on
     success and failure so wasted spend on a crashed run is visible."""
+    state.llm_usage.append(summary)
     _emit_progress(state, "llm_usage", **summary)
 
 
@@ -1089,6 +1090,7 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             "job_id": self.state.id,  # backward-compat alias for flow_id
             "project_name": self.state.project_name,
             "final_qa_repair_attempts": self.state.final_qa_repair_attempts,
+            "llm_usage": self.state.llm_usage,
         }
         if build_dir:
             payload["build_dir"] = build_dir

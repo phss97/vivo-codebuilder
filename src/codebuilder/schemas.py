@@ -1,4 +1,4 @@
-from typing import Literal
+from typing import Any, Literal
 
 from crewai.flow.flow import FlowState
 from pydantic import BaseModel, ConfigDict, Field
@@ -111,6 +111,7 @@ class CodebuilderState(FlowState):
     qa_report: QAReport | None = None
     production_review: ProductionReview | None = None
     final_qa_repair_attempts: int = 0
+    llm_usage: list[dict[str, Any]] = Field(default_factory=list)
     patch: str = ""
     zip_path: str = ""
     zip_url: str = ""

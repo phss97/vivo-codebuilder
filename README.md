@@ -136,6 +136,7 @@ Consumers must gate on `qa_passed` or `qa_report.passed`, never on archive prese
 - `zip_path` / `zip_url`: backward-compatible aliases.
 - `artifact_urls`: uploaded archive and optional per-file artifacts.
 - `patch`: audit diff for `patch_existing`.
+- `llm_usage`: requested and actual model IDs plus per-call cost/token metrics.
 - `preflight_qa_report`: original attached-project QA evidence when preflight ran.
 - `qa_report` / `qa_report_markdown`: final deterministic results.
 - `final_qa_repair_attempts`: number of repair model calls.

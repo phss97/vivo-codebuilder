@@ -265,6 +265,7 @@ def test_run_reviewer_is_structured_and_read_only():
     options = q.captured["options"]
     assert "Read" in options.allowed_tools
     assert "Bash" in options.disallowed_tools
+    assert "MultiEdit" not in options.disallowed_tools
     assert options.permission_mode == "default"
     assert options.model == "claude-sonnet-5"
 
@@ -381,6 +382,7 @@ def test_executor_effort_default_is_medium():
     asyncio.run(cc_agent.run_executor(cwd=".", prompt="x", query_fn=q))
     assert q.captured["options"].effort == "medium"
     assert q.captured["options"].model == "claude-sonnet-5"
+    assert "MultiEdit" not in q.captured["options"].allowed_tools
 
 
 def test_planner_effort_default_is_high():
@@ -388,6 +390,7 @@ def test_planner_effort_default_is_high():
     asyncio.run(cc_agent.run_planner(cwd=".", prompt="x", query_fn=q))
     assert q.captured["options"].effort == "high"
     assert q.captured["options"].model == "claude-opus-5"
+    assert "MultiEdit" not in q.captured["options"].disallowed_tools
 
 
 def test_executor_effort_override():
@@ -466,6 +469,20 @@ def test_on_usage_fires_on_failure():
             cc_agent.run_executor(cwd=".", prompt="x", query_fn=q, on_usage=seen.append)
         )
     assert seen and seen[0]["cost_usd"] == 1.23  # wasted spend is surfaced
+
+
+def test_usage_is_persisted_in_completion_payload(monkeypatch):
+    monkeypatch.setattr(main, "_emit_progress", lambda *_args, **_kwargs: None)
+    flow = main.CodebuilderFlow()
+    summary = {
+        "stage": "planner",
+        "requested_model": "claude-opus-5",
+        "actual_models": ["claude-opus-5"],
+    }
+
+    main._emit_usage(flow.state, summary)
+
+    assert flow._completion_payload()["llm_usage"] == [summary]
 
 
 # --- cost budget cap -------------------------------------------------------
