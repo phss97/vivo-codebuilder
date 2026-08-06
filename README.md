@@ -1,76 +1,100 @@
 # CodeBuilder
 
-CodeBuilder is a CrewAI Flow that turns a brief and optional project attachment into a
-reviewable plan, pauses for human approval, and delegates implementation to Claude Code
-agents. CrewAI provides the AMP/HITL lifecycle; one Claude planner and one Claude executor
-perform the planning and coding.
+CodeBuilder is a CrewAI Flow that turns a brief and optional project attachment into an
+approved, revisioned specification and then executes its work-package DAG with test-driven
+gates. CrewAI provides the AMP/HITL lifecycle; narrow Claude Agent SDK roles perform intake,
+planning, test authoring, implementation, and semantic review.
 
 ```text
 brief + attachment
         │
         ▼
-ingest + deterministic preflight ──▶ Claude plan ──▶ HITL approval
-                                                    │
-                                                    ▼
-                                             Claude build
-                                                    │
-                                                    ▼
-                     deterministic QA + RPA wiring review + up to three repairs
-                                                    │
-                                                    ▼
-                                    verified or failed project archive
+ingest + preflight ─▶ read-only intake ──questions─▶ HITL answers
+        │                    │ enough
+        │                    ▼
+        └────────────▶ structured spec ──▶ HITL approve / amend / reject
+                                            │ approve
+                                            ▼
+              per package: tests ─▶ freeze ─▶ code ─▶ commands + review
+                                            │ green
+                                            ▼
+                                  promote into last-green tree
+                                            │
+                                            ▼
+                            release archive or quarantine evidence
 ```
 
 Two modes are supported:
 
-- `new_project`: build in `workspaces/<session_id>/output/`.
+- `new_project`: start from an empty baseline and promote verified packages into
+  `workspaces/<session_id>/output/`.
 - `patch_existing`: materialize a Git/zip attachment under `inputs/`, resolve its project
-  root, edit it in place, return its diff, and archive the complete project.
+  root, copy it to a last-green output tree, and leave the attachment untouched.
+
+The primary routed flow requires a structured specification. Legacy Markdown plans remain
+accepted by lower-level validation and direct-call compatibility paths, but do not bypass
+the intake and structured-plan gates.
 
 ## Quality contract
 
 When an attached project can be resolved, CodeBuilder runs preflight QA before planning.
 Failures are non-terminal and are included, with bounded per-category output, in both the
-planner and executor prompts. This lets the approved plan address observed defects instead
-of discovering them after the build.
+intake and planner prompts. Patch jobs also snapshot their runtime and development dependency
+names; later QA rejects dependency removals. This lets the approved spec address observed
+defects without silently shrinking the existing contract.
 
-Preflight and final QA run the complete applicable project checks:
+The read-only intake analyst inspects the brief, attachments, source tree, authoritative
+assets, stack, and available verification commands. Any blocking question or missing command
+keeps the job at the intake HITL gate. Once intake is ready, the read-only planner produces a
+strict, revisioned spec containing:
 
-- `uv sync --locked` for installable Python projects;
-- `ruff check .` and `ruff format --check .`;
-- native project MyPy configuration (required for RPA projects);
-- `.env.example` versus Pydantic `BaseSettings` names/prefixes and README
-  `env`/`dotenv` snippets;
-- RPA runtime dependencies (`pyodbc`, Windows-scoped `pywin32`) and console entry-point
-  imports plus a safe `--help` smoke run;
-- RPA production wiring: declared settings fields, typed injected dependencies, and
-  externally managed client login/connect lifecycle;
-- the full pytest suite, plus a second RPA pass with `.env.example` active, with a
-  configurable 40-minute default timeout per pass.
+- authoritative assets with immutable hashes;
+- exact package, module, symbol, field, environment-variable, and entry-point identifiers;
+- one terminology registry for translated human-facing prose;
+- explicit lint, typecheck, test, build, and integration commands;
+- a dependency-ordered work-package DAG, where each package declares what to build,
+  expected behavior, success criteria, tests, files, and public API.
 
-All checks run and are aggregated; a passing test suite cannot hide lint, formatting,
-typing, configuration, dependency, entry-point, or production-wiring failures. Final QA
-covers the whole repository in both modes. Once deterministic QA passes, RPA jobs receive a
-read-only semantic review of the real entry point, composition root, adapters, secrets, and
-resource cleanup. The current source tree is its only evidence: approved plans, prior reports,
-and old review findings are explicitly excluded, and every blocker must cite the current
-file/symbol and broken runtime contract. Concrete blockers use the same bounded Claude repair
-loop as deterministic failures. New projects receive Ruff's safe fixes and formatter before
-each QA pass so model repairs can focus on semantic failures. Non-RPA jobs incur no review
-call. Builder/reviewer crashes and exhausted budgets do not trigger another model call.
+Code identifiers are copied verbatim and are never translated. The terminology registry is
+the single source of truth for prose translations, so later agents reuse an existing term
+instead of inventing synonyms. The human can approve, amend, or reject the rendered spec;
+each amendment creates another revision and returns to the same approval gate.
 
-Every build directory is archived, even when the builder crashes, the budget is exhausted,
-or QA remains red. These responses keep `status="failed"` and `qa_passed=false`, but still
-return `project_archive`, `zip_path`/`zip_url`, artifacts, and a patch when available. Failed
-archives contain a deterministic `CODEBUILDER_REPORT.md` with the reason, changed files,
-preflight/final results, repair count, approved plan, and remaining work. The report is
-injected into the zip and is not written into the customer source tree. Successful archives
-do not contain it.
+Each approved work package runs in an isolated copy of the last-green tree:
+
+1. The test author may write only the declared test files.
+2. CodeBuilder snapshots and freezes those tests, then records the pre-implementation
+   verification results.
+3. The executor may change only files declared by that package. Changes to frozen tests or
+   files outside the package are restored and reported as blockers.
+4. Deterministic QA checks the exact spec contract and runs every approved command without a
+   shell against an isolated disposable project copy in an OS sandbox. Non-build commands are
+   read-only; build outputs are discarded with that copy. A read-only semantic reviewer runs
+   only after those checks pass. Host reads and network are denied; a spec must explicitly
+   approve network when needed. Linux child processes stay in Bubblewrap's PID namespace;
+   macOS verification commands must execute directly because child creation is denied.
+5. Only a fully green stage is promoted into the canonical last-green tree.
+
+Code-owned blockers enter the bounded package repair loop
+(`CODEBUILDER_MAX_FINAL_QA_REPAIRS`, default 3); test-, spec-, environment-, exhausted-budget-,
+or reviewer-infrastructure blockers fail closed at the QA HITL gate. The human may retry with
+guidance, amend the spec, skip the failed package and all of its dependents, or terminate.
+Independent packages may continue after a skip, but any skipped package blocks release.
+
+After all packages pass, CodeBuilder runs the full spec contract, approved commands, and
+semantic review once more. A successful release archive contains the last-green project plus
+`approved-spec.json` and `QA.md`. A failed, skipped, or terminated run never returns a runnable
+project archive; it returns a quarantine archive containing the last-green tree, only the
+approved paths from the failed stage, and spec/QA evidence. When a run cost cap is configured,
+up to $10 remains reserved for QA review and repair.
 
 ## Requirements and setup
 
 - Python `>=3.10, <3.14`
 - [`uv`](https://docs.astral.sh/uv/)
+- Verification isolation: macOS `sandbox-exec` or Linux `bwrap`. Other environments fail
+  closed. On macOS, use direct verifier commands (for example, `python -m pytest`); child
+  process creation is denied so background work cannot escape QA.
 - `ANTHROPIC_API_KEY` for the Claude Agent SDK
 - `OPENAI_API_KEY` only when using the default OpenAI HITL classifier
 
@@ -104,9 +128,10 @@ uv run kickoff  # local hardcoded smoke input
 uv run plot     # render the Flow graph
 ```
 
-The plan pauses at `@human_feedback`. With `CODEBUILDER_APPROVAL_WEBHOOK`, the provider
-posts the pending approval and the caller later invokes `codebuilder.main.resume(job_id,
-feedback)`. Without a webhook, the provider uses the console.
+Intake questions, spec review, and unresolved QA each pause at `@human_feedback`. With
+`CODEBUILDER_APPROVAL_WEBHOOK`, the provider posts the pending decision and the caller later
+invokes `codebuilder.main.resume(job_id, feedback)`. Without a webhook, the provider uses the
+console. The completion payload's `phase` identifies the active UI state.
 
 ## Important configuration
 
@@ -116,7 +141,7 @@ See `.env.example` for every setting. The main operational controls are:
 |---|---:|---|
 | `CODEBUILDER_PLANNER_MODEL` | `claude-opus-5` | Exact model requested for planning. |
 | `CODEBUILDER_EXECUTOR_MODEL` | `claude-sonnet-5` | Exact model requested for build, review, and repair. |
-| `CODEBUILDER_MAX_RUN_COST_USD` | unset | Build/review/repair cost safety cap. |
+| `CODEBUILDER_MAX_RUN_COST_USD` | unset | Build/review/repair cap; up to $10 is reserved for QA review/repair. |
 | `CODEBUILDER_MAX_FINAL_QA_REPAIRS` | `3` | Repair attempts after a normal final-QA failure. |
 | `CODEBUILDER_REPAIR_EFFORT` | `high` | Claude reasoning effort for QA repair calls. |
 | `CODEBUILDER_EXECUTOR_EFFORT` | `medium` | Base build effort; RPA and failed attached packages are elevated to `high`. |
@@ -130,25 +155,32 @@ See `.env.example` for every setting. The main operational controls are:
 
 ## Completion contract
 
-Consumers must gate on `qa_passed` or `qa_report.passed`, never on archive presence.
+Runnable archive fields are success-only; consumers must still gate on `qa_passed` or
+`qa_report.passed`. Quarantine fields are failure evidence and must never be treated as a
+deployable package.
 
 - `project_archive`: primary complete-package deliverable, local path and optional URL.
 - `zip_path` / `zip_url`: backward-compatible aliases.
-- `artifact_urls`: uploaded archive and optional per-file artifacts.
+- `quarantine_archive` / `quarantine_report`: failed-stage evidence and package outcomes.
+- `approved_spec_hash`: hash binding package results and QA to the approved revision.
+- `package_results`: passed, failed, or skipped result for each work package.
+- `artifact_urls`: uploaded release or quarantine archive and optional per-file artifacts.
 - `patch`: audit diff for `patch_existing`.
 - `llm_usage`: requested and actual model IDs plus per-call cost/token metrics.
 - `preflight_qa_report`: original attached-project QA evidence when preflight ran.
-- `qa_report` / `qa_report_markdown`: final deterministic results.
-- `final_qa_repair_attempts`: number of repair model calls.
+- `qa_report` / `qa_report_markdown`: deterministic, contract, and semantic results.
+- `current_failure`: structured blocker ownership and evidence at the QA gate.
+- `final_qa_repair_attempts`: total automatic repair model calls.
 
 ## Repository layout
 
 ```text
 src/codebuilder/
-├── cc_agent.py             # Claude planner/executor SDK wrappers and cost controls
-├── main.py                 # CrewAI Flow, prompts, salvage packaging, completion payload
-├── runtime_qa.py           # Package QA and deterministic config/runtime checks
-├── schemas.py              # Plan, state, QA, and artifact contracts
+├── cc_agent.py             # Scoped intake/planner/test/executor/reviewer wrappers
+├── main.py                 # CrewAI Flow, HITL routing, package orchestration
+├── runtime_qa.py           # Spec validation and deterministic command runners
+├── package_workspace.py     # Isolated stages, promotion, and quarantine bundles
+├── schemas.py              # Structured spec, state, QA, and artifact contracts
 ├── history.py              # Best-effort per-project SQLite history
 ├── feedback_provider.py    # Webhook/console HITL provider
 ├── tools/                  # Project env, QA runners, git, attachments, S3
@@ -156,6 +188,6 @@ src/codebuilder/
 tests/                      # Flow, QA, security, and artifact regressions
 ```
 
-Keep `plan`, `revise_plan`, `build`, and `finalize` asynchronous: AMP resumes them inside an
-existing event loop. Preserve `session_id` versus CrewAI `state.id`, and keep `.claude/`,
-virtual environments, caches, and Git metadata out of diffs and archives.
+Keep SDK-calling listeners asynchronous: AMP resumes them inside an existing event loop.
+Preserve `session_id` versus CrewAI `state.id`, and keep `.claude/`, virtual environments,
+caches, secrets, and Git metadata out of diffs and archives.

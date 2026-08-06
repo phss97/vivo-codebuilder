@@ -150,7 +150,8 @@ def test_ingest_runs_nonterminal_preflight_before_planning(tmp_path, monkeypatch
         project = main.Path(workspace_dir) / "inputs" / "project"
         project.mkdir(parents=True)
         (project / "pyproject.toml").write_text(
-            "[project]\nname='demo'\nversion='0.1'\n"
+            "[project]\nname='demo'\nversion='0.1'\ndependencies=['pandas>=2']\n"
+            "[dependency-groups]\ndev=['pandas-stubs>=2']\n"
         )
         return [{"kind": "zip", "name": "project.zip", "path": str(project)}]
 
@@ -178,6 +179,7 @@ def test_ingest_runs_nonterminal_preflight_before_planning(tmp_path, monkeypatch
 
     assert flow.state.status == "planning"
     assert flow.state.preflight_qa_report == failed
+    assert flow.state.baseline_dependencies == ["pandas", "pandas-stubs"]
     assert calls and calls[0]["require_installable"] is True
     assert calls[0]["require_typecheck"] is True
     planner_prompt = main._planner_prompt(flow.state)
@@ -308,6 +310,7 @@ def test_repair_prompt_requires_root_cause_and_green_qa():
 def test_existing_rpa_prompts_require_canonical_contract_repair():
     flow = main.CodebuilderFlow()
     flow.state.preflight_qa_report = QAReport(passed=False, test_output="143 failed")
+    flow.state.baseline_dependencies = ["pandas", "pandas-stubs"]
     plan = Plan.model_validate(
         {**VALID_PLAN, "mode": "patch_existing", "domain": "rpa"}
     )
@@ -321,6 +324,9 @@ def test_existing_rpa_prompts_require_canonical_contract_repair():
     assert "run targeted MyPy and tests" in executor
     assert "Do not remove or weaken tests" in executor
     assert "lower coverage thresholds" in executor
+    for prompt in (planner, executor):
+        assert "`pandas`" in prompt
+        assert "`pandas-stubs`" in prompt
 
 
 # --- run_executor ----------------------------------------------------------
@@ -512,16 +518,18 @@ def test_budget_not_tripped_when_under():
     assert "t" in out
 
 
-def test_build_budget_exceeded_uses_no_wrapup_agent(tmp_path, monkeypatch):
-    monkeypatch.setenv("CODEBUILDER_MAX_RUN_COST_USD", "1")
+def test_build_budget_reserves_repair_capacity(tmp_path, monkeypatch):
+    monkeypatch.setenv("CODEBUILDER_MAX_RUN_COST_USD", "20")
     monkeypatch.setenv("CODEBUILDER_HISTORY_ENABLED", "false")
-    calls = {"count": 0}
+    budgets: list[float | None] = []
 
-    async def _boom(**_kwargs):
-        calls["count"] += 1
-        raise cc_agent.CCBudgetExceeded(1.5, "partial transcript")
+    async def _executor(**kwargs):
+        budgets.append(kwargs.get("budget_usd"))
+        if len(budgets) == 1:
+            raise cc_agent.CCBudgetExceeded(10.0, "partial transcript")
+        return "repair complete"
 
-    monkeypatch.setattr(cc_agent, "run_executor", _boom)
+    monkeypatch.setattr(cc_agent, "run_executor", _executor)
 
     flow = main.CodebuilderFlow()
     flow.state.plan = Plan.model_validate(VALID_PLAN)  # new_project
@@ -533,23 +541,21 @@ def test_build_budget_exceeded_uses_no_wrapup_agent(tmp_path, monkeypatch):
         feedback = "approved"
 
     asyncio.run(flow.build(_Prior()))
-    assert flow.state.status == "failed"
-    assert calls["count"] == 1
+    assert flow.state.status == "executing"
+    assert budgets == [10.0]
     assert not (tmp_path / "output" / "CHANGELOG.md").exists()
     assert "budget" in flow.state.qa_report.integration_notes.lower()
-    monkeypatch.setattr(
-        main.CodebuilderFlow,
-        "_run_final_qa",
-        lambda *_: QAReport(passed=True, integration_notes="partial files checked"),
+    reports = iter(
+        [QAReport(passed=False, test_output="1 failed"), QAReport(passed=True)]
     )
+    monkeypatch.setattr(main.CodebuilderFlow, "_run_final_qa", lambda *_: next(reports))
     payload = asyncio.run(flow.finalize())
-    assert payload["status"] == "failed" and payload["zip_path"]
-    with zipfile.ZipFile(tmp_path / "demo.zip") as archive:
-        report = archive.read("demo/CODEBUILDER_REPORT.md").decode()
-    assert "cost budget" in report
+    assert payload["status"] == "done" and payload["zip_path"]
+    assert budgets == [10.0, 10.0]
+    assert flow.state.final_qa_repair_attempts == 1
 
 
-def test_builder_crash_delivers_partial_archive(tmp_path, monkeypatch):
+def test_builder_crash_returns_report_without_archive(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEBUILDER_HISTORY_ENABLED", "false")
 
     async def _crash(*, cwd, **_kwargs):
@@ -574,12 +580,11 @@ def test_builder_crash_delivers_partial_archive(tmp_path, monkeypatch):
     )
     payload = asyncio.run(flow.finalize())
     assert payload["status"] == "failed"
-    with zipfile.ZipFile(tmp_path / "demo.zip") as archive:
-        report = archive.read("demo/CODEBUILDER_REPORT.md").decode()
-    assert "builder crashed" in report
+    assert "zip_path" not in payload and "project_archive" not in payload
+    assert "builder crashed" in payload["qa_report_markdown"]
 
 
-def test_finalize_zips_partial_on_failure(tmp_path, monkeypatch):
+def test_finalize_suppresses_archive_on_failure(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEBUILDER_HISTORY_ENABLED", "false")
     build_dir = tmp_path / "output"
     build_dir.mkdir()
@@ -607,13 +612,9 @@ def test_finalize_zips_partial_on_failure(tmp_path, monkeypatch):
     payload = asyncio.run(flow.finalize())
     assert payload["status"] == "failed" and payload["qa_passed"] is False
     assert calls["qa"] == 1, "final QA must run even after the builder failed"
-    assert payload.get("zip_path"), "partial package should still be zipped on failure"
-    assert (tmp_path / "demo.zip").is_file()
-    with zipfile.ZipFile(tmp_path / "demo.zip") as archive:
-        names = archive.namelist()
-        assert "demo/CODEBUILDER_REPORT.md" in names
-        report = archive.read("demo/CODEBUILDER_REPORT.md").decode()
-    assert "stopped at budget" in report
+    assert "zip_path" not in payload and "project_archive" not in payload
+    assert not (tmp_path / "demo.zip").exists()
+    assert "stopped at budget" in payload["qa_report_markdown"]
     assert not (build_dir / "CODEBUILDER_REPORT.md").exists()
 
 
@@ -791,6 +792,31 @@ def test_pywin32_must_be_windows_scoped(tmp_path):
     (tmp_path / "app.py").write_text("import win32com.client\n")
     output = runtime_qa.check_runtime_contract(str(tmp_path))
     assert "must be scoped to Windows" in output
+
+
+def test_patch_qa_blocks_removed_existing_dependencies(tmp_path, monkeypatch):
+    pyproject = tmp_path / "pyproject.toml"
+    pyproject.write_text(
+        "[project]\nname='demo'\nversion='0.1'\ndependencies=['pandas>=2']\n"
+        "[dependency-groups]\ndev=['pandas-stubs>=2', 'pytest>=8']\n"
+    )
+    baseline = runtime_qa.project_dependency_names(str(tmp_path))
+    pyproject.write_text(
+        "[project]\nname='demo'\nversion='0.1'\ndependencies=[]\n"
+        "[dependency-groups]\ndev=['pytest>=8']\n"
+    )
+    monkeypatch.setattr(runtime_qa, "ensure_project_env", lambda *_args, **_kwargs: "")
+    monkeypatch.setattr(runtime_qa.LintRunnerTool, "_run", lambda *_: "PASS")
+    monkeypatch.setattr(runtime_qa.TypeCheckRunnerTool, "_run", lambda *_: "PASS")
+    monkeypatch.setattr(runtime_qa.TestRunnerTool, "_run", lambda *_: "PASS\n1 passed")
+    monkeypatch.setattr(runtime_qa, "check_env_example", lambda *_: "PASS")
+    monkeypatch.setattr(runtime_qa, "check_runtime_contract", lambda *_: "PASS")
+
+    report = run_final_qa(str(tmp_path), baseline_dependencies=baseline)
+
+    assert not report.passed
+    assert "pandas" in report.integration_notes
+    assert "pandas-stubs" in report.integration_notes
 
 
 def test_rpa_production_contract_catches_dynamic_wiring_and_unused_lifecycle(
@@ -1109,11 +1135,11 @@ def test_rpa_reviewer_error_fails_closed_without_spending_on_repair(
     assert payload["status"] == "failed"
     assert not executor_called
     assert "review service unavailable" in payload["qa_report"]["integration_notes"]
-    with zipfile.ZipFile(tmp_path / "demo.zip") as archive:
-        assert "demo/CODEBUILDER_REPORT.md" in archive.namelist()
+    assert "project_archive" not in payload and "zip_path" not in payload
+    assert not (tmp_path / "demo.zip").exists()
 
 
-def test_final_qa_failure_is_archived_with_report(tmp_path, monkeypatch):
+def test_final_qa_failure_returns_report_without_archive(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEBUILDER_HISTORY_ENABLED", "false")
     monkeypatch.setenv("CODEBUILDER_MAX_FINAL_QA_REPAIRS", "0")
     build_dir = tmp_path / "output"
@@ -1136,6 +1162,6 @@ def test_final_qa_failure_is_archived_with_report(tmp_path, monkeypatch):
 
     payload = asyncio.run(flow.finalize())
     assert payload["status"] == "failed"
-    with zipfile.ZipFile(tmp_path / "demo.zip") as archive:
-        report = archive.read("demo/CODEBUILDER_REPORT.md").decode()
-    assert "F401" in report and "Original approved plan" in report
+    assert "project_archive" not in payload and "zip_path" not in payload
+    assert not (tmp_path / "demo.zip").exists()
+    assert "F401" in payload["qa_report_markdown"]
