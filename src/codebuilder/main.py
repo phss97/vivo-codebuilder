@@ -518,7 +518,17 @@ def _bind_authoritative_asset_hashes(
 
 
 def _intake_prompt(state: CodebuilderState) -> str:
-    answers = "\n".join(f"- {answer}" for answer in state.intake_answers) or "(none)"
+    answers = "\n\n".join(state.intake_answers) or "(none)"
+    readiness = (
+        "- Set ready=true only when scope, authoritative assets, exact machine "
+        "identifiers, and credible test/build/typecheck commands are known.\n"
+        "- For an unfamiliar stack, ask the user for exact verification commands; "
+        "never silently downgrade to semantic-only QA.\n"
+        if state.attachments
+        else "- Set ready=true once the requested scope and stack are clear. This is "
+        "a new project: the planner defines the verification commands, so list any "
+        "you would expect in missing_verification_commands but never block on them.\n"
+    )
     return "\n\n".join(
         [
             "You are the read-only intake analyst for CodeBuilder. Inventory the "
@@ -533,13 +543,10 @@ def _intake_prompt(state: CodebuilderState) -> str:
             + _format_attachment_records(state.attachment_records),
             "## Existing deterministic preflight\n"
             + qa_report_for_prompt(state.preflight_qa_report),
-            f"## Answers from earlier clarification rounds\n{answers}",
+            f"## Earlier clarification rounds (already resolved — do not re-ask)\n{answers}",
             "## Decision contract\n"
-            "- Set ready=true only when scope, authoritative assets, exact machine "
-            "identifiers, and credible test/build/typecheck commands are known.\n"
-            "- For an unfamiliar stack, ask the user for exact verification commands; "
-            "never silently downgrade to semantic-only QA.\n"
-            "- Ask at most three genuinely blocking questions. Prefer explicit "
+            + readiness
+            + "- Ask at most three genuinely blocking questions. Prefer explicit "
             "assumptions for non-blockers.\n"
             "- List an authoritative_asset only when that file must be delivered "
             "byte-for-byte unchanged; list reference documentation only under "
@@ -632,6 +639,11 @@ def _planner_prompt(state: CodebuilderState) -> str:
         "Keep network=false unless that command explicitly requires approved network "
         "access; the human will review this capability. Only category=build may write "
         "to its disposable verification copy.\n"
+        "- When the plan declares or depends on a DDL/schema/migration file (`*.sql` "
+        "or under `migrations/`), one test case must assert that the model/ORM field "
+        "names match that schema column-for-column, with its `verifies_schema` set to "
+        "that exact path. This is what catches a translated `nome` living beside a "
+        "correct `job_name`.\n"
         "- Use `terminology` only for repeated human-facing prose. Machine identifiers, "
         "external literals, database fields, environment variables, and entry points "
         "belong in `identifier_contract` and are never translated.\n"
@@ -943,10 +955,17 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             prompt=prompt,
             on_usage=lambda summary: _emit_usage(self.state, summary),
         )
-        if assessment.blocking_questions or assessment.missing_verification_commands:
-            assessment.ready = False
+        self._apply_intake_gate(assessment)
         self.state.intake_assessment = assessment
         return assessment.model_dump(mode="json")
+
+    def _apply_intake_gate(self, assessment: IntakeAssessment) -> None:
+        """Only a patch job can be blocked on unknown verification commands — for a
+        new project the planner invents them, so the question has no answer."""
+        if assessment.blocking_questions or (
+            self.state.attachments and assessment.missing_verification_commands
+        ):
+            assessment.ready = False
 
     @router(
         assess_intake,
@@ -992,7 +1011,19 @@ class CodebuilderFlow(Flow[CodebuilderState]):
     async def reassess_intake(self, prior) -> dict:
         feedback = _feedback_text(prior)
         if feedback:
-            self.state.intake_answers.append(feedback)
+            # Pair the answer with what was asked; a bare answer list left the next
+            # round unable to tell what had already been resolved, so it re-asked.
+            asked = "\n".join(
+                f"Q: {question.question}"
+                for question in (
+                    self.state.intake_assessment.blocking_questions
+                    if self.state.intake_assessment
+                    else []
+                )
+            )
+            self.state.intake_answers.append(
+                f"{asked}\nA: {feedback}" if asked else f"A: {feedback}"
+            )
         self.state.phase = "intake"
         try:
             prompt = _intake_prompt(self.state)
@@ -1002,11 +1033,7 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                 prompt=prompt,
                 on_usage=lambda summary: _emit_usage(self.state, summary),
             )
-            if (
-                assessment.blocking_questions
-                or assessment.missing_verification_commands
-            ):
-                assessment.ready = False
+            self._apply_intake_gate(assessment)
         except Exception as exc:  # noqa: BLE001 — resumed HITL methods must re-gate
             log.warning("intake reassessment failed; re-gating: %s", exc)
             assessment = IntakeAssessment(
@@ -1045,29 +1072,21 @@ class CodebuilderFlow(Flow[CodebuilderState]):
     @listen("intake_ready")
     @human_feedback(
         message="Review the generated plan. Reply 'approve' to start coding, describe changes to amend, or 'reject' to cancel.",
-        emit=["spec_approved", "spec_amend", "job_rejected"],
+        # emit[0] is CrewAI's fallback whenever the classifier LLM fails (outage,
+        # bad JSON, missing key) — default_outcome only covers empty feedback. So
+        # the safe outcome must be first, or an outage silently approves the spec.
+        emit=["spec_amend", "spec_approved", "job_rejected"],
         llm=GUARDRAIL_LLM,
         default_outcome="spec_amend",
     )
     async def plan(self) -> dict:
         self.state.phase = "specification"
-        prompt = _planner_prompt(self.state)
-        _emit_prompt_prepared(self.state, "plan", prompt)
-        plan_obj = validate_plan(
-            await cc_agent.run_planner(
-                cwd=self.state.workspace_dir,
-                prompt=prompt,
-                on_usage=lambda s: _emit_usage(self.state, s),
-            )
-        )
-        if not plan_obj.is_structured:
-            raise ValueError(
-                "Planner returned a legacy Markdown plan without work packages."
-            )
-        _bind_authoritative_asset_hashes(
-            plan_obj, self.state.workspace_dir, self.state.intake_assessment
-        )
-        validate_plan(plan_obj)
+        # plan() runs DURING resume for any job that passed an intake gate, after
+        # resume_async cleared the pending-feedback row. It must NEVER raise.
+        try:
+            plan_obj = await self._plan_with_repair(_planner_prompt(self.state), "plan")
+        except Exception as exc:  # noqa: BLE001 — see above
+            return self._degraded_plan_gate(exc)
         plan_obj.revision = 1
         plan_obj.plan_markdown = plan_obj.render_markdown()
         self.state.plan = plan_obj
@@ -1081,10 +1100,88 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             **plan_obj.model_dump(mode="json"),
         }
 
+    async def _plan_with_repair(
+        self,
+        prompt: str,
+        label: str,
+        *,
+        require_structured: bool = True,
+        **emit_payload: Any,
+    ) -> Plan:
+        """Run the planner, feeding validate_plan's own rejection text back for a retry.
+
+        validate_plan is strict and all-or-nothing, so without this one missed rule
+        the planner could have fixed itself discards the whole run.
+        """
+        attempts = max(
+            1, int(os.environ.get("CODEBUILDER_PLANNER_REPAIR_ATTEMPTS") or "2")
+        )
+        rejection: ValueError | None = None
+        for attempt in range(1, attempts + 1):
+            attempt_prompt = (
+                prompt
+                if rejection is None
+                else (
+                    f"{prompt}\n\n## Rejected specification\n"
+                    f"Your previous plan was rejected: {rejection}\n"
+                    "Fix exactly these problems and return the whole corrected plan."
+                )
+            )
+            _emit_prompt_prepared(
+                self.state, label, attempt_prompt, attempt=attempt, **emit_payload
+            )
+            try:
+                plan_obj = validate_plan(
+                    await cc_agent.run_planner(
+                        cwd=self.state.workspace_dir,
+                        prompt=attempt_prompt,
+                        on_usage=lambda s: _emit_usage(self.state, s),
+                    )
+                )
+                if require_structured and not plan_obj.is_structured:
+                    raise ValueError(
+                        "Planner returned a legacy plan without work packages."
+                    )
+                if plan_obj.is_structured:
+                    _bind_authoritative_asset_hashes(
+                        plan_obj, self.state.workspace_dir, self.state.intake_assessment
+                    )
+                    validate_plan(plan_obj)
+                return plan_obj
+            except ValueError as exc:
+                rejection = exc
+                log.warning("planner attempt %d/%d rejected: %s", attempt, attempts, exc)
+        raise rejection or ValueError("Planner returned no usable plan.")
+
+    def _degraded_plan_gate(self, exc: Exception) -> dict:
+        """Re-gate on a planner failure instead of stranding the pending-feedback row.
+
+        CrewAI clears that row before running a resumed listener and only re-saves
+        it for HumanFeedbackPending, so any other exception makes the job
+        permanently unresumable — and silent in the UI.
+        """
+        log.warning("planning failed (%s); re-gating for human input", exc)
+        self.state.phase = "specification"
+        self.state.status = "awaiting_approval"
+        detail = (
+            f"Automatic planning failed: {exc}. Restate the request with more detail "
+            "to try again, or reject it."
+        )
+        return {
+            "phase": "specification",
+            "plan": None,
+            "planner_error": str(exc),
+            "revision_error": detail,
+            "open_questions": [detail],
+            # Without explicit actions the frontend renders no buttons at all on a
+            # plan-less card — a dead end instead of a gate.
+            "actions": ["rejected", "amend"],
+        }
+
     @listen(or_("spec_amend", "amend", "qa_amend"))
     @human_feedback(
         message="Revised plan — please review again. Approve, amend further, or reject.",
-        emit=["spec_approved", "spec_amend", "job_rejected"],
+        emit=["spec_amend", "spec_approved", "job_rejected"],
         llm=GUARDRAIL_LLM,
         default_outcome="spec_amend",
     )
@@ -1100,30 +1197,16 @@ class CodebuilderFlow(Flow[CodebuilderState]):
         # unresumable ("No pending feedback found"). On any failure, fall back to
         # the prior plan (annotated) and let @human_feedback re-gate.
         try:
-            prompt = _planner_prompt(self.state)
-            _emit_prompt_prepared(
-                self.state, "revise_plan", prompt, amend_cycle=self.state.amend_cycles
+            plan_obj = await self._plan_with_repair(
+                _planner_prompt(self.state),
+                "revise_plan",
+                require_structured=structured_revision,
+                amend_cycle=self.state.amend_cycles,
             )
-            plan_obj = validate_plan(
-                await cc_agent.run_planner(
-                    cwd=self.state.workspace_dir,
-                    prompt=prompt,
-                    on_usage=lambda s: _emit_usage(self.state, s),
-                )
-            )
-            if structured_revision and not plan_obj.is_structured:
-                raise ValueError(
-                    "Planner returned a legacy plan during structured revision."
-                )
-            if plan_obj.is_structured:
-                _bind_authoritative_asset_hashes(
-                    plan_obj, self.state.workspace_dir, self.state.intake_assessment
-                )
-                validate_plan(plan_obj)
         except Exception as exc:  # noqa: BLE001 — a revise failure must never brick the job
             fallback = self._prior_plan_snapshot(prior)
             if fallback is None:
-                raise
+                return self._degraded_plan_gate(exc)
             log.warning("plan revision failed (%s); re-gating with the prior plan", exc)
             revision_error = (
                 f"Automatic plan revision failed ({exc}). The previous plan is shown "
@@ -1172,12 +1255,16 @@ class CodebuilderFlow(Flow[CodebuilderState]):
         self.state.status = "executing"
         plan = self.state.plan
         if plan is None:
-            self.state.status = "failed"
-            self.state.qa_report = QAReport(
+            # Without an explicit route, route_build coerces this to
+            # "execution_complete" and a planless job reports as a success.
+            report = QAReport(
                 passed=False,
                 integration_notes="Build could not start because no approved plan was available.",
             )
-            return {"status": "failed", "reason": "no plan to execute"}
+            self.state.qa_report = report
+            self.state.current_failure = report
+            self.state.current_package_id = "__setup__"
+            return {"route": "qa_exhausted", "reason": "no plan to execute"}
 
         if plan.is_structured:
             return await self._build_structured(plan)
@@ -2018,7 +2105,9 @@ class CodebuilderFlow(Flow[CodebuilderState]):
     @listen("qa_exhausted")
     @human_feedback(
         message="QA is still failing. Choose retry with guidance, amend the spec, skip this package and its dependents, or terminate with a quarantine bundle.",
-        emit=["qa_retry", "qa_amend", "qa_skip", "qa_terminate"],
+        # emit[0] is the classifier-failure fallback (see plan()); amending is the
+        # only outcome here that neither discards work nor burns another build.
+        emit=["qa_amend", "qa_retry", "qa_skip", "qa_terminate"],
         llm=GUARDRAIL_LLM,
         default_outcome="qa_terminate",
     )
@@ -2036,8 +2125,29 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             ],
         }
 
+    def _degraded_qa_gate(self, exc: Exception) -> dict:
+        """Re-gate a failed QA action rather than strand the job (see _degraded_plan_gate)."""
+        log.warning("QA action failed (%s); re-gating for human input", exc)
+        report = self.state.current_failure or QAReport(passed=False)
+        self.state.current_failure = report.model_copy(
+            update={
+                "integration_notes": (
+                    f"{report.integration_notes}\n"
+                    f"The requested action could not be completed: {exc}"
+                ).strip()
+            }
+        )
+        return {"route": "qa_exhausted"}
+
     @listen("qa_retry")
     async def retry_failed_qa(self, prior) -> dict:
+        # Runs during resume; raising strands the pending-feedback row.
+        try:
+            return await self._retry_failed_qa(prior)
+        except Exception as exc:  # noqa: BLE001 — see above
+            return self._degraded_qa_gate(exc)
+
+    async def _retry_failed_qa(self, prior) -> dict:
         plan = self.state.plan
         if plan is None:
             return {"route": "qa_exhausted"}
@@ -2110,6 +2220,13 @@ class CodebuilderFlow(Flow[CodebuilderState]):
 
     @listen("qa_skip")
     async def skip_failed_package(self, _prior=None) -> dict:
+        # Runs during resume; raising strands the pending-feedback row.
+        try:
+            return await self._skip_failed_package()
+        except Exception as exc:  # noqa: BLE001 — see above
+            return self._degraded_qa_gate(exc)
+
+    async def _skip_failed_package(self) -> dict:
         plan = self.state.plan
         failed_id = self.state.current_package_id
         if plan is None or failed_id in {"__final__", "__setup__"}:

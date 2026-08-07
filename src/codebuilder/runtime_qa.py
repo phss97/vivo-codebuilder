@@ -63,6 +63,9 @@ _ENV_FENCE = re.compile(r"```(?:dotenv|env)\s*\n(.*?)```", re.IGNORECASE | re.DO
 _ENV_ASSIGNMENT = re.compile(r"^\s*(?:export\s+)?([A-Z][A-Z0-9_]*)\s*=", re.MULTILINE)
 _ID = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _PACKAGE_ID = re.compile(r"^[a-z][a-z0-9_]*$")
+# Only real DDL: identifier_contract.fields is non-empty on most plans and would
+# demand a parity test with no schema to check against.
+_SCHEMA_PATH = re.compile(r"(\.sql$|(^|/)migrations?/)", re.IGNORECASE)
 _WORK_PACKAGE_ID = re.compile(r"^[a-z][a-z0-9_-]*$")
 _MODULE_ID = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$")
 _ENV_ID = re.compile(r"^[A-Z][A-Z0-9_]*$")
@@ -230,6 +233,8 @@ def validate_plan(plan: Plan | None) -> Plan:
         issues.append("duplicate work package ids: " + ", ".join(duplicate_packages))
     package_id_set = set(package_ids)
     file_owners: dict[str, str] = {}
+    schema_paths: set[str] = set()
+    schema_tests: dict[str, str] = {}
     test_ids: list[str] = []
     all_criterion_ids: list[str] = []
     for package in plan.work_packages:
@@ -278,12 +283,13 @@ def validate_plan(plan: Plan | None) -> Plan:
             else:
                 file_owners[normalized.casefold()] = package.id
             declared_paths[normalized] = file.kind
+            if _SCHEMA_PATH.search(normalized):
+                schema_paths.add(normalized.casefold())
             if not file.purpose.strip():
                 issues.append(f"{normalized}: purpose is empty")
-            if normalized.endswith(".py") and "public_api" not in file.model_fields_set:
-                issues.append(
-                    f"{normalized}: Python files must declare public_api explicitly"
-                )
+            # ponytail: no "public_api must be present" rule — it rejected a plan for
+            # omitting a key rather than for anything semantic, and check_spec_contract
+            # already skips files whose public_api is empty.
             for declaration in file.public_api:
                 name = _public_api_name(declaration)
                 if name is None:
@@ -312,6 +318,15 @@ def validate_plan(plan: Plan | None) -> Plan:
                     + ", ".join(sorted(unknown))
                 )
             covered.update(test.criterion_ids)
+            if test.verifies_schema.strip():
+                schema = _safe_relative_path(test.verifies_schema)
+                if schema is None:
+                    issues.append(
+                        f"{package.id}: test {test.id!r} has unsafe verifies_schema "
+                        f"{test.verifies_schema!r}"
+                    )
+                else:
+                    schema_tests[test.id] = schema.casefold()
             if not test.test_name.strip() or not test.expected_behavior.strip():
                 issues.append(f"{package.id}: test {test.id!r} is incomplete")
         uncovered = criterion_id_set - covered
@@ -367,10 +382,26 @@ def validate_plan(plan: Plan | None) -> Plan:
             issues.append(f"unsafe authoritative asset path {asset.path!r}")
         else:
             asset_paths.append(normalized)
+            if _SCHEMA_PATH.search(normalized):
+                schema_paths.add(normalized.casefold())
         if asset.sha256 and not re.fullmatch(r"[0-9a-fA-F]{64}", asset.sha256):
             issues.append(f"{asset.path}: invalid SHA-256 digest")
     if duplicate_assets := _duplicates(asset_paths):
         issues.append("duplicate authoritative assets: " + ", ".join(duplicate_assets))
+
+    if schema_paths:
+        for test_id, schema in schema_tests.items():
+            if schema not in schema_paths:
+                issues.append(
+                    f"test {test_id!r}: verifies_schema {schema!r} is not a declared "
+                    "schema file or authoritative asset"
+                )
+    if schema_paths and not set(schema_tests.values()) & schema_paths:
+        issues.append(
+            "the declared schema (" + ", ".join(sorted(schema_paths)) + ") needs one "
+            "test asserting the model/ORM field names match it, with verifies_schema "
+            "set to that path"
+        )
 
     for field_name, values in plan.identifier_contract.model_dump().items():
         if duplicates := _duplicates(values):

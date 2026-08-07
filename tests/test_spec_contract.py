@@ -207,6 +207,45 @@ def test_validate_plan_rejects_dependency_cycle_and_placeholder_package():
     assert "cyclic" in str(error.value)
 
 
+def test_declared_schema_requires_a_field_parity_test():
+    plan = _plan()
+    plan.authoritative_assets = [AuthoritativeAsset(path="db/schema.sql")]
+
+    with pytest.raises(ValueError, match="verifies_schema"):
+        validate_plan(plan)
+
+    plan.work_packages[0].tests[0].verifies_schema = "db/schema.sql"
+    assert validate_plan(plan)
+
+
+def test_schema_parity_test_must_name_a_declared_schema():
+    plan = _plan()
+    plan.authoritative_assets = [AuthoritativeAsset(path="db/schema.sql")]
+    plan.work_packages[0].tests[0].verifies_schema = "db/other.sql"
+
+    with pytest.raises(ValueError, match="not a declared schema file"):
+        validate_plan(plan)
+
+
+def test_parity_test_may_name_a_schema_the_plan_never_declares():
+    # A patch job's DDL already lives in the attached repo, so it is neither an
+    # owned file nor necessarily an authoritative asset. Rejecting that plan would
+    # tell the planner its correct answer is wrong.
+    plan = _plan(mode="patch_existing")
+    plan.work_packages[0].tests[0].verifies_schema = "db/schema.sql"
+
+    assert validate_plan(plan)
+
+
+def test_fields_alone_do_not_demand_a_parity_test():
+    # identifier_contract.fields is non-empty on most plans; gating on it would
+    # reject every job that has no schema to check against.
+    plan = _plan()
+    plan.identifier_contract.fields = ["customer_id"]
+
+    assert validate_plan(plan)
+
+
 def test_public_api_contract_catches_create_to_build_translation_drift(tmp_path):
     plan = validate_plan(_plan())
     (tmp_path / "src/my_project").mkdir(parents=True)

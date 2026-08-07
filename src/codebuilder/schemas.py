@@ -104,6 +104,9 @@ class TestCaseSpec(StrictOutputModel):
     path: str
     test_name: str
     expected_behavior: str
+    # Set to the DDL/migration path this test asserts the model fields match.
+    # It is what catches `nome` drifting beside a correct `job_name`.
+    verifies_schema: str = ""
 
 
 class FileSpec(StrictOutputModel):
@@ -230,6 +233,11 @@ class Plan(StrictOutputModel):
                     *[
                         f"- `{test.id}` ({', '.join(test.criterion_ids)}): "
                         f"`{test.path}::{test.test_name}` — {test.expected_behavior}"
+                        + (
+                            f" (schema parity: `{test.verifies_schema}`)"
+                            if test.verifies_schema
+                            else ""
+                        )
                         for test in package.tests
                     ],
                     "",
