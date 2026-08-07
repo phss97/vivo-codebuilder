@@ -246,6 +246,20 @@ def test_fields_alone_do_not_demand_a_parity_test():
     assert validate_plan(plan)
 
 
+def test_identifier_contract_repeats_are_deduped_not_rejected():
+    # A repeat enforces the same presence check twice, so rejecting the whole
+    # planner run over it is a validator defect. FAILED and failed are distinct
+    # identifiers in code and must both survive.
+    plan = _plan()
+    plan.identifier_contract.fields = ["job_name", "job_name", "FAILED", "failed"]
+
+    assert validate_plan(plan).identifier_contract.fields == [
+        "job_name",
+        "FAILED",
+        "failed",
+    ]
+
+
 def test_public_api_contract_catches_create_to_build_translation_drift(tmp_path):
     plan = validate_plan(_plan())
     (tmp_path / "src/my_project").mkdir(parents=True)

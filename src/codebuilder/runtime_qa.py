@@ -403,12 +403,14 @@ def validate_plan(plan: Plan | None) -> Plan:
             "set to that path"
         )
 
-    for field_name, values in plan.identifier_contract.model_dump().items():
-        if duplicates := _duplicates(values):
-            issues.append(
-                f"duplicate identifier contract values in {field_name}: "
-                + ", ".join(duplicates)
-            )
+    # ponytail: the contract is a presence set — check_spec_contract asserts each
+    # value appears verbatim, so a repeat enforces the same thing twice. Dedupe
+    # rather than discard the whole planner run. Exact match, not casefold:
+    # FAILED and failed are distinct identifiers.
+    for field_name in plan.identifier_contract.__class__.model_fields:
+        values = getattr(plan.identifier_contract, field_name)
+        seen: set[str] = set()
+        values[:] = [v for v in values if not (v in seen or seen.add(v))]
     canonical_terms = [entry.canonical for entry in plan.terminology]
     if duplicate_terms := _duplicates(canonical_terms):
         issues.append("duplicate canonical terminology: " + ", ".join(duplicate_terms))
