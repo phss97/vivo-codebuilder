@@ -1263,7 +1263,18 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             return {"route": "qa_exhausted", "reason": "no plan to execute"}
 
         if plan.is_structured:
-            return await self._build_structured(plan)
+            # Runs during resume; raising strands the pending-feedback row. The
+            # staging helpers raise WorkspaceSafetyError by design, so this is a
+            # reachable path, not a paranoia guard.
+            try:
+                return await self._build_structured(plan)
+            except Exception as exc:  # noqa: BLE001 — see _degraded_qa_gate
+                # Empty means we never reached a package; "__setup__" clears
+                # can_skip so the gate can't offer to skip a nonexistent one.
+                self.state.current_package_id = (
+                    self.state.current_package_id or "__setup__"
+                )
+                return self._degraded_qa_gate(exc)
 
         if plan.mode == "patch_existing":
             patch_root = _resolve_patch_root(self.state.workspace_dir)
@@ -1454,6 +1465,9 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             return {"route": "quarantine_ready"}
 
         canonical = self.state.canonical_build_dir
+        # Set before staging: stage_tree can raise, and build()'s guard re-gates
+        # on a stale id otherwise — the gate reads this for can_skip.
+        self.state.current_package_id = "__final__"
         final_stage = package_workspace.stage_tree(
             self.state.workspace_dir,
             canonical,
@@ -1464,7 +1478,6 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             canonical,
             Path(self.state.workspace_dir) / "trusted-tests" / "__final__",
         )
-        self.state.current_package_id = "__final__"
         self.state.current_stage_dir = str(final_stage)
         self.state.frozen_test_hashes = package_workspace.snapshot_files(
             trusted, self._scope_test_paths(plan, None)
@@ -1482,6 +1495,11 @@ class CodebuilderFlow(Flow[CodebuilderState]):
     ) -> dict:
         workspace = self.state.workspace_dir
         canonical = self.state.canonical_build_dir
+        # Same reason as __final__ above: a stage_tree failure here must not
+        # leave the *previous* package's id in state, or the human gate offers
+        # to skip the wrong package (and marks its dependents skipped with it).
+        self.state.current_package_id = package.id
+        self.state.current_stage_dir = ""
         stage = package_workspace.stage_tree(
             workspace,
             canonical,
@@ -1489,7 +1507,6 @@ class CodebuilderFlow(Flow[CodebuilderState]):
         )
         _install_skills(stage)
         git_tool.init_and_commit(stage, f"codebuilder {package.id} baseline")
-        self.state.current_package_id = package.id
         self.state.current_stage_dir = str(stage)
         test_paths = self._scope_test_paths(plan, package)
         baseline = package_workspace.snapshot_files(stage)
@@ -2121,18 +2138,24 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             ],
         }
 
+    def _note_failure(self, message: str) -> None:
+        """Append a line to the failure report the human will see."""
+        report = self.state.current_failure or QAReport(passed=False)
+        updated = report.model_copy(
+            update={
+                "integration_notes": f"{report.integration_notes}\n{message}".strip()
+            }
+        )
+        self.state.current_failure = updated
+        # Both, like _record_failure: finalize() recomputes status from qa_report
+        # alone and reads None as "done", so a degraded gate that set only
+        # current_failure would report a dead job as a successful completion.
+        self.state.qa_report = updated
+
     def _degraded_qa_gate(self, exc: Exception) -> dict:
         """Re-gate a failed QA action rather than strand the job (see _degraded_plan_gate)."""
         log.warning("QA action failed (%s); re-gating for human input", exc)
-        report = self.state.current_failure or QAReport(passed=False)
-        self.state.current_failure = report.model_copy(
-            update={
-                "integration_notes": (
-                    f"{report.integration_notes}\n"
-                    f"The requested action could not be completed: {exc}"
-                ).strip()
-            }
-        )
+        self._note_failure(f"The requested action could not be completed: {exc}")
         return {"route": "qa_exhausted"}
 
     @listen("qa_retry")
@@ -2263,7 +2286,15 @@ class CodebuilderFlow(Flow[CodebuilderState]):
 
     @listen("qa_terminate")
     def terminate_failed_qa(self, _prior=None) -> dict:
-        self._prepare_quarantine()
+        # Runs during resume; raising strands the pending-feedback row. Not
+        # _degraded_qa_gate: route_qa_terminate only emits quarantine_ready, and
+        # losing the evidence bundle is survivable where losing the job is not.
+        try:
+            self._prepare_quarantine()
+        except Exception as exc:  # noqa: BLE001 — see above
+            log.warning("quarantine preparation failed: %s", exc)
+            self._note_failure(f"The quarantine bundle could not be built: {exc}")
+            self.state.status = "failed"
         return {"route": "quarantine_ready"}
 
     @router(terminate_failed_qa, emit=["quarantine_ready"])
@@ -2588,11 +2619,15 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                         self.state.project_archive.url = zip_artifact.url
                     uploaded_refs.append(zip_artifact)
                 elif os.environ.get("CODEBUILDER_ARTIFACT_BUCKET"):
-                    self.state.qa_report.passed = False
+                    # Note, don't fail: a network blip on upload is not a QA
+                    # result. Failing here would trip the clearing block below
+                    # and drop project_archive.local_path — the last pointer to
+                    # a zip that built fine. Same shape as quarantine, below.
                     _append_note(
                         self.state.qa_report,
                         "Project archive upload failed: CODEBUILDER_ARTIFACT_BUCKET is set "
-                        "but no downloadable archive URL was returned.",
+                        "but no downloadable archive URL was returned. The archive is still "
+                        f"on disk at {self.state.zip_path}.",
                     )
 
             if self.state.quarantine_archive:

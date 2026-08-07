@@ -53,8 +53,10 @@ def upload_file(local_path: str | Path, key: str) -> dict | None:
         return None
 
     region = os.environ.get("AWS_REGION", "us-east-1")
-    s3 = boto3.client("s3", region_name=region)
     try:
+        # Inside the try: a stale AWS_PROFILE or malformed ~/.aws/config raises
+        # here, and finalize() calls this unguarded from a resume listener.
+        s3 = boto3.client("s3", region_name=region)
         s3.upload_file(str(path), bucket, key)
         url = s3.generate_presigned_url(
             "get_object",
@@ -90,7 +92,11 @@ def upload_workspace(workspace_dir: str | Path, prefix: str) -> list[dict]:
         return []
 
     region = os.environ.get("AWS_REGION", "us-east-1")
-    s3 = boto3.client("s3", region_name=region)
+    try:
+        s3 = boto3.client("s3", region_name=region)
+    except Exception as exc:  # noqa: BLE001 — see upload_file
+        log.warning("s3 client unavailable: %s", exc)
+        return []
 
     refs: list[dict] = []
     for path in workspace.rglob("*"):

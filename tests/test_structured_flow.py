@@ -681,6 +681,29 @@ def test_empty_setup_failure_creates_report_only_quarantine(
     }
 
 
+def test_staging_failure_mid_dag_names_the_package_it_failed_on(
+    flow: main.CodebuilderFlow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # stage_tree runs unguarded inside _run_package, so this really does escape
+    # to build()'s handler. It used to escape with the *previous* package's id
+    # still in state, and the gate reads that for can_skip / _package_by_id —
+    # so the human would be offered to skip a package that had already passed.
+    plan = _plan(_package("wp-1"), _package("wp-2", depends_on=["wp-1"]))
+    flow.state.plan = plan
+    flow.state.canonical_build_dir = str(Path(flow.state.workspace_dir) / "output")
+    flow.state.current_package_id = "wp-0-already-green"
+
+    def boom(*_args, **_kwargs):
+        raise main.package_workspace.WorkspaceSafetyError("symlink escapes the stage")
+
+    monkeypatch.setattr(main.package_workspace, "stage_tree", boom)
+
+    with pytest.raises(main.package_workspace.WorkspaceSafetyError):
+        asyncio.run(flow._continue_structured_build(plan))
+
+    assert flow.state.current_package_id == "wp-1"
+
+
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFO is POSIX-only")
 def test_special_file_in_patch_baseline_fails_at_setup_without_blocking(
     flow: main.CodebuilderFlow,

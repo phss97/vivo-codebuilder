@@ -17,7 +17,13 @@ import pytest
 
 import codebuilder.main as main
 from codebuilder.runtime_qa import validate_plan
-from codebuilder.schemas import IntakeAssessment, IntakeQuestion, Plan, QAReport
+from codebuilder.schemas import (
+    AuthoritativeAsset,
+    IntakeAssessment,
+    IntakeQuestion,
+    Plan,
+    QAReport,
+)
 
 _BOOM = RuntimeError("planner exploded")
 
@@ -232,3 +238,66 @@ def test_classifier_failure_falls_back_to_the_safe_outcome(
     # CrewAI collapses to emit[0] on any classifier error, ignoring default_outcome.
     config = getattr(main.CodebuilderFlow, method).__human_feedback_config__
     assert config.emit[0] == safe_outcome
+
+
+def test_structured_build_failure_regates_instead_of_stranding_the_job(
+    flow: main.CodebuilderFlow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # build() is the spec_approved resume listener, and the whole structured DAG
+    # runs under it through staging helpers that raise WorkspaceSafetyError by
+    # design. Unguarded, one symlink from an LLM kills the job for good.
+    flow.state.plan = _structured_plan()
+
+    async def boom(*_args, **_kwargs) -> dict:
+        raise _BOOM
+
+    monkeypatch.setattr(flow, "_build_structured", boom)
+
+    result = asyncio.run(main.CodebuilderFlow.build(flow, _feedback("approve")))
+
+    assert result == {"route": "qa_exhausted"}
+    # "__setup__" clears can_skip — the gate must not offer to skip a package
+    # the build never reached.
+    assert flow.state.current_package_id == "__setup__"
+    assert "planner exploded" in flow.state.current_failure.integration_notes
+    # finalize() recomputes status from qa_report alone and reads None as "done",
+    # so a degraded gate that set only current_failure would report this dead
+    # job as a successful completion.
+    assert flow.state.qa_report is not None and not flow.state.qa_report.passed
+
+
+def test_terminate_survives_a_failed_quarantine_bundle(
+    flow: main.CodebuilderFlow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # qa_terminate is review_qa_failure's default_outcome, so empty feedback
+    # lands here. Losing the evidence bundle is survivable; losing the job isn't.
+    def boom() -> None:
+        raise _BOOM
+
+    monkeypatch.setattr(flow, "_prepare_quarantine", boom)
+
+    assert flow.terminate_failed_qa() == {"route": "quarantine_ready"}
+    assert "planner exploded" in flow.state.current_failure.integration_notes
+    assert flow.state.status == "failed"
+
+
+@pytest.mark.parametrize("bad_path", ["dist/wp_1.py", "build/wp_1.py"])
+def test_validate_plan_rejects_paths_promotion_would_refuse(bad_path: str) -> None:
+    # Approval used to accept any relative path, while promote_files refuses
+    # anything _is_excluded covers — so the plan detonated after the paid
+    # test-author call instead of at the gate.
+    plan = _structured_plan()
+    plan.work_packages[0].files[0].path = bad_path
+
+    with pytest.raises(ValueError, match="excluded from package staging"):
+        validate_plan(plan)
+
+
+def test_validate_plan_rejects_an_asset_the_executor_would_never_see() -> None:
+    # copy_clean_tree drops excluded paths silently, so an "authoritative"
+    # reference under one is invisible to the agent told to obey it.
+    plan = _structured_plan()
+    plan.authoritative_assets = [AuthoritativeAsset(path="node_modules/schema.json")]
+
+    with pytest.raises(ValueError, match="invisible to the executor"):
+        validate_plan(plan)

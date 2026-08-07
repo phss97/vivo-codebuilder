@@ -18,6 +18,7 @@ from codebuilder.runtime_qa import run_final_qa, validate_plan
 from codebuilder.schemas import Attachment, Plan, ProductionReview, QAReport
 from codebuilder.tools.git_tool import _HARNESS_EXCLUDES
 from codebuilder.tools.lint_runner_tool import apply_ruff_fixes
+from codebuilder.tools import s3_artifacts
 from codebuilder.tools.s3_artifacts import SKIP_DIRS
 
 
@@ -629,6 +630,53 @@ def test_finalize_suppresses_archive_on_failure(tmp_path, monkeypatch):
     assert not (tmp_path / "demo.zip").exists()
     assert "stopped at budget" in payload["qa_report_markdown"]
     assert not (build_dir / "CODEBUILDER_REPORT.md").exists()
+
+
+def test_upload_blip_keeps_the_archive_that_built_fine(tmp_path, monkeypatch):
+    # A blip on S3 (network, rotated creds, IAM) used to set qa_report.passed =
+    # False, which tripped the success-only clearing block and nulled
+    # project_archive.local_path — the last pointer to a zip that built fine and
+    # is sitting on disk. Upload health is not a QA result.
+    monkeypatch.setenv("CODEBUILDER_HISTORY_ENABLED", "false")
+    monkeypatch.setenv("CODEBUILDER_ARTIFACT_BUCKET", "demo-bucket")
+    monkeypatch.setattr(main, "upload_file", lambda *_a, **_k: None)
+    monkeypatch.setattr(main, "upload_workspace", lambda *_a, **_k: [])
+    build_dir = tmp_path / "output"
+    build_dir.mkdir()
+    (build_dir / "main.py").write_text("x = 1\n")
+
+    flow = main.CodebuilderFlow()
+    flow.state.plan = Plan.model_validate(VALID_PLAN)
+    flow.state.workspace_dir = str(tmp_path)
+    flow.state.project_name = "demo"
+    flow._build_dir = str(build_dir)
+    monkeypatch.setattr(
+        main.CodebuilderFlow, "_run_final_qa", lambda *_: QAReport(passed=True)
+    )
+
+    payload = asyncio.run(flow.finalize())
+
+    assert payload["status"] == "done" and payload["qa_passed"] is True
+    assert main.Path(payload["project_archive"]["local_path"]).exists()
+    assert "zip_url" not in payload  # honestly absent, not a broken download card
+    assert "upload failed" in payload["qa_report"]["integration_notes"].lower()
+
+
+def test_upload_file_survives_a_broken_aws_profile(tmp_path, monkeypatch):
+    # boto3.client() used to sit above upload_file's own try, so a stale
+    # AWS_PROFILE raised straight through finalize() — a resume listener.
+    boto3 = pytest.importorskip("boto3")
+    monkeypatch.setenv("CODEBUILDER_ARTIFACT_BUCKET", "demo-bucket")
+    target = tmp_path / "demo.zip"
+    target.write_bytes(b"zip")
+
+    def boom(*_a, **_k):
+        raise RuntimeError("ProfileNotFound: the config profile could not be found")
+
+    monkeypatch.setattr(boto3, "client", boom)
+
+    assert s3_artifacts.upload_file(str(target), key="demo.zip") is None
+    assert s3_artifacts.upload_workspace(str(tmp_path), prefix="p") == []
 
 
 # --- async-flow correctness (the resume-path gap) --------------------------

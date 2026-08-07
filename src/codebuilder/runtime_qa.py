@@ -24,6 +24,7 @@ except ModuleNotFoundError:  # pragma: no cover - Python 3.10 compatibility
 
 from codebuilder.package_workspace import (
     WorkspaceSafetyError,
+    _is_excluded,
     changed_paths,
     copy_clean_tree,
     snapshot_files,
@@ -327,6 +328,13 @@ def validate_plan(plan: Plan | None) -> Plan:
             else:
                 file_owners[normalized.casefold()] = package.id
             declared_paths[normalized] = file.kind
+            # Same predicate staging/promotion uses, so approval can't accept a
+            # path that promote_files would later refuse (build/, dist/, .zip, …).
+            if _is_excluded(PurePosixPath(normalized)):
+                issues.append(
+                    f"{normalized}: excluded from package staging (build output, "
+                    "archive, or secret-bearing path) — declare a different path"
+                )
             if _SCHEMA_PATH.search(normalized):
                 schema_paths.add(normalized.casefold())
             if not file.purpose.strip():
@@ -426,6 +434,13 @@ def validate_plan(plan: Plan | None) -> Plan:
             issues.append(f"unsafe authoritative asset path {asset.path!r}")
         else:
             asset_paths.append(normalized)
+            # Excluded assets are silently dropped by copy_clean_tree, so the
+            # executor would never see the file it is told is authoritative.
+            if _is_excluded(PurePosixPath(normalized)):
+                issues.append(
+                    f"{normalized}: authoritative asset is excluded from package "
+                    "staging and would be invisible to the executor"
+                )
             if _SCHEMA_PATH.search(normalized):
                 schema_paths.add(normalized.casefold())
         if asset.sha256 and not re.fullmatch(r"[0-9a-fA-F]{64}", asset.sha256):
