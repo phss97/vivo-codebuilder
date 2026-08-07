@@ -1130,14 +1130,14 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             _emit_prompt_prepared(
                 self.state, label, attempt_prompt, attempt=attempt, **emit_payload
             )
+            plan_obj = None
             try:
-                plan_obj = validate_plan(
-                    await cc_agent.run_planner(
-                        cwd=self.state.workspace_dir,
-                        prompt=attempt_prompt,
-                        on_usage=lambda s: _emit_usage(self.state, s),
-                    )
+                plan_obj = await cc_agent.run_planner(
+                    cwd=self.state.workspace_dir,
+                    prompt=attempt_prompt,
+                    on_usage=lambda s: _emit_usage(self.state, s),
                 )
+                plan_obj = validate_plan(plan_obj)
                 if require_structured and not plan_obj.is_structured:
                     raise ValueError(
                         "Planner returned a legacy plan without work packages."
@@ -1150,7 +1150,16 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                 return plan_obj
             except ValueError as exc:
                 rejection = exc
-                log.warning("planner attempt %d/%d rejected: %s", attempt, attempts, exc)
+                # Log the plan itself, not just the rule that killed it — one
+                # error string is not enough to tell a planner bug from a
+                # validator bug after a 15-minute high-effort run.
+                log.warning(
+                    "planner attempt %d/%d rejected: %s\nrejected plan: %s",
+                    attempt,
+                    attempts,
+                    exc,
+                    plan_obj.model_dump_json() if plan_obj else "<no plan returned>",
+                )
         raise rejection or ValueError("Planner returned no usable plan.")
 
     def _degraded_plan_gate(self, exc: Exception) -> dict:
