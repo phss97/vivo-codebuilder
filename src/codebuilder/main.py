@@ -25,6 +25,7 @@ from crewai.flow.human_feedback import human_feedback
 
 from codebuilder import cc_agent, history, package_workspace
 from codebuilder.runtime_qa import (
+    PLANNER_CONTRACT_RULES,
     artifact_refs,
     check_declared_tests,
     check_preserved_dependencies,
@@ -624,29 +625,11 @@ def _planner_prompt(state: CodebuilderState) -> str:
         "- Produce a revisioned structured specification. `plan_markdown` is a "
         "derived compatibility view: leave it empty because CodeBuilder renders it "
         "from the structured fields.\n"
-        "- Set one exact English-ASCII `package_name` for new projects. Preserve "
-        "existing package/module/symbol names byte-for-byte for patch jobs.\n"
         "- For patch jobs, make every `authoritative_assets.path` relative to the "
         "attached project root; never prefix it with `inputs/<project>/`.\n"
         "- Break the work into dependency-ordered `work_packages`. Each package must "
         "state what to build, expected behavior, stable success-criterion IDs, exact "
         "test cases covering every criterion, and every owned file exactly once.\n"
-        "- Every Python file must declare its binding `public_api` names/signatures, "
-        "including an explicitly empty list when it exports nothing. Never substitute "
-        "synonyms or translations such as create/build.\n"
-        "- Put exact shell-free argv arrays for required lint/typecheck/test/build "
-        "commands in `verification_commands`; include at least one required test. "
-        "Keep network=false unless that command explicitly requires approved network "
-        "access; the human will review this capability. Only category=build may write "
-        "to its disposable verification copy.\n"
-        "- When the plan declares or depends on a DDL/schema/migration file (`*.sql` "
-        "or under `migrations/`), one test case must assert that the model/ORM field "
-        "names match that schema column-for-column, with its `verifies_schema` set to "
-        "that exact path. This is what catches a translated `nome` living beside a "
-        "correct `job_name`.\n"
-        "- Use `terminology` only for repeated human-facing prose. Machine identifiers, "
-        "external literals, database fields, environment variables, and entry points "
-        "belong in `identifier_contract` and are never translated.\n"
         "- For an existing RPA project, trace the real production path from the "
         "entry point through Settings, dependency composition, external adapters, "
         "and login/connect cleanup. Include a `Canonical contracts` section that "
@@ -656,9 +639,13 @@ def _planner_prompt(state: CodebuilderState) -> str:
         "database scripts, production path, and tested behavior. Do not trust tests "
         "that replace the complete production adapter or reproduce a different fake "
         "contract.\n"
-        "- Put only genuinely blocking decisions in `open_questions` (max 3, "
-        "empty when possible — prefer stating `assumptions` instead).\n"
         "- Do NOT write any files; you are read-only."
+    )
+    sections.append(
+        "## Rejection contract\n"
+        "CodeBuilder validates the specification before a human ever sees it. A plan "
+        "that breaks any rule below is discarded whole, so satisfy every one of them.\n"
+        + PLANNER_CONTRACT_RULES
     )
     return "\n\n".join(sections)
 

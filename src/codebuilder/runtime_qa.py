@@ -204,6 +204,46 @@ def plan_spec_hash(plan: Plan) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
+# ponytail: prose form of the rules enforced immediately below, inlined into the
+# planner prompt by main._planner_prompt so there is one place to edit instead of
+# two files that silently drift. It is adjacency, not derivation — a rule change
+# still has to touch both halves, but they are now on the same screen. Encode the
+# rules as data and generate this text only if the list keeps growing.
+PLANNER_CONTRACT_RULES = """- `open_questions` must be empty. A plan that still carries one is rejected
+  outright, so state an `assumptions` entry instead and plan around it.
+- `work_packages`: unique ids, no self-dependency, no dependency on an id that
+  does not exist, and no cycles. Titles and descriptions must be real, not
+  `TODO`/`TBD` placeholders.
+- Every owned file is declared exactly once across all packages, with a
+  non-empty `purpose` and a relative path that never escapes the project root.
+- Success-criterion ids are unique across the whole plan and every one of them
+  is covered by at least one test case. Test ids are unique too.
+- Every test must own a file declared in the same package with `kind="test"`,
+  reference only criterion ids from that package, and set both `test_name` and
+  `expected_behavior`.
+- `public_api` declarations must parse as a name or signature. Omit the key when
+  a file exports nothing; do not invent synonyms or translations (create/build).
+- `verification_commands`: unique ids, non-empty shell-free argv arrays, a
+  relative `cwd`, and at least one entry with `required=true` and
+  `category="test"`. Keep `network=false` unless the command truly needs it.
+  Only `category="build"` may write to its disposable verification copy.
+- When the plan declares or depends on a DDL/schema/migration file (`*.sql` or
+  under `migrations/`), exactly one test case must assert the model/ORM field
+  names match it column-for-column, with `verifies_schema` set to that path.
+  This is what catches a translated `nome` living beside a correct `job_name`.
+- `authoritative_assets`: safe relative paths, no repeats, and either a real
+  64-character SHA-256 or none at all.
+- `terminology` holds only repeated human-facing prose, one entry per canonical
+  term, with non-empty translations. Machine identifiers, external literals,
+  database fields, environment variables, and entry points belong in
+  `identifier_contract` and are never translated.
+- For `new_project`, every identifier must be valid English ASCII:
+  `package_name` and `identifier_contract.packages` lowercase
+  `[a-z][a-z0-9_]*`, `modules` dotted, `symbols`/`fields` plain identifiers,
+  `environment_variables` `[A-Z][A-Z0-9_]*`, `entry_points` `name=module:attr`.
+  Patch jobs preserve the existing names byte-for-byte instead."""
+
+
 def validate_plan(plan: Plan | None) -> Plan:
     """Validate legacy plans or the complete revisioned specification contract."""
     if not isinstance(plan, Plan):

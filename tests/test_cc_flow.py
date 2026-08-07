@@ -329,6 +329,19 @@ def test_existing_rpa_prompts_require_canonical_contract_repair():
         assert "`pandas-stubs`" in prompt
 
 
+def test_planner_prompt_inlines_the_validator_rules_verbatim():
+    # The prompt and validate_plan used to be hand-maintained copies and drifted:
+    # the prompt allowed "max 3" open_questions that validate_plan rejects outright,
+    # and demanded a public_api key whose rule had been deleted. Inlining the one
+    # constant is what keeps a re-divergence from being silent.
+    prompt = main._planner_prompt(main.CodebuilderFlow().state)
+
+    # validate_plan's own rejection of open_questions is pinned by
+    # test_spec_contract.py::test_validate_plan_rejects_unapproved_or_non_ascii_contract.
+    assert runtime_qa.PLANNER_CONTRACT_RULES in prompt
+    assert "max 3" not in prompt
+
+
 # --- run_executor ----------------------------------------------------------
 
 
