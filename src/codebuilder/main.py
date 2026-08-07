@@ -416,6 +416,14 @@ def _resolve_authoritative_asset(
         if patch_root is None:
             return None
         raw_root = Path(patch_root)
+        try:
+            workspace_prefix = raw_root.relative_to(Path(workspace_dir)).parts
+        except ValueError:
+            return None
+        if relative.parts[: len(workspace_prefix)] == workspace_prefix:
+            relative = PurePosixPath(*relative.parts[len(workspace_prefix) :])
+            if not relative.parts:
+                return None
     else:
         raw_root = inputs_path
     current = raw_root
@@ -475,6 +483,23 @@ def _bind_authoritative_asset_hashes(
     intake: IntakeAssessment | None = None,
 ) -> None:
     """Bind real asset hashes before approval, while the human can review them."""
+    raw_root = (
+        _resolve_patch_root(workspace_dir)
+        if plan.mode == "patch_existing"
+        else str(Path(workspace_dir) / "inputs")
+    )
+    if raw_root is not None:
+        root = Path(raw_root).resolve()
+        assets = [
+            *(intake.authoritative_assets if intake else []),
+            *plan.authoritative_assets,
+        ]
+        for asset in assets:
+            candidate = _resolve_authoritative_asset(
+                workspace_dir, asset.path, plan.mode
+            )
+            if candidate is not None:
+                asset.path = candidate.relative_to(root).as_posix()
     required = {asset.path for asset in (intake.authoritative_assets if intake else [])}
     declared = {asset.path for asset in plan.authoritative_assets}
     if missing := sorted(required - declared):
@@ -519,6 +544,8 @@ def _intake_prompt(state: CodebuilderState) -> str:
             "- List an authoritative_asset only when that file must be delivered "
             "byte-for-byte unchanged; list reference documentation only under "
             "evidence_inspected.\n"
+            "- For patch jobs, record authoritative_asset paths relative to the "
+            "attached project root, without an inputs/<project>/ prefix.\n"
             "- Existing package/module/symbol/database/API/environment names are "
             "authoritative and must be recorded verbatim, never translated.",
         ]
@@ -592,6 +619,8 @@ def _planner_prompt(state: CodebuilderState) -> str:
         "from the structured fields.\n"
         "- Set one exact English-ASCII `package_name` for new projects. Preserve "
         "existing package/module/symbol names byte-for-byte for patch jobs.\n"
+        "- For patch jobs, make every `authoritative_assets.path` relative to the "
+        "attached project root; never prefix it with `inputs/<project>/`.\n"
         "- Break the work into dependency-ordered `work_packages`. Each package must "
         "state what to build, expected behavior, stable success-criterion IDs, exact "
         "test cases covering every criterion, and every owned file exactly once.\n"

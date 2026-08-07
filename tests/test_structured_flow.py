@@ -531,6 +531,36 @@ def test_authoritative_assets_are_rehashed_from_intake_evidence_before_approval(
     assert len(plan.authoritative_assets[0].sha256) == 64
 
 
+def test_workspace_prefixed_authoritative_asset_is_canonicalized_before_approval(
+    flow: main.CodebuilderFlow,
+) -> None:
+    workspace = Path(flow.state.workspace_dir)
+    source = workspace / "inputs/app-faturamento-automatico-terra"
+    (source / "src").mkdir(parents=True)
+    lock = source / "uv.lock"
+    lock.write_text("version = 1\n")
+    prefixed = "inputs/app-faturamento-automatico-terra/uv.lock"
+    plan = _plan(_package("wp-1")).model_copy(
+        update={
+            "mode": "patch_existing",
+            "authoritative_assets": [AuthoritativeAsset(path=prefixed)],
+        }
+    )
+    intake = IntakeAssessment(
+        ready=True,
+        authoritative_assets=[AuthoritativeAsset(path=prefixed)],
+    )
+
+    main._bind_authoritative_asset_hashes(plan, str(workspace), intake)
+
+    assert intake.authoritative_assets[0].path == "uv.lock"
+    assert plan.authoritative_assets[0].path == "uv.lock"
+    assert (
+        plan.authoritative_assets[0].sha256
+        == hashlib.sha256(lock.read_bytes()).hexdigest()
+    )
+
+
 def test_new_project_does_not_use_unrelated_attachment_directories_as_baseline(
     flow: main.CodebuilderFlow, monkeypatch: pytest.MonkeyPatch
 ) -> None:
