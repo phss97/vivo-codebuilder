@@ -221,8 +221,12 @@ PLANNER_CONTRACT_RULES = """- `open_questions` must be empty. A plan that still 
 - Every test must own a file declared in the same package with `kind="test"`,
   reference only criterion ids from that package, and set both `test_name` and
   `expected_behavior`.
-- `public_api` declarations must parse as a name or signature. Omit the key when
-  a file exports nothing; do not invent synonyms or translations (create/build).
+- Every Python file that exports anything must list it in `public_api`, spelled
+  exactly as the code will spell it — a bare name or a full signature
+  (`build_invoice(path: str) -> Path`). That list is the only check that catches a
+  renamed `create_registro` → `build_registro`, and a file with an empty
+  `public_api` is exempt from it, so leave it empty only for a file that genuinely
+  exports nothing. Never a synonym or a translation of the real name.
 - `verification_commands`: unique ids, non-empty shell-free argv arrays, a
   relative `cwd`, and at least one entry with `required=true` and
   `category="test"`. Keep `network=false` unless the command truly needs it.

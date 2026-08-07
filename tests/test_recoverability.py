@@ -176,8 +176,10 @@ def test_planner_repair_feeds_the_rejection_back_into_the_next_prompt(
     assert "legacy plan" in prompts[1]
 
 
-def test_planner_repair_is_bounded(
-    flow: main.CodebuilderFlow, monkeypatch: pytest.MonkeyPatch
+def test_planner_repair_is_bounded_and_logs_the_rejected_plan(
+    flow: main.CodebuilderFlow,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     calls: list[int] = []
 
@@ -188,10 +190,13 @@ def test_planner_repair_is_bounded(
     monkeypatch.setattr(main.cc_agent, "run_planner", planner)
     monkeypatch.setenv("CODEBUILDER_PLANNER_REPAIR_ATTEMPTS", "3")
 
-    with pytest.raises(ValueError):
+    with caplog.at_level("WARNING"), pytest.raises(ValueError):
         asyncio.run(flow._plan_with_repair("PLAN THIS", "plan"))
 
     assert len(calls) == 3
+    # One error string cannot tell a planner bug from a validator bug after a
+    # 15-minute high-effort run, so the rejected plan itself must reach the log.
+    assert '"plan_markdown":"# legacy"' in caplog.text
 
 
 def test_missing_verification_commands_block_only_a_patch_job(
