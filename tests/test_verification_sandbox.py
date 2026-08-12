@@ -401,6 +401,46 @@ def test_declared_tests_reject_syntax_and_exact_name_drift(tmp_path):
     )
 
 
+def test_declared_class_based_test_satisfies_the_contract(tmp_path):
+    """pytest collects `Class::method`; the checker must too, or the QA gate loops."""
+    package = _package()
+    package.tests[0].test_name = "TestCore::test_core"
+    (tmp_path / "tests").mkdir()
+    path = tmp_path / "tests/test_core.py"
+    path.write_text(
+        "class TestCore:\n    def test_core(self):\n        pass\n", encoding="utf-8"
+    )
+
+    assert check_declared_tests(str(tmp_path), package) == "PASS"
+
+    package.tests[0].test_name = "TestCore.test_core"
+    assert check_declared_tests(str(tmp_path), package) == "PASS"
+
+    # A bare name still resolves to the single matching method...
+    package.tests[0].test_name = "test_core"
+    assert check_declared_tests(str(tmp_path), package) == "PASS"
+
+    # ...but drift inside the class is still caught exactly.
+    package.tests[0].test_name = "TestCore::test_missing"
+    assert "exact test missing: TestCore::test_missing" in check_declared_tests(
+        str(tmp_path), package
+    )
+
+
+def test_declared_bare_test_name_matching_two_classes_is_ambiguous(tmp_path):
+    package = _package()
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "tests/test_core.py").write_text(
+        "class TestA:\n    def test_core(self):\n        pass\n"
+        "class TestB:\n    def test_core(self):\n        pass\n",
+        encoding="utf-8",
+    )
+
+    output = check_declared_tests(str(tmp_path), package)
+    assert "ambiguous test name 'test_core'" in output
+    assert "TestA.test_core, TestB.test_core" in output
+
+
 def test_declared_non_python_test_requires_exact_approved_name(tmp_path):
     package = _package()
     package.tests[0].path = "tests/core.test.js"

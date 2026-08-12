@@ -218,6 +218,36 @@ def test_validate_plan_accepts_portuguese_prose_containing_todo():
     assert validate_plan(plan) is plan
 
 
+def test_validate_plan_rejects_test_name_the_checker_cannot_verify():
+    """A node id with the path in it is unverifiable — reject it before a human
+    approves the spec, not at the QA gate where `owner="test"` has no repair path."""
+    plan = _plan()
+    plan.work_packages[0].tests[0].test_name = "tests/test_core.py::TestA::test_b"
+
+    with pytest.raises(ValueError) as error:
+        validate_plan(plan)
+
+    assert "unverifiable test_name" in str(error.value)
+
+
+def test_validate_plan_accepts_class_qualified_and_non_python_test_names():
+    plan = _plan()
+    plan.work_packages[0].tests[0].test_name = "TestCore::test_b"
+    assert validate_plan(plan) is plan
+
+    # The checker reads the AST, so it resolves this. Rejecting it here would
+    # discard a whole Portuguese plan over a name the gate can verify.
+    plan.work_packages[0].tests[0].test_name = "test_fecha_sessão"
+    assert validate_plan(plan) is plan
+
+    # Non-Python paths are substring-matched, so free-form names stay legal.
+    test_file = plan.work_packages[0].files[1]
+    test_file.path = "tests/core.test.js"
+    plan.work_packages[0].tests[0].path = "tests/core.test.js"
+    plan.work_packages[0].tests[0].test_name = "builds core correctly"
+    assert validate_plan(plan) is plan
+
+
 @pytest.mark.parametrize(
     "category, argv, rejected",
     [

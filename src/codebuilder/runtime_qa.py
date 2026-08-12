@@ -69,6 +69,9 @@ _PACKAGE_ID = re.compile(r"^[a-z][a-z0-9_]*$")
 _SCHEMA_PATH = re.compile(r"(\.sql$|(^|/)migrations?/)", re.IGNORECASE)
 _WORK_PACKAGE_ID = re.compile(r"^[a-z][a-z0-9_-]*$")
 _MODULE_ID = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$")
+# Unicode \w on purpose: _test_names reads the AST, so `test_fecha_sessão` resolves at
+# the gate. Rejecting it here would discard a whole Portuguese plan the checker can verify.
+_TEST_NAME = re.compile(r"^[A-Za-z_]\w*(?:(?:::|\.)[A-Za-z_]\w*)?$")
 _ENV_ID = re.compile(r"^[A-Z][A-Z0-9_]*$")
 # ponytail: markers are case-sensitive on purpose — Portuguese "todo" ("all/whole")
 # is ordinary prose, and we ask the planner for prose in the job's language.
@@ -247,7 +250,9 @@ PLANNER_CONTRACT_RULES = """- `open_questions` must be empty. A plan that still 
   is covered by at least one test case. Test ids are unique too.
 - Every test must own a file declared in the same package with `kind="test"`,
   reference only criterion ids from that package, and set both `test_name` and
-  `expected_behavior`.
+  `expected_behavior`. For a `.py` test path, `test_name` is the bare function name
+  (`test_disposes_engine`) or `Class::method` / `Class.method` when the test lives in a
+  class — never the file path, never parametrisation brackets, never spaces.
 - Every Python file that exports anything must list it in `public_api`, spelled
   exactly as the code will spell it — a bare name or a full signature
   (`build_invoice(path: str) -> Path`). That list is the only check that catches a
@@ -423,6 +428,13 @@ def validate_plan(plan: Plan | None) -> Plan:
                     schema_tests[test.id] = schema.casefold()
             if not test.test_name.strip() or not test.expected_behavior.strip():
                 issues.append(f"{package.id}: test {test.id!r} is incomplete")
+            elif test.path.endswith(".py") and not _TEST_NAME.match(test.test_name):
+                # Only .py: the non-Python branch of check_declared_tests is a substring
+                # match, where "builds core correctly" is a legitimate test name.
+                issues.append(
+                    f"{package.id}: test {test.id!r} has unverifiable test_name "
+                    f"{test.test_name!r} — use a bare function name or Class::method"
+                )
         uncovered = criterion_id_set - covered
         if uncovered:
             issues.append(
@@ -1039,6 +1051,26 @@ def _defined_names(tree: ast.Module) -> set[str]:
     return names
 
 
+def _test_names(tree: ast.Module) -> set[str]:
+    """Top-level defs plus ``Class.method`` one class deep — pytest's collection depth.
+
+    Separate from `_defined_names` on purpose: that one is subtracted from a file's
+    declared `public_api`, where a class method must NOT satisfy a missing module-level
+    function.
+    """
+    names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.add(node.name)
+        if isinstance(node, ast.ClassDef):
+            names.update(
+                f"{node.name}.{child.name}"
+                for child in node.body
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+            )
+    return names
+
+
 def check_declared_tests(build_dir: str, package: WorkPackageSpec) -> str:
     """Validate the test author's exact approved files before code generation."""
     root = Path(build_dir).resolve()
@@ -1077,8 +1109,20 @@ def check_declared_tests(build_dir: str, package: WorkPackageSpec) -> str:
         except (OSError, SyntaxError, UnicodeError) as exc:
             failures.append(f"{test.path}: cannot inspect declared test: {exc}")
             continue
-        if test.test_name not in _defined_names(tree):
+        declared = test.test_name.replace("::", ".")
+        defined = _test_names(tree)
+        if declared in defined:
+            continue
+        # A bare declared name may still be a method: pytest node ids and bare names
+        # are both plausible readings of `test_name`, and the author sees the raw value.
+        candidates = sorted(name for name in defined if name.endswith(f".{declared}"))
+        if "." in declared or not candidates:
             failures.append(f"{test.path}: exact test missing: {test.test_name}.")
+        elif len(candidates) > 1:
+            failures.append(
+                f"{test.path}: ambiguous test name {test.test_name!r} — matches "
+                f"{', '.join(candidates)}; declare it as Class::name."
+            )
     return "PASS" if not failures else "\n".join(failures)
 
 
