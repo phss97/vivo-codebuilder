@@ -74,7 +74,7 @@ def _plan(
                 {
                     "id": "pytest",
                     "category": "test",
-                    "argv": ["pytest", "-q"],
+                    "argv": ["python", "-m", "unittest", "discover"],
                 }
             ],
         }
@@ -122,9 +122,9 @@ def test_plan_markdown_exposes_the_complete_approval_contract():
         AuthoritativeAsset(path="schemas/customer.json", sha256=digest)
     ]
     plan.verification_commands[0] = VerificationCommand(
-        id="pytest",
+        id="unit",
         category="test",
-        argv=["pytest", "-q", "tests/test_service.py"],
+        argv=["python", "-m", "unittest", "discover", "tests"],
         cwd="src",
         timeout_seconds=47,
         required=True,
@@ -141,8 +141,8 @@ def test_plan_markdown_exposes_the_complete_approval_contract():
     assert f"`schemas/customer.json` — immutable=true, sha256=`{digest}`" in markdown
     assert "Depends on: `wp-1`" in markdown
     assert (
-        "`pytest` [test, cwd=`src`, required=true, timeout=47s, network=false]: "
-        "`pytest -q tests/test_service.py`"
+        "`unit` [test, cwd=`src`, required=true, timeout=47s, network=false]: "
+        "`python -m unittest discover tests`"
     ) in markdown
 
 
@@ -216,6 +216,41 @@ def test_validate_plan_accepts_portuguese_prose_containing_todo():
     )
 
     assert validate_plan(plan) is plan
+
+
+@pytest.mark.parametrize(
+    "category, argv, rejected",
+    [
+        # Measured in a real non-build sandbox: no .venv, so these never run.
+        ("test", ["uv", "run", "--frozen", "pytest", "-q"], True),
+        ("test", ["pytest", "-q"], True),
+        ("typecheck", ["mypy"], True),
+        ("typecheck", ["python", "-m", "mypy", "src"], True),
+        ("lint", ["pip", "install", "-e", "."], True),
+        # Self-contained or stdlib-only: these work today and must keep validating.
+        # This half is the one that catches an over-broad reject list.
+        ("lint", ["ruff", "check", "--no-cache", "."], False),
+        ("test", ["python", "-m", "unittest", "discover"], False),
+        ("test", ["python", "-c", "import demo"], False),
+        ("build", ["uv", "run", "--frozen", "pytest", "-q"], False),
+    ],
+)
+def test_dependency_commands_are_only_valid_as_build(category, argv, rejected):
+    """A non-build verification copy is read-only with no installed dependencies,
+    so a command needing them exits on the environment and reads as broken code."""
+    plan = _plan()
+    plan.verification_commands.append(
+        VerificationCommand(id="extra", category=category, argv=argv)
+    )
+
+    if not rejected:
+        assert validate_plan(plan) is plan
+        return
+    with pytest.raises(ValueError) as error:
+        validate_plan(plan)
+    # The repair loop replays this verbatim, so it must carry the remedy.
+    assert "'extra'" in str(error.value)
+    assert 'category="build"' in str(error.value)
 
 
 def test_declared_schema_requires_a_field_parity_test():

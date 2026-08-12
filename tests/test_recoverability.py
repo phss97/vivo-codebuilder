@@ -72,7 +72,11 @@ def _structured_plan() -> Plan:
                     }
                 ],
                 "verification_commands": [
-                    {"id": "tests", "category": "test", "argv": ["pytest", "-q"]}
+                    {
+                        "id": "tests",
+                        "category": "test",
+                        "argv": ["python", "-m", "unittest", "discover"],
+                    }
                 ],
             }
         )

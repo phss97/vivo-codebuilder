@@ -81,7 +81,7 @@ def _plan(*packages: dict) -> Plan:
                     {
                         "id": "tests",
                         "category": "test",
-                        "argv": ["pytest", "-q"],
+                        "argv": ["python", "-m", "unittest", "discover"],
                     }
                 ],
             }

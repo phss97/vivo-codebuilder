@@ -435,7 +435,7 @@ def test_package_identifier_must_be_a_real_directory(tmp_path):
                 {
                     "id": "tests",
                     "category": "test",
-                    "argv": ["pytest", "-q"],
+                    "argv": ["python", "-m", "unittest", "discover"],
                 }
             ],
         }

@@ -158,6 +158,29 @@ def _safe_relative_path(value: str, *, allow_dot: bool = False) -> str | None:
     return normalized if normalized == stripped else None
 
 
+# ponytail: only tools measured failing in a real non-build sandbox (uv 125,
+# pytest 4, mypy 71) plus the installers, which always need a writable root. A
+# false entry here is unrecoverable — the repair loop would be told to move a
+# command that actually works — so self-contained tools stay out: `ruff check
+# --no-cache .` was measured at rc=0 and must keep validating.
+_NEEDS_INSTALLED_DEPS = frozenset(
+    {"uv", "uvx", "pip", "pip3", "poetry", "pdm", "pytest", "mypy"}
+)
+
+
+def _dependency_tool(argv: list[str]) -> str | None:
+    """Name the tool in argv that cannot run without installed dependencies."""
+    if not argv:
+        return None
+    head = PurePosixPath(argv[0]).name
+    if head in _NEEDS_INSTALLED_DEPS:
+        return head
+    if head.startswith("python") and argv[1:2] == ["-m"]:
+        module = argv[2].partition(".")[0] if len(argv) > 2 else ""
+        return module if module in _NEEDS_INSTALLED_DEPS else None
+    return None
+
+
 def _duplicates(values: list[str]) -> list[str]:
     seen: set[str] = set()
     duplicates: list[str] = []
@@ -234,7 +257,20 @@ PLANNER_CONTRACT_RULES = """- `open_questions` must be empty. A plan that still 
 - `verification_commands`: unique ids, non-empty shell-free argv arrays, a
   relative `cwd`, and at least one entry with `required=true` and
   `category="test"`. Keep `network=false` unless the command truly needs it.
-  Only `category="build"` may write to its disposable verification copy.
+- Every command runs in its own disposable copy of the project, and only
+  `category="build"` may write to that copy. Every other category gets a
+  read-only root with **no `.venv` and no installed dependencies**, so it can
+  only run the interpreter's standard library. Plan accordingly:
+  - The mandatory `category="test"` gate must be stdlib-only — `["python","-c",
+    "..."]` or `["python","-m","unittest",...]`. A cheap structural gate (import
+    the package, `ast.parse` every source file) is the intended shape.
+  - The real suite and the type check need the dependencies installed, so they
+    must be `category="build"` with `network=true`:
+    `["uv","run","--frozen","pytest","-q"]`, `["uv","run","--frozen","mypy"]`.
+    Each build command pays a full cold install; that is expected.
+  - Self-contained tools that need no project dependency stay in their own
+    category, but must not write to the read-only root — `ruff` needs
+    `--no-cache`: `["ruff","check","--no-cache","."]`.
 - When the plan declares or depends on a DDL/schema/migration file (`*.sql` or
   under `migrations/`), exactly one test case must assert the model/ORM field
   names match it column-for-column, with `verifies_schema` set to that path.
@@ -430,6 +466,14 @@ def validate_plan(plan: Plan | None) -> Plan:
             or any(not value.strip() for value in command.argv)
         ):
             issues.append(f"verification command {command.id!r} has empty argv")
+        elif (tool := _dependency_tool(command.argv)) and command.category != "build":
+            issues.append(
+                f"verification command {command.id!r} runs {tool!r}, but "
+                f"category={command.category!r} gets a read-only copy with no "
+                'installed dependencies — declare it category="build" with '
+                "network=true, or replace it with a stdlib-only argv such as "
+                '["python","-c",...] or ["python","-m","unittest",...]'
+            )
         if _safe_relative_path(command.cwd, allow_dot=True) is None:
             issues.append(f"verification command {command.id!r} has unsafe cwd")
 
@@ -891,6 +935,21 @@ def run_verification_command(
                     stdout=truncate(stdout or ""),
                     stderr="Verification sandbox unavailable: "
                     + truncate(stderr or "sandbox startup failed"),
+                    mutated_paths=mutations,
+                )
+            # ponytail: the launcher prefixes its own exec diagnostic
+            # (`sandbox-exec: execvp() of 'mypy' failed`, `bwrap: execvp mypy`).
+            # The process never started, so this is never a code defect — 127
+            # is what _structured_qa already routes to owner="environment",
+            # whereas sandbox-exec's raw 71 would have bought a repair attempt.
+            if f"{sandbox_kind}: execvp" in (stderr or ""):
+                return CommandResult(
+                    command_id=command.id,
+                    passed=False,
+                    returncode=127,
+                    stdout=truncate(stdout or ""),
+                    stderr="Verification command executable not found: "
+                    + truncate(stderr or ""),
                     mutated_paths=mutations,
                 )
     except (OSError, WorkspaceSafetyError) as exc:
