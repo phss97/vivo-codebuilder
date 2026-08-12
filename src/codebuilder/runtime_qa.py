@@ -70,8 +70,11 @@ _SCHEMA_PATH = re.compile(r"(\.sql$|(^|/)migrations?/)", re.IGNORECASE)
 _WORK_PACKAGE_ID = re.compile(r"^[a-z][a-z0-9_-]*$")
 _MODULE_ID = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*$")
 _ENV_ID = re.compile(r"^[A-Z][A-Z0-9_]*$")
-_PLACEHOLDER = re.compile(
-    r"\b(?:todo|tbd|placeholder|to be determined|diagnostic only|investigate only|analysis only)\b",
+# ponytail: markers are case-sensitive on purpose — Portuguese "todo" ("all/whole")
+# is ordinary prose, and we ask the planner for prose in the job's language.
+_PLACEHOLDER_MARKER = re.compile(r"\b(?:TODO|TBD)\b")
+_PLACEHOLDER_PHRASE = re.compile(
+    r"\b(?:to be determined|diagnostic only|investigate only|analysis only)\b",
     re.IGNORECASE,
 )
 _PUBLIC_API_NAME = re.compile(
@@ -288,8 +291,11 @@ def validate_plan(plan: Plan | None) -> Plan:
         )
         if not _WORK_PACKAGE_ID.fullmatch(package.id) or not package.title.strip():
             issues.append(f"invalid work package id/title: {package.id!r}")
-        if _PLACEHOLDER.search(text):
-            issues.append(f"{package.id}: placeholder-only work package")
+        if match := (_PLACEHOLDER_MARKER.search(text) or _PLACEHOLDER_PHRASE.search(text)):
+            issues.append(
+                f"{package.id}: placeholder text {match.group(0)!r} in title/what_to_build/"
+                "expected_behavior — describe the real work instead"
+            )
         if not package.what_to_build.strip() or not package.expected_behavior.strip():
             issues.append(f"{package.id}: build or behavior description is empty")
         if not package.files:
