@@ -27,8 +27,9 @@ data/
 *.sqlite3
 brief.json
 
-# CrewAI scaffolding doc (kept locally, not pushed)
-AGENTS.md
+.uv-cache/
+changelog/
 
 .claude
 references/
+amp_logs/
