@@ -47,6 +47,17 @@ from codebuilder.tools.project_env import (
 
 MAX_QA_OUTPUT_CHARS = 12000
 MAX_PROMPT_SECTION_CHARS = 6000
+# The two failures that mean *nothing* can run, as opposed to an
+# environment-owned verification-command failure (rc 124/127 below), which is
+# one broken command in an otherwise usable runtime. Named because the intake
+# gate selects on exactly these and must not widen to every owner=environment
+# issue.
+ENV_UNPROVISIONED = "The project environment could not be provisioned."
+PREFLIGHT_INCOMPLETE = "Preflight QA could not complete."
+DEAD_RUNTIME_MESSAGES = frozenset({ENV_UNPROVISIONED, PREFLIGHT_INCOMPLETE})
+# Marker in a `check_declared_tests` failure line: the contract could not be
+# enforced, as opposed to the author breaking it. The caller routes on it.
+BASELINE_UNREADABLE = "baseline copy could not be read"
 
 _QA_SKIP_DIRS = {
     ".git",
@@ -957,12 +968,21 @@ def run_verification_command(
             # is what _structured_qa already routes to owner="environment",
             # whereas sandbox-exec's raw 71 would have bought a repair attempt.
             if f"{sandbox_kind}: execvp" in (stderr or ""):
+                # Report where the executable was looked for. "returncode 127"
+                # alone cannot distinguish a tool missing from the image from a
+                # tool present but outside the sandbox's PATH, and that guess
+                # decides whether the fix is the plan or the deployment.
+                resolved = shutil.which(command.argv[0], path=environment.get("PATH"))
                 return CommandResult(
                     command_id=command.id,
                     passed=False,
                     returncode=127,
                     stdout=truncate(stdout or ""),
-                    stderr="Verification command executable not found: "
+                    stderr=(
+                        f"Verification command executable not found: "
+                        f"{command.argv[0]} resolved to "
+                        f"{resolved or 'nothing'} on the sandboxed PATH. "
+                    )
                     + truncate(stderr or ""),
                     mutated_paths=mutations,
                 )
@@ -1073,8 +1093,57 @@ def _test_names(tree: ast.Module) -> set[str]:
     return names
 
 
-def check_declared_tests(build_dir: str, package: WorkPackageSpec) -> str:
-    """Validate the test author's exact approved files before code generation."""
+def _collectible_test_names(tree: ast.Module) -> set[str]:
+    """The subset of `_test_names` pytest actually collects, which is what turns
+    an undeclared test into an acceptance obligation: `test_*` module functions
+    and `test_*` methods of `Test*` classes. Fixtures and helpers are neither, so
+    the author stays free to write them.
+    """
+    names: set[str] = set()
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            if node.name.startswith("test"):
+                names.add(node.name)
+        elif isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
+            names.update(
+                f"{node.name}.{child.name}"
+                for child in node.body
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and child.name.startswith("test")
+            )
+    return names
+
+
+def _baseline_test_names(path: Path) -> set[str]:
+    """Tests the author inherited rather than wrote, raising when a baseline is
+    there but cannot be read.
+
+    An *absent* baseline genuinely has no inherited tests — a brand-new file —
+    so an empty set is the right answer. An *unreadable* one (a latin-1 test
+    module, syntax from a newer Python, a permission error) proves nothing about
+    what was inherited: answering "empty" would report every inherited test as
+    undeclared, and answering "everything is inherited" would switch the exact
+    contract off. Neither is true, so it raises and the caller reports that.
+    """
+    if not path.is_file():
+        return set()
+    return _collectible_test_names(
+        ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    )
+
+
+def check_declared_tests(
+    build_dir: str, package: WorkPackageSpec, *, baseline_dir: str | None = None
+) -> str:
+    """Validate the test author's exact approved files before code generation.
+
+    With `baseline_dir` set the contract is enforced in both directions, which is
+    what the test-author prompt already promises: every declared test present,
+    and no undeclared test that the author added. Tests already in the baseline
+    are inherited, not authored, so they never count as violations. Callers with
+    no baseline to compare against (final QA, where the tests are long frozen)
+    keep presence-only semantics.
+    """
     root = Path(build_dir).resolve()
     failures: list[str] = []
     for test in package.tests:
@@ -1125,6 +1194,50 @@ def check_declared_tests(build_dir: str, package: WorkPackageSpec) -> str:
                 f"{test.path}: ambiguous test name {test.test_name!r} — matches "
                 f"{', '.join(candidates)}; declare it as Class::name."
             )
+    if baseline_dir is not None:
+        base = Path(baseline_dir).resolve()
+        by_file: dict[str, set[str]] = {}
+        for test in package.tests:
+            by_file.setdefault(test.path, set()).add(test.test_name.replace("::", "."))
+        for relative_path, declared_names in sorted(by_file.items()):
+            path = root / relative_path
+            if path.suffix != ".py" or not path.is_file() or path.is_symlink():
+                continue
+            try:
+                defined = _collectible_test_names(
+                    ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+                )
+            except (OSError, SyntaxError, UnicodeError):
+                continue  # the presence pass above already reported this file
+            approved = set(declared_names)
+            # A bare declared name may legitimately be a method (same reading the
+            # presence pass allows), and that method is then declared, not extra.
+            approved.update(
+                name
+                for name in defined
+                for declared in declared_names
+                if "." not in declared and name.endswith(f".{declared}")
+            )
+            try:
+                approved.update(_baseline_test_names(base / relative_path))
+            except (OSError, SyntaxError, UnicodeError) as exc:
+                # Not "skip the check": an unreadable baseline that turned the
+                # contract off would be an exact contract only while the tree
+                # happens to be readable. Report it instead, as its own kind of
+                # failure — the author cannot fix a file outside its stage.
+                failures.append(
+                    f"{relative_path}: {BASELINE_UNREADABLE} "
+                    f"({type(exc).__name__}: {exc}) — tests inherited from it "
+                    "cannot be told apart from tests this attempt added, so the "
+                    "exact test contract cannot be enforced."
+                )
+                continue
+            if extra := sorted(defined - approved):
+                failures.append(
+                    f"{relative_path}: undeclared tests: {', '.join(extra)}. The "
+                    "approved test contract is exact — delete them, or amend the "
+                    "spec to declare them."
+                )
     return "PASS" if not failures else "\n".join(failures)
 
 
@@ -1869,7 +1982,10 @@ def run_final_qa(
         sync_output = "SKIP: project environment provisioning is disabled"
     else:
         sync_output = ensure_project_env(build_dir, locked=locked_sync)
-    sync_ok = not sync_output or not require_installable
+    # A deliberate "provisioning disabled" SKIP is an operator setting, not
+    # evidence the environment is broken — only a real failure counts.
+    sync_failed = bool(sync_output) and not is_skip(sync_output)
+    sync_ok = not sync_failed or not require_installable
 
     lint_output = LintRunnerTool(
         workspace_dir=build_dir,
@@ -1941,7 +2057,7 @@ def run_final_qa(
         )
 
     checks = [
-        f"uv sync --locked: {'PASS' if not sync_output else 'FAIL'}",
+        f"uv sync --locked: {'PASS' if not sync_failed else 'FAIL'}",
         f"ruff check + format: {'PASS' if lint_ok else 'FAIL'}",
         f"mypy: {'PASS' if type_ok else 'FAIL'}",
         f".env.example consistency: {'PASS' if env_ok else 'FAIL'}",
@@ -1996,6 +2112,26 @@ def run_final_qa(
             )
         ]
     )
+    # A failed sync used to set passed=False while emitting no issue at all, so
+    # the report read `passed: false, issues: []` and nothing downstream could
+    # tell why. It is also the one failure that invalidates every other check
+    # below it: with no project venv, lint/type/test/entry points cannot run.
+    sync_issues = (
+        []
+        if sync_ok
+        else [
+            QAIssue(
+                source="command",
+                owner="environment",
+                message=ENV_UNPROVISIONED,
+                evidence=truncate(sync_output),
+                repair_instruction=(
+                    "Fix the dependency or package-index problem so `uv sync` "
+                    "succeeds; no verification command can run until it does."
+                ),
+            )
+        ]
+    )
     command_issues = [
         QAIssue(
             source="command",
@@ -2039,6 +2175,6 @@ def run_final_qa(
         or (plan_spec_hash(plan) if plan and plan.is_structured else ""),
         package_id=package_id,
         command_results=command_results,
-        issues=[*contract_issues, *command_issues],
+        issues=[*sync_issues, *contract_issues, *command_issues],
         contract_issues=contract_issues,
     )

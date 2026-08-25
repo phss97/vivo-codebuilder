@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import inspect
+import subprocess
 import zipfile
 
 import pytest
@@ -15,7 +16,14 @@ from codebuilder import cc_agent
 from codebuilder.tools import lint_runner_tool
 from codebuilder.cc_agent import CCAgentError
 from codebuilder.runtime_qa import run_final_qa, validate_plan
-from codebuilder.schemas import Attachment, Plan, ProductionReview, QAReport
+from codebuilder.schemas import (
+    Attachment,
+    IntakeAssessment,
+    Plan,
+    ProductionReview,
+    QAIssue,
+    QAReport,
+)
 from codebuilder.tools.git_tool import _HARNESS_EXCLUDES
 from codebuilder.tools.lint_runner_tool import apply_ruff_fixes
 from codebuilder.tools import s3_artifacts
@@ -1226,3 +1234,139 @@ def test_final_qa_failure_returns_report_without_archive(tmp_path, monkeypatch):
     assert "project_archive" not in payload and "zip_path" not in payload
     assert not (tmp_path / "demo.zip").exists()
     assert "F401" in payload["qa_report_markdown"]
+
+
+def test_disabled_provisioning_is_a_skip_not_a_dead_runtime(tmp_path, monkeypatch):
+    """Turning provisioning off is an operator setting; it must not look like a
+    broken environment, or every such job blocks at the intake gate."""
+    monkeypatch.setenv("CODEBUILDER_PROVISION_PROJECT_ENV", "0")
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='demo'\nversion='0.1'\n")
+    monkeypatch.setattr(runtime_qa.LintRunnerTool, "_run", lambda *_: "PASS")
+    monkeypatch.setattr(runtime_qa.TypeCheckRunnerTool, "_run", lambda *_: "PASS")
+    monkeypatch.setattr(runtime_qa.TestRunnerTool, "_run", lambda *_: "PASS\n1 passed")
+    monkeypatch.setattr(runtime_qa, "check_env_example", lambda *_: "PASS")
+    monkeypatch.setattr(runtime_qa, "check_runtime_contract", lambda *_: "PASS")
+
+    report = run_final_qa(str(tmp_path), require_installable=True)
+
+    assert not [issue for issue in report.issues if issue.owner == "environment"]
+
+
+def test_failed_sync_reports_a_blocking_environment_issue(tmp_path, monkeypatch):
+    """The observed run reported `passed: false, issues: []`, so nothing
+    downstream could tell that the runtime, not the code, was the problem."""
+    monkeypatch.setattr(
+        runtime_qa,
+        "ensure_project_env",
+        lambda *_a, **_k: "openpyxl was not found in the package registry",
+    )
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='demo'\nversion='0.1'\n")
+    monkeypatch.setattr(runtime_qa.LintRunnerTool, "_run", lambda *_: "PASS")
+    monkeypatch.setattr(runtime_qa.TypeCheckRunnerTool, "_run", lambda *_: "PASS")
+    monkeypatch.setattr(runtime_qa.TestRunnerTool, "_run", lambda *_: "PASS\n1 passed")
+    monkeypatch.setattr(runtime_qa, "check_env_example", lambda *_: "PASS")
+    monkeypatch.setattr(runtime_qa, "check_runtime_contract", lambda *_: "PASS")
+
+    report = run_final_qa(str(tmp_path), require_installable=True)
+
+    assert not report.passed
+    issues = [issue for issue in report.issues if issue.owner == "environment"]
+    assert issues and "openpyxl" in issues[0].evidence
+
+
+def test_dead_runtime_blocks_intake_without_restranding_the_resume(monkeypatch):
+    flow = main.CodebuilderFlow()
+    flow.state.preflight_qa_report = QAReport(
+        passed=False,
+        issues=[
+            QAIssue(
+                source="command",
+                owner="environment",
+                message=runtime_qa.ENV_UNPROVISIONED,
+                evidence="openpyxl was not found in the package registry",
+            )
+        ],
+    )
+
+    question = flow._preflight_blocking_question()
+    assert question is not None and question.id == "preflight_env_unusable"
+
+    assessment = IntakeAssessment(ready=True)
+    assessment.blocking_questions.append(question)
+    flow._apply_intake_gate(assessment)
+    assert not assessment.ready
+
+    # reassess_intake shares _apply_intake_gate but never re-runs preflight, so
+    # a resumed answer must be able to proceed — otherwise the pending row is
+    # stranded behind a question no answer can clear.
+    resumed = IntakeAssessment(ready=True)
+    flow._apply_intake_gate(resumed)
+    assert resumed.ready
+
+
+def test_customer_lint_failure_alone_does_not_block_intake():
+    """Fixing the customer's imperfect code is the job, not a reason to stop."""
+    flow = main.CodebuilderFlow()
+    flow.state.preflight_qa_report = QAReport(passed=False, lint_output="lint failed")
+    assert flow._preflight_blocking_question() is None
+
+    flow.state.preflight_qa_report = None
+    assert flow._preflight_blocking_question() is None
+
+
+def test_one_broken_verification_command_does_not_block_intake():
+    """run_final_qa owns rc 124/127 to `environment` too, but a timed-out or
+    missing-tool command is one broken command in a usable runtime — not the
+    dead runtime the gate's question describes."""
+    flow = main.CodebuilderFlow()
+    flow.state.preflight_qa_report = QAReport(
+        passed=False,
+        issues=[
+            QAIssue(
+                source="command",
+                owner="environment",
+                message="Verification command 'lint' failed.",
+                evidence="Verification command executable not found: ruff",
+            )
+        ],
+    )
+    assert flow._preflight_blocking_question() is None
+
+
+def test_the_gate_selects_exactly_the_messages_its_producers_emit():
+    """The gate matches on message text, so a producer renaming its message
+    would silently disarm the gate."""
+    assert runtime_qa.DEAD_RUNTIME_MESSAGES == {
+        runtime_qa.ENV_UNPROVISIONED,
+        runtime_qa.PREFLIGHT_INCOMPLETE,
+    }
+
+
+def test_our_package_index_never_leaks_into_the_customer_sync(tmp_path, monkeypatch):
+    """Inherited wholesale, codebuilder's own mirror config silently redirects
+    the customer project's resolution — a package the mirror lacks then 401s
+    instead of resolving from public PyPI."""
+    from codebuilder.tools import project_env
+
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='demo'\nversion='0.1'\n")
+    monkeypatch.setenv("CODEBUILDER_PROVISION_PROJECT_ENV", "1")
+    monkeypatch.setenv("UV_DEFAULT_INDEX", "https://pypi.example-mirror.com/simple")
+    monkeypatch.setenv("PIP_INDEX_URL", "https://pypi.example-mirror.com/simple")
+    monkeypatch.setenv("KEEP_ME", "yes")
+    monkeypatch.setattr(project_env.shutil, "which", lambda _name: "/usr/bin/uv")
+    # Record only what is asserted: the passed env is the real one, and a
+    # failing assertion on the whole dict would print live credentials.
+    captured: dict = {}
+    watched = {"UV_DEFAULT_INDEX", "PIP_INDEX_URL", "KEEP_ME"}
+
+    def _run(_command, **kwargs):
+        captured.update({k: v for k, v in kwargs["env"].items() if k in watched})
+        return subprocess.CompletedProcess(_command, 0, "", "")
+
+    monkeypatch.setattr(project_env.subprocess, "run", _run)
+
+    assert project_env.ensure_project_env(str(tmp_path)) == ""
+    assert "UV_DEFAULT_INDEX" not in captured
+    assert "PIP_INDEX_URL" not in captured
+    # Only index config is dropped; the rest of the environment still passes.
+    assert captured["KEEP_ME"] == "yes"

@@ -25,7 +25,10 @@ from crewai.flow.human_feedback import human_feedback
 
 from codebuilder import cc_agent, history, package_workspace
 from codebuilder.runtime_qa import (
+    BASELINE_UNREADABLE,
+    DEAD_RUNTIME_MESSAGES,
     PLANNER_CONTRACT_RULES,
+    PREFLIGHT_INCOMPLETE,
     artifact_refs,
     check_declared_tests,
     check_preserved_dependencies,
@@ -651,22 +654,58 @@ def _planner_prompt(state: CodebuilderState) -> str:
 
 
 def _test_author_prompt(
-    state: CodebuilderState, plan: Plan, package: WorkPackageSpec, guidance: str = ""
+    state: CodebuilderState,
+    plan: Plan,
+    package: WorkPackageSpec,
+    guidance: str = "",
+    *,
+    repair_report: QAReport | None = None,
 ) -> str:
     parts = [
         "Write the approved tests for exactly one work package. Tests are the frozen "
         "acceptance evidence for the next agent, so do not implement production code "
         "and do not weaken an assertion merely to make the current tree pass.",
+        # The declared names lead the prompt because they are the only thing the
+        # contract gate actually checks. They used to be needles inside the package
+        # JSON below, competing with `what_to_build` prose that described a different
+        # number of scenarios — and the author wrote the prose, not the contract.
+        "## Required tests — create exactly these, spelled exactly\n"
+        + (
+            "\n".join(
+                f"- `{test.path}::{test.test_name}` — {test.expected_behavior}"
+                for test in package.tests
+            )
+            or "(none)"
+        ),
         f"## Work package\n{json.dumps(package.model_dump(mode='json'), indent=2, ensure_ascii=False)}",
         f"## Approved spec hash\n{state.approved_spec_hash}",
-        f"## Canonical identifier and terminology contract\n{_canonical_spec_json(plan)}",
+        f"## Exact identifier contract\n{json.dumps(plan.identifier_contract.model_dump(mode='json'), indent=2, ensure_ascii=False)}",
+        f"## Human-facing terminology registry\n{json.dumps([entry.model_dump(mode='json') for entry in plan.terminology], indent=2, ensure_ascii=False)}",
     ]
+    if repair_report is not None:
+        # ponytail: rendered inline rather than through qa_report_for_repair, which
+        # dumps the whole QAReport as JSON. A contract failure carries one issue and
+        # empty everything else, so that helper would re-bury the exact missing names
+        # this section exists to surface.
+        violations = [
+            f"{issue.message}\n{issue.evidence}".strip()
+            for issue in repair_report.issues
+            if issue.owner == "test" and issue.blocking
+        ]
+        if violations:
+            parts.append(
+                "## Contract violations to fix — the previous attempt failed these "
+                "exact checks\n" + "\n\n".join(violations)
+            )
     if guidance:
         parts.append(f"## Human retry guidance\n{guidance}")
     parts.append(
-        "## Completion contract\nCreate every declared test path and exact test name, "
-        "cover every mapped criterion, use canonical identifiers verbatim, run the "
-        "most focused available checks, and stop if the approved contract is ambiguous."
+        "## Completion contract\nCreate exactly the tests listed above — those paths "
+        "and those names, no more and no fewer. The declared test names are "
+        "normative; scenario prose in `what_to_build` is illustrative only and never "
+        "changes a name or the number of tests. Cover every mapped criterion, use "
+        "canonical identifiers verbatim, run the most focused available checks, and "
+        "stop if the approved contract is ambiguous."
     )
     return "\n\n".join(parts)
 
@@ -913,6 +952,21 @@ class CodebuilderFlow(Flow[CodebuilderState]):
                 self.state.preflight_qa_report = QAReport(
                     passed=False,
                     integration_notes=f"Preflight QA could not complete: {exc}",
+                    # Preflight crashing outright is the least confident case of
+                    # all, so it must reach the same gate a failed sync does
+                    # rather than silently proceed to planning.
+                    issues=[
+                        QAIssue(
+                            source="command",
+                            owner="environment",
+                            message=PREFLIGHT_INCOMPLETE,
+                            evidence=str(exc),
+                            repair_instruction=(
+                                "Fix the workspace or runtime so deterministic "
+                                "checks can run."
+                            ),
+                        )
+                    ],
                 )
             _emit_progress(
                 self.state,
@@ -942,9 +996,43 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             prompt=prompt,
             on_usage=lambda summary: _emit_usage(self.state, summary),
         )
+        if question := self._preflight_blocking_question():
+            assessment.blocking_questions.append(question)
         self._apply_intake_gate(assessment)
         self.state.intake_assessment = assessment
         return assessment.model_dump(mode="json")
+
+    def _preflight_blocking_question(self) -> IntakeQuestion | None:
+        """Ask once, before planning spends anything, when the attached project's
+        environment cannot run anything at all.
+
+        Deliberately called only from `assess_intake`, never from
+        `_apply_intake_gate`: `preflight_qa_report` is captured once in `ingest`
+        and never refreshed, so gating on it in the shared helper would re-block
+        every resumed answer and strand the pending row.
+        """
+        report = self.state.preflight_qa_report
+        if report is None:
+            return None
+        dead_runtime = [
+            issue
+            for issue in report.issues
+            if issue.blocking and issue.message in DEAD_RUNTIME_MESSAGES
+        ]
+        if not dead_runtime:
+            return None
+        return IntakeQuestion(
+            id="preflight_env_unusable",
+            question=(
+                "The attached project's environment could not be provisioned, so "
+                "lint, type checks, tests, and entry points cannot run at all. Fix "
+                "the dependency or package-index problem, or confirm the job should "
+                "proceed without deterministic verification."
+            ),
+            rationale="; ".join(
+                issue.evidence or issue.message for issue in dead_runtime
+            ),
+        )
 
     def _apply_intake_gate(self, assessment: IntakeAssessment) -> None:
         """Only a patch job can be blocked on unknown verification commands — for a
@@ -1491,7 +1579,12 @@ class CodebuilderFlow(Flow[CodebuilderState]):
         return {"route": "execution_complete"}
 
     async def _run_package(
-        self, plan: Plan, package: WorkPackageSpec, guidance: str = ""
+        self,
+        plan: Plan,
+        package: WorkPackageSpec,
+        guidance: str = "",
+        *,
+        repair_report: QAReport | None = None,
     ) -> dict:
         workspace = self.state.workspace_dir
         canonical = self.state.canonical_build_dir
@@ -1510,61 +1603,122 @@ class CodebuilderFlow(Flow[CodebuilderState]):
         self.state.current_stage_dir = str(stage)
         test_paths = self._scope_test_paths(plan, package)
         baseline = package_workspace.snapshot_files(stage)
-        _emit_progress(self.state, "test_author_started", package_id=package.id)
-        try:
-            await cc_agent.run_test_author(
-                cwd=stage,
-                prompt=_test_author_prompt(self.state, plan, package, guidance),
-                declared_test_files=test_paths,
-                budget_usd=(
-                    self._remaining_budget()
-                    if guidance
-                    else self._remaining_initial_budget()
-                ),
-                on_usage=self._record_executor_usage,
-            )
-        except Exception as exc:  # noqa: BLE001 — surface through the QA decision gate
-            report = self._issue_report(
-                package.id,
-                QAIssue(
-                    source="review",
-                    owner="environment",
-                    message=f"Test author could not complete: {exc}",
-                    repair_instruction="Retry after fixing the agent environment.",
-                ),
-            )
-            return self._record_failure(report, str(stage), package.id)
-
-        changed = package_workspace.changed_paths(
-            baseline, package_workspace.snapshot_files(stage)
+        _emit_progress(
+            self.state, "test_author_started", package_id=package.id, attempt=0
         )
-        unexpected = sorted(set(changed) - set(test_paths))
-        missing = [
-            path
-            for path in test_paths
-            if (stage / path).is_symlink() or not (stage / path).is_file()
-        ]
-        if unexpected:
-            package_workspace.restore_files(workspace, stage, canonical, unexpected)
-        declared_test_output = check_declared_tests(str(stage), package)
-        if unexpected or missing or declared_test_output != "PASS":
-            details = []
-            if unexpected:
-                details.append("unapproved changes: " + ", ".join(unexpected))
-            if missing:
-                details.append("missing tests: " + ", ".join(missing))
-            if declared_test_output != "PASS":
-                details.append(declared_test_output)
-            report = self._issue_report(
-                package.id,
-                QAIssue(
-                    source="contract",
-                    owner="test",
-                    message="Test author violated the approved test contract.",
-                    evidence="; ".join(details),
-                    repair_instruction="Rewrite only the declared tests from the approved criteria.",
-                ),
+
+        async def author_once(
+            evidence: QAReport | None, attempt: int
+        ) -> QAReport | None:
+            """Call the test author once and return a report, or None when the
+            approved contract is satisfied."""
+            try:
+                await cc_agent.run_test_author(
+                    cwd=stage,
+                    prompt=_test_author_prompt(
+                        self.state, plan, package, guidance, repair_report=evidence
+                    ),
+                    declared_test_files=test_paths,
+                    budget_usd=(
+                        self._remaining_initial_budget()
+                        if attempt == 0 and not guidance
+                        else self._remaining_budget()
+                    ),
+                    on_usage=self._record_executor_usage,
+                )
+            except Exception as exc:  # noqa: BLE001 — surface through the QA decision gate
+                return self._issue_report(
+                    package.id,
+                    QAIssue(
+                        source="review",
+                        owner="environment",
+                        message=f"Test author could not complete: {exc}",
+                        repair_instruction="Retry after fixing the agent environment.",
+                    ),
+                )
+
+            changed = package_workspace.changed_paths(
+                baseline, package_workspace.snapshot_files(stage)
             )
+            unexpected = sorted(set(changed) - set(test_paths))
+            missing = [
+                path
+                for path in test_paths
+                if (stage / path).is_symlink() or not (stage / path).is_file()
+            ]
+            if unexpected:
+                package_workspace.restore_files(workspace, stage, canonical, unexpected)
+            declared_test_output = check_declared_tests(
+                str(stage), package, baseline_dir=str(canonical)
+            )
+            if unexpected or missing or declared_test_output != "PASS":
+                details = []
+                if unexpected:
+                    details.append("unapproved changes: " + ", ".join(unexpected))
+                if missing:
+                    details.append("missing tests: " + ", ".join(missing))
+                if declared_test_output != "PASS":
+                    details.append(declared_test_output)
+                if BASELINE_UNREADABLE in declared_test_output:
+                    # ponytail: not the author's to fix — the retry loop below
+                    # restages the tests from that same canonical tree, so
+                    # owner="test" would buy three identical paid attempts.
+                    # Environment blockers route straight to the human gate.
+                    issue = QAIssue(
+                        source="contract",
+                        owner="environment",
+                        message="The approved test contract could not be enforced.",
+                        evidence="; ".join(details),
+                        repair_instruction=(
+                            "Repair the baseline test file so it parses as UTF-8 "
+                            "Python, then retry the package."
+                        ),
+                    )
+                else:
+                    issue = QAIssue(
+                        source="contract",
+                        owner="test",
+                        message="Test author violated the approved test contract.",
+                        evidence="; ".join(details),
+                        repair_instruction="Rewrite only the declared tests from the approved criteria.",
+                    )
+                return self._issue_report(package.id, issue)
+            return None
+
+        # A contract violation names the exact tests that are missing, so it is the
+        # most repairable failure in the build — feed that evidence back rather than
+        # spending a human gate on it. Keyed separately from the code-repair loop
+        # below so a test retry cannot eat the executor's repair budget.
+        test_key = f"{package.id}:tests"
+        attempts = self._max_final_qa_repairs()
+        report = await author_once(repair_report, 0)
+        while (
+            report is not None
+            and any(issue.owner == "test" and issue.blocking for issue in report.issues)
+            and self.state.package_repair_attempts.get(test_key, 0) < attempts
+        ):
+            count = self.state.package_repair_attempts.get(test_key, 0) + 1
+            self.state.package_repair_attempts[test_key] = count
+            self.state.final_qa_repair_attempts += 1
+            # check_declared_tests only proves the declared names are present; it
+            # never rejects stale ones. Without this reset a retry can leave the
+            # previous wrong-named tests beside the corrected ones, pass the gate,
+            # and freeze both into trusted-tests.
+            package_workspace.restore_files(workspace, stage, canonical, test_paths)
+            # ponytail: the same event with a higher `attempt`, not a new type.
+            # The frontend gates progress on a registered event-type set that
+            # also guards its /feedback_ready fallback route, so a new type is
+            # a two-repo change that until deployed reads as HITL feedback.
+            _emit_progress(
+                self.state,
+                "test_author_started",
+                package_id=package.id,
+                attempt=count,
+            )
+            report = await author_once(report, count)
+
+        if report is not None:
+            report.repair_count = self.state.package_repair_attempts.get(test_key, 0)
             return self._record_failure(report, str(stage), package.id)
 
         package_workspace.harden_tree(stage)
@@ -2182,7 +2336,13 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             if issue.blocking
         }
         if package is not None and "test" in owners:
-            result = await self._run_package(plan, package, guidance)
+            # The human is supplying new input, so give the automatic loop its
+            # budget back — otherwise a retry arriving after the bound is spent
+            # pays for a stage copy and never calls the author at all.
+            self.state.package_repair_attempts.pop(f"{package.id}:tests", None)
+            result = await self._run_package(
+                plan, package, guidance, repair_report=self.state.current_failure
+            )
             if result.get("route") == "qa_exhausted":
                 return result
             self.state.package_cursor += 1

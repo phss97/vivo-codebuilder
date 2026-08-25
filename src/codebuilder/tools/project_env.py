@@ -30,6 +30,19 @@ log = logging.getLogger(__name__)
 
 SYNC_TIMEOUT_SECONDS = 2400
 _HASH_MARKER = ".codebuilder-pyproject-hash"
+# Index configuration belonging to codebuilder's own deployment, never to the
+# customer project it is building.
+_INDEX_ENV = frozenset(
+    {
+        "UV_INDEX",
+        "UV_DEFAULT_INDEX",
+        "UV_INDEX_URL",
+        "UV_EXTRA_INDEX_URL",
+        "UV_FIND_LINKS",
+        "PIP_INDEX_URL",
+        "PIP_EXTRA_INDEX_URL",
+    }
+)
 
 
 def _venv_python(build_dir: Path) -> Path:
@@ -88,7 +101,20 @@ def ensure_project_env(workspace_dir: str, *, locked: bool = False) -> str:
 
     # uv project commands ignore an inherited VIRTUAL_ENV (the orchestrator's
     # venv when launched via `uv run`) but warn loudly; drop it for clean output.
-    env = {k: v for k, v in os.environ.items() if k != "VIRTUAL_ENV"}
+    # Drop our own package-index config too: inherited wholesale it silently
+    # redirects the *customer* project's resolution at codebuilder's private
+    # mirror, so any package that mirror does not carry 401s instead of
+    # resolving from public PyPI.
+    # ponytail: strip, don't override — the customer's own pyproject/uv.lock
+    # index declaration stays authoritative, which an explicit default would
+    # outrank.
+    dropped = {k for k in os.environ if k == "VIRTUAL_ENV" or k in _INDEX_ENV}
+    if dropped - {"VIRTUAL_ENV"}:
+        log.info(
+            "dropped orchestrator index config for customer uv sync: %s",
+            sorted(dropped - {"VIRTUAL_ENV"}),
+        )
+    env = {k: v for k, v in os.environ.items() if k not in dropped}
     try:
         command = [uv, "sync", "--no-progress"]
         if locked:

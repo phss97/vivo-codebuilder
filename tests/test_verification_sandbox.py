@@ -485,3 +485,75 @@ def test_package_identifier_must_be_a_real_directory(tmp_path):
     output = check_spec_contract(str(tmp_path), plan)
 
     assert "Package drift: expected exact package 'alias'" in output
+
+
+def test_undeclared_tests_are_rejected_unless_inherited_from_the_baseline(tmp_path):
+    """The test-author prompt promises "exactly these, no more and no fewer", so
+    the gate must enforce both halves — otherwise an extra test rides a passing
+    first attempt straight into the frozen, executor-owned acceptance set."""
+    package = _package()
+    stage = tmp_path / "stage"
+    baseline = tmp_path / "baseline"
+    for root in (stage, baseline):
+        (root / "tests").mkdir(parents=True)
+    written = stage / "tests/test_core.py"
+    written.write_text(
+        "def test_core(): pass\ndef test_unapproved(): pass\n", encoding="utf-8"
+    )
+
+    # Presence-only callers (final QA) keep their existing semantics.
+    assert check_declared_tests(str(stage), package) == "PASS"
+
+    output = check_declared_tests(str(stage), package, baseline_dir=str(baseline))
+    assert "undeclared tests: test_unapproved" in output
+
+    # The same extra is fine once it is inherited rather than authored.
+    (baseline / "tests/test_core.py").write_text(
+        "def test_unapproved(): pass\n", encoding="utf-8"
+    )
+    assert (
+        check_declared_tests(str(stage), package, baseline_dir=str(baseline)) == "PASS"
+    )
+
+    # Fixtures and helpers are not acceptance obligations, so they stay allowed.
+    written.write_text(
+        "import pytest\n\n\n@pytest.fixture\ndef engine(): return 1\n\n\n"
+        "def helper(): pass\n\n\ndef test_core(engine): pass\n",
+        encoding="utf-8",
+    )
+    assert (
+        check_declared_tests(str(stage), package, baseline_dir=str(baseline)) == "PASS"
+    )
+
+
+def test_an_unreadable_baseline_is_reported_rather_than_passed_or_blamed_on_the_author(
+    tmp_path,
+):
+    """A baseline that exists but cannot be parsed proves nothing about what the
+    author inherited. Reporting every inherited test as undeclared blames the
+    author for a file they never wrote; passing makes the "exact" contract exact
+    only while the tree happens to be readable. Both are lies, so it says so.
+    Only an *absent* baseline genuinely means nothing was inherited."""
+    package = _package()
+    stage = tmp_path / "stage"
+    baseline = tmp_path / "baseline"
+    for root in (stage, baseline):
+        (root / "tests").mkdir(parents=True)
+    (stage / "tests/test_core.py").write_text(
+        "def test_core(): pass\ndef test_inherited(): pass\n", encoding="utf-8"
+    )
+
+    # Absent baseline: nothing was inherited, so the extra is a real violation.
+    output = check_declared_tests(str(stage), package, baseline_dir=str(baseline))
+    assert "undeclared tests: test_inherited" in output
+
+    # Present but unparseable, and again undecodable: neither passes, and neither
+    # is reported as the author having added an undeclared test.
+    for content in (
+        "def test_inherited(:\n".encode(),
+        "def test_inherited(): pass  # acentua\xe7\xe3o\n".encode("latin-1"),
+    ):
+        (baseline / "tests/test_core.py").write_bytes(content)
+        output = check_declared_tests(str(stage), package, baseline_dir=str(baseline))
+        assert runtime_qa.BASELINE_UNREADABLE in output
+        assert "undeclared tests" not in output

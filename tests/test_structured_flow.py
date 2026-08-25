@@ -14,7 +14,11 @@ import pytest
 
 import codebuilder.main as main
 from codebuilder.package_workspace import snapshot_files, stage_tree
-from codebuilder.runtime_qa import plan_spec_hash, validate_plan
+from codebuilder.runtime_qa import (
+    BASELINE_UNREADABLE,
+    plan_spec_hash,
+    validate_plan,
+)
 from codebuilder.schemas import (
     AuthoritativeAsset,
     CommandResult,
@@ -149,6 +153,49 @@ def test_test_author_out_of_scope_change_is_restored_and_pauses_for_test_owner(
     assert flow.state.current_failure is not None
     assert flow.state.current_failure.issues[0].owner == "test"
     assert not (Path(flow.state.current_stage_dir) / "UNAPPROVED.md").exists()
+
+
+def test_an_unreadable_baseline_test_file_is_environment_owned_not_the_authors_fault(
+    flow: main.CodebuilderFlow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A declared test path the customer already ships as latin-1: the author
+    rewrites it as UTF-8, so the stage parses while the canonical copy still does
+    not. Nothing in the stage can fix that, and a retry restages the tests from
+    that same canonical tree — so it goes straight to the human gate instead of
+    buying three identical paid author calls."""
+    monkeypatch.setenv("CODEBUILDER_MAX_FINAL_QA_REPAIRS", "3")
+    plan = _plan(_package("wp-1"))
+    workspace = Path(flow.state.workspace_dir)
+    canonical = workspace / "output"
+    (canonical / "tests").mkdir(parents=True)
+    (canonical / "tests/test_wp_1.py").write_bytes(
+        "def test_legado(): pass  # acentua\xe7\xe3o\n".encode("latin-1")
+    )
+    flow.state.plan = plan
+    flow.state.canonical_build_dir = str(canonical)
+    calls: list[str] = []
+
+    async def test_author(*, cwd, declared_test_files, **_kwargs) -> None:
+        calls.append(cwd)
+        (Path(cwd) / declared_test_files[0]).write_text(
+            "def test_wp_1(): pass\n", encoding="utf-8"
+        )
+
+    async def executor(**_kwargs) -> None:
+        raise AssertionError(
+            "implementation must not run after a test contract failure"
+        )
+
+    monkeypatch.setattr(main.cc_agent, "run_test_author", test_author)
+    monkeypatch.setattr(main.cc_agent, "run_executor", executor)
+
+    result = asyncio.run(flow._run_package(plan, plan.work_packages[0]))
+
+    assert result == {"route": "qa_exhausted"}
+    issue = flow.state.current_failure.issues[0]
+    assert issue.owner == "environment"
+    assert BASELINE_UNREADABLE in issue.evidence
+    assert len(calls) == 1
 
 
 def test_executor_cannot_promote_mutated_tests_or_unapproved_files(
@@ -817,3 +864,254 @@ def test_skip_routes_directly_to_quarantine_without_full_missing_file_qa(
     assert result == {"route": "quarantine_ready"}
     assert flow.state.skipped_package_ids == ["wp-1", "wp-2"]
     assert flow.state.quarantine_archive is not None
+
+
+def test_wrong_test_names_are_repaired_automatically_with_the_missing_names(
+    flow: main.CodebuilderFlow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The regression test for the run that burned two author calls on the same
+    failure: the retry must carry the exact names the contract check reported."""
+    monkeypatch.setenv("CODEBUILDER_MAX_FINAL_QA_REPAIRS", "1")
+    plan = _plan(_package("wp-1"))
+    flow.state.plan = plan
+    _green_qa(monkeypatch)
+    prompts: list[str] = []
+
+    async def test_author(*, cwd, declared_test_files, prompt, **_kwargs) -> None:
+        prompts.append(prompt)
+        test = Path(cwd) / declared_test_files[0]
+        test.parent.mkdir(parents=True, exist_ok=True)
+        name = "test_wp_1" if len(prompts) > 1 else "test_something_else"
+        test.write_text(f"def {name}(): pass\n")
+
+    async def executor(*, cwd, **_kwargs) -> None:
+        root = Path(cwd) / "src/demo_pkg"
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "wp_1.py").write_text("def build_wp_1(): return 'ok'\n")
+
+    monkeypatch.setattr(main.cc_agent, "run_test_author", test_author)
+    monkeypatch.setattr(main.cc_agent, "run_executor", executor)
+    events: list[tuple[str, dict]] = []
+    monkeypatch.setattr(
+        main,
+        "_emit_progress",
+        lambda _state, event_type, **payload: events.append((event_type, payload)),
+    )
+
+    result = asyncio.run(flow._build_structured(plan))
+
+    assert result == {"route": "execution_complete"}
+    assert len(prompts) == 2
+    # Keyed apart from the code-repair loop's bare package id, so a test retry
+    # cannot eat the executor's repair budget.
+    assert flow.state.package_repair_attempts["wp-1:tests"] == 1
+    assert "test_wp_1" in prompts[1]
+    assert "exact test missing" in prompts[1]
+    # The retry reuses the registered event with a higher `attempt`. A new event
+    # type would be invisible to the frontend, whose registered-type set also
+    # gates its /feedback_ready fallback route — so an unregistered progress
+    # event there is parsed as human feedback, not ignored.
+    authoring = [payload for kind, payload in events if kind == "test_author_started"]
+    assert [payload["attempt"] for payload in authoring] == [0, 1]
+    assert all(payload["package_id"] == "wp-1" for payload in authoring)
+    assert not [kind for kind, _ in events if kind == "test_author_retry"]
+
+
+def test_stale_wrong_named_test_cannot_survive_an_automatic_retry(
+    flow: main.CodebuilderFlow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """check_declared_tests only proves declared names are present, so a retry
+    that appends must not leave the previous wrong-named test behind."""
+    monkeypatch.setenv("CODEBUILDER_MAX_FINAL_QA_REPAIRS", "1")
+    plan = _plan(_package("wp-1"))
+    flow.state.plan = plan
+    _green_qa(monkeypatch)
+    calls: list[str] = []
+
+    async def test_author(*, cwd, declared_test_files, **_kwargs) -> None:
+        calls.append("x")
+        test = Path(cwd) / declared_test_files[0]
+        test.parent.mkdir(parents=True, exist_ok=True)
+        if len(calls) == 1:
+            test.write_text("def test_stale_name(): pass\n")
+            return
+        # Append, as an agent editing in place would.
+        existing = test.read_text() if test.is_file() else ""
+        test.write_text(existing + "def test_wp_1(): pass\n")
+
+    async def executor(*, cwd, **_kwargs) -> None:
+        root = Path(cwd) / "src/demo_pkg"
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "wp_1.py").write_text("def build_wp_1(): return 'ok'\n")
+
+    monkeypatch.setattr(main.cc_agent, "run_test_author", test_author)
+    monkeypatch.setattr(main.cc_agent, "run_executor", executor)
+
+    result = asyncio.run(flow._build_structured(plan))
+
+    assert result == {"route": "execution_complete"}
+    frozen = (Path(flow.state.canonical_build_dir) / "tests/test_wp_1.py").read_text()
+    assert "test_stale_name" not in frozen
+
+
+def test_human_retry_restores_the_automatic_budget_for_that_package(
+    flow: main.CodebuilderFlow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A human retry arriving after the bound is spent must still author, not
+    pay for a stage copy and return the same failure."""
+    monkeypatch.setenv("CODEBUILDER_MAX_FINAL_QA_REPAIRS", "1")
+    plan = _plan(_package("wp-1"))
+    flow.state.plan = plan
+    flow.state.canonical_build_dir = str(Path(flow.state.workspace_dir) / "output")
+    Path(flow.state.canonical_build_dir).mkdir(parents=True, exist_ok=True)
+    flow.state.current_package_id = "wp-1"
+    flow.state.package_repair_attempts["wp-1:tests"] = 1
+    flow.state.current_failure = QAReport(
+        passed=False,
+        issues=[
+            QAIssue(
+                source="contract",
+                owner="test",
+                message="Test author violated the approved test contract.",
+                evidence="tests/test_wp_1.py: exact test missing: test_wp_1.",
+                repair_instruction="Rewrite only the declared tests.",
+            )
+        ],
+    )
+    _green_qa(monkeypatch)
+    calls: list[str] = []
+
+    async def test_author(*, cwd, declared_test_files, prompt, **_kwargs) -> None:
+        calls.append(prompt)
+        test = Path(cwd) / declared_test_files[0]
+        test.parent.mkdir(parents=True, exist_ok=True)
+        # Wrong again on the human retry, so only a restored automatic budget
+        # can still take this package green.
+        name = "test_wp_1" if len(calls) > 1 else "test_still_wrong"
+        test.write_text(f"def {name}(): pass\n")
+
+    async def executor(*, cwd, **_kwargs) -> None:
+        root = Path(cwd) / "src/demo_pkg"
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "wp_1.py").write_text("def build_wp_1(): return 'ok'\n")
+
+    monkeypatch.setattr(main.cc_agent, "run_test_author", test_author)
+    monkeypatch.setattr(main.cc_agent, "run_executor", executor)
+
+    result = asyncio.run(flow._retry_failed_qa({"feedback": "qa_retry"}))
+
+    assert result != {"route": "qa_exhausted"}
+    assert len(calls) == 2
+    # The human's prior failure evidence seeds the first call, not just the loop.
+    assert "exact test missing: test_wp_1" in calls[0]
+
+
+def test_test_author_prompt_leads_with_names_and_omits_other_packages(
+    flow: main.CodebuilderFlow,
+) -> None:
+    plan = _plan(_package("wp-1"), _package("wp-2"))
+    prompt = main._test_author_prompt(flow.state, plan, plan.work_packages[0])
+
+    assert "`tests/test_wp_1.py::test_wp_1`" in prompt
+    # The whole-plan dump used to put a second package's competing prose in
+    # front of the test author; only its own package may appear.
+    assert plan.work_packages[1].what_to_build not in prompt
+
+
+def test_a_preexisting_declared_test_survives_the_restore_before_a_retry(
+    flow: main.CodebuilderFlow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The real failing package declared two test files: one brand new and one
+    already in the baseline carrying a declared bare name. The pre-retry restore
+    wipes the new file back to nonexistence, so it must equally restore the
+    pre-existing one from canonical rather than delete it — otherwise the retry
+    fails the gate on a test that passed on the first attempt."""
+    monkeypatch.setenv("CODEBUILDER_MAX_FINAL_QA_REPAIRS", "1")
+    package = _package("wp-1")
+    package["tests"].append(
+        {
+            "id": "wp-1-test-existing",
+            "criterion_ids": ["wp-1-criterion"],
+            "path": "tests/test_existing.py",
+            "test_name": "test_already_here",
+            "expected_behavior": "Already covered by the attached project.",
+        }
+    )
+    package["files"].append(
+        {
+            "path": "tests/test_existing.py",
+            "purpose": "Pre-existing coverage.",
+            "kind": "test",
+            "public_api": [],
+        }
+    )
+    plan = _plan(package)
+    flow.state.plan = plan
+    canonical = Path(flow.state.workspace_dir) / "output"
+    (canonical / "tests").mkdir(parents=True, exist_ok=True)
+    (canonical / "tests/test_existing.py").write_text("def test_already_here(): pass\n")
+    flow.state.canonical_build_dir = str(canonical)
+    _green_qa(monkeypatch)
+    calls: list[str] = []
+
+    async def test_author(*, cwd, prompt, **_kwargs) -> None:
+        calls.append(prompt)
+        # Only ever authors the new file — the declared bare name in
+        # tests/test_existing.py is already satisfied by the baseline.
+        test = Path(cwd) / "tests/test_wp_1.py"
+        test.parent.mkdir(parents=True, exist_ok=True)
+        name = "test_wp_1" if len(calls) > 1 else "test_wrong_name"
+        test.write_text(f"def {name}(): pass\n")
+
+    async def executor(*, cwd, **_kwargs) -> None:
+        root = Path(cwd) / "src/demo_pkg"
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "wp_1.py").write_text("def build_wp_1(): return 'ok'\n")
+
+    monkeypatch.setattr(main.cc_agent, "run_test_author", test_author)
+    monkeypatch.setattr(main.cc_agent, "run_executor", executor)
+
+    result = asyncio.run(flow._run_package(plan, plan.work_packages[0]))
+
+    assert result == {"route": "package_complete"}
+    assert len(calls) == 2
+    # The retry's evidence names only the new file's test, never the baseline one.
+    assert "test_wp_1" in calls[1]
+    assert "test_already_here" not in calls[1].split("## Contract violations")[-1]
+    assert (canonical / "tests/test_existing.py").is_file()
+
+
+def test_an_undeclared_extra_test_is_repaired_before_it_is_frozen(
+    flow: main.CodebuilderFlow, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The gate is only useful if _run_package passes it the right baseline: an
+    extra test on a first attempt must fail the contract and be repaired, not
+    ride a PASS into the executor-owned acceptance set."""
+    monkeypatch.setenv("CODEBUILDER_MAX_FINAL_QA_REPAIRS", "1")
+    plan = _plan(_package("wp-1"))
+    flow.state.plan = plan
+    _green_qa(monkeypatch)
+    prompts: list[str] = []
+
+    async def test_author(*, cwd, declared_test_files, prompt, **_kwargs) -> None:
+        prompts.append(prompt)
+        test = Path(cwd) / declared_test_files[0]
+        test.parent.mkdir(parents=True, exist_ok=True)
+        extra = "" if len(prompts) > 1 else "def test_unapproved(): pass\n"
+        test.write_text(f"def test_wp_1(): pass\n{extra}")
+
+    async def executor(*, cwd, **_kwargs) -> None:
+        root = Path(cwd) / "src/demo_pkg"
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "wp_1.py").write_text("def build_wp_1(): return 'ok'\n")
+
+    monkeypatch.setattr(main.cc_agent, "run_test_author", test_author)
+    monkeypatch.setattr(main.cc_agent, "run_executor", executor)
+
+    result = asyncio.run(flow._build_structured(plan))
+
+    assert result == {"route": "execution_complete"}
+    assert len(prompts) == 2
+    assert "undeclared tests: test_unapproved" in prompts[1]
+    frozen = (Path(flow.state.canonical_build_dir) / "tests/test_wp_1.py").read_text()
+    assert "test_unapproved" not in frozen
