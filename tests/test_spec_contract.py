@@ -211,9 +211,9 @@ def test_validate_plan_accepts_portuguese_prose_containing_todo():
     """Portuguese "todo" means "all/whole". The planner is told to write prose in
     the job's language, so the placeholder scan must not fire on ordinary words."""
     plan = _plan()
-    plan.work_packages[0].what_to_build = (
-        "Orquestra todo o ciclo de vida do motor de faturamento"
-    )
+    plan.work_packages[
+        0
+    ].what_to_build = "Orquestra todo o ciclo de vida do motor de faturamento"
 
     assert validate_plan(plan) is plan
 

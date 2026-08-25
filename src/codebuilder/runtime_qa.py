@@ -332,7 +332,9 @@ def validate_plan(plan: Plan | None) -> Plan:
         )
         if not _WORK_PACKAGE_ID.fullmatch(package.id) or not package.title.strip():
             issues.append(f"invalid work package id/title: {package.id!r}")
-        if match := (_PLACEHOLDER_MARKER.search(text) or _PLACEHOLDER_PHRASE.search(text)):
+        if match := (
+            _PLACEHOLDER_MARKER.search(text) or _PLACEHOLDER_PHRASE.search(text)
+        ):
             issues.append(
                 f"{package.id}: placeholder text {match.group(0)!r} in title/what_to_build/"
                 "expected_behavior — describe the real work instead"

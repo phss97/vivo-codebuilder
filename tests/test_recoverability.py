@@ -133,7 +133,10 @@ def test_revision_failure_without_a_prior_plan_regates(
 
 @pytest.mark.parametrize(
     ("method", "private"),
-    [("retry_failed_qa", "_retry_failed_qa"), ("skip_failed_package", "_skip_failed_package")],
+    [
+        ("retry_failed_qa", "_retry_failed_qa"),
+        ("skip_failed_package", "_skip_failed_package"),
+    ],
 )
 def test_failed_qa_action_regates_instead_of_stranding_the_job(
     flow: main.CodebuilderFlow,
@@ -173,7 +176,9 @@ def test_planner_repair_feeds_the_rejection_back_into_the_next_prompt(
     async def planner(*, prompt: str, **_kwargs) -> Plan:
         prompts.append(prompt)
         if len(prompts) == 1:
-            return Plan(project_name="demo", mode="new_project", plan_markdown="# legacy")
+            return Plan(
+                project_name="demo", mode="new_project", plan_markdown="# legacy"
+            )
         return good
 
     monkeypatch.setattr(main.cc_agent, "run_planner", planner)
