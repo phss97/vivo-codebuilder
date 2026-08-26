@@ -294,13 +294,20 @@ def test_declared_schema_requires_a_field_parity_test():
     assert validate_plan(plan)
 
 
+def test_package_scope_does_not_require_an_aggregate_schema_test():
+    plan = _plan()
+    plan.authoritative_assets = [AuthoritativeAsset(path="db/schema.sql")]
+
+    assert validate_plan(plan, aggregate=False) is plan
+
+
 def test_schema_parity_test_must_name_a_declared_schema():
     plan = _plan()
     plan.authoritative_assets = [AuthoritativeAsset(path="db/schema.sql")]
     plan.work_packages[0].tests[0].verifies_schema = "db/other.sql"
 
     with pytest.raises(ValueError, match="not a declared schema file"):
-        validate_plan(plan)
+        validate_plan(plan, aggregate=False)
 
 
 def test_parity_test_may_name_a_schema_the_plan_never_declares():

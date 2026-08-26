@@ -2090,7 +2090,9 @@ class CodebuilderFlow(Flow[CodebuilderState]):
         required = {
             command.id: command.required for command in plan.verification_commands
         }
-        contract_output = check_spec_contract(str(build_path), contract_plan)
+        contract_output = check_spec_contract(
+            str(build_path), contract_plan, aggregate=package is None
+        )
         if contract_output != "PASS":
             issues.append(
                 QAIssue(
@@ -3140,6 +3142,21 @@ class CodebuilderFlow(Flow[CodebuilderState]):
             lines.append(f"- Archive: {self.state.project_archive.local_path}")
             if self.state.project_archive.url:
                 lines.append(f"- Download: {self.state.project_archive.url}")
+        if report.command_results:
+            lines.extend(["", "## Verification commands", "", "```text"])
+            for result in report.command_results:
+                reason = (
+                    " - bwrap unavailable"
+                    if result.isolation in {"none", "unshare-net"}
+                    else ""
+                )
+                lines.append(
+                    f"{result.command_id}  {'PASS' if result.passed else 'FAIL'}  "
+                    f"[isolation: {result.isolation}{reason}]"
+                )
+                if result.isolation_detail:
+                    lines.append(f"  {result.isolation_detail}")
+            lines.append("```")
         sections = [
             ("Integration Notes", report.integration_notes),
             ("Lint Output", report.lint_output),

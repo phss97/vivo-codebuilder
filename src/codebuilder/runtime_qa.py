@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import ast
+import functools
 import hashlib
 import json
+import logging
 import os
 import re
 import selectors
@@ -44,6 +46,8 @@ from codebuilder.tools.project_env import (
     project_python,
     provisioning_enabled,
 )
+
+log = logging.getLogger(__name__)
 
 MAX_QA_OUTPUT_CHARS = 12000
 MAX_PROMPT_SECTION_CHARS = 6000
@@ -107,6 +111,17 @@ _SAFE_ENV_KEYS = {
     "TMPDIR",
     "VIRTUAL_ENV",
 }
+_TRUTHY = {"1", "true", "yes", "on"}
+_NO_ISOLATION_DETAIL = (
+    "No OS sandbox was used because bwrap is unavailable. Filesystem confinement "
+    "outside the disposable copy, network denial, and PID/IPC/UTS isolation were "
+    "not provided."
+)
+_UNSHARE_NET_DETAIL = (
+    "Only network denial was provided by a successful unshare -n probe because "
+    "bwrap is unavailable. Filesystem confinement outside the disposable copy and "
+    "PID/IPC/UTS isolation were not provided."
+)
 
 
 def is_pass(output: str) -> bool:
@@ -287,9 +302,10 @@ PLANNER_CONTRACT_RULES = """- `open_questions` must be empty. A plan that still 
   - Self-contained tools that need no project dependency stay in their own
     category, but must not write to the read-only root — `ruff` needs
     `--no-cache`: `["ruff","check","--no-cache","."]`.
-- When the plan declares or depends on a DDL/schema/migration file (`*.sql` or
-  under `migrations/`), exactly one test case must assert the model/ORM field
-  names match it column-for-column, with `verifies_schema` set to that path.
+- At whole-plan scope, when the plan declares or depends on a DDL/schema/migration
+  file (`*.sql` or under `migrations/`), at least one test case must assert the
+  model/ORM field names match it column-for-column, with `verifies_schema` set to
+  that path.
   This is what catches a translated `nome` living beside a correct `job_name`.
 - `authoritative_assets`: safe relative paths, no repeats, and either a real
   64-character SHA-256 or none at all.
@@ -304,8 +320,8 @@ PLANNER_CONTRACT_RULES = """- `open_questions` must be empty. A plan that still 
   Patch jobs preserve the existing names byte-for-byte instead."""
 
 
-def validate_plan(plan: Plan | None) -> Plan:
-    """Validate legacy plans or the complete revisioned specification contract."""
+def validate_plan(plan: Plan | None, *, aggregate: bool = True) -> Plan:
+    """Validate a revisioned specification, optionally without aggregate rules."""
     if not isinstance(plan, Plan):
         raise ValueError("Planner did not return a valid Plan object.")
     issues: list[str] = []
@@ -530,7 +546,7 @@ def validate_plan(plan: Plan | None) -> Plan:
                     f"test {test_id!r}: verifies_schema {schema!r} is not a declared "
                     "schema file or authoritative asset"
                 )
-    if schema_paths and not set(schema_tests.values()) & schema_paths:
+    if aggregate and schema_paths and not set(schema_tests.values()) & schema_paths:
         issues.append(
             "the declared schema (" + ", ".join(sorted(schema_paths)) + ") needs one "
             "test asserting the model/ORM field names match it, with verifies_schema "
@@ -661,6 +677,27 @@ def _bounded_communicate(
     return output("stdout"), output("stderr"), timed_out
 
 
+@functools.cache
+def _unshare_net_available(unshare: str) -> bool:
+    """Return whether this runtime permits a new network namespace."""
+    true = shutil.which("true")
+    if not true:
+        return False
+    try:
+        return (
+            subprocess.run(
+                [unshare, "-n", "--", true],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=2,
+                check=False,
+            ).returncode
+            == 0
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
 def _verification_sandbox(
     root: Path,
     cwd: Path,
@@ -746,7 +783,23 @@ def _verification_sandbox(
     if sys.platform.startswith("linux"):
         bwrap = shutil.which("bwrap")
         if not bwrap:
-            return argv, cwd, root, {}, "", "bubblewrap is unavailable"
+            allow_unconfined = (
+                os.environ.get("CODEBUILDER_ALLOW_UNCONFINED_QA", "").strip().lower()
+                in _TRUTHY
+            )
+            if not allow_unconfined:
+                return argv, cwd, root, {}, "", "bubblewrap is unavailable"
+            unshare = None if network else shutil.which("unshare")
+            if unshare and _unshare_net_available(unshare):
+                return (
+                    [unshare, "-n", "--", *sandboxed_command],
+                    cwd,
+                    root,
+                    {},
+                    "unshare-net",
+                    "",
+                )
+            return sandboxed_command, cwd, root, {}, "none", ""
         system_paths = [
             Path(path)
             for path in (
@@ -824,16 +877,20 @@ def _sandbox_startup_failed(
     kind: str, process: subprocess.CompletedProcess[str]
 ) -> bool:
     stderr = (process.stderr or "").lower()
-    return (kind == "sandbox-exec" and "sandbox_apply" in stderr) or (
-        kind == "bwrap"
-        and any(
-            marker in stderr
-            for marker in (
-                "creating new namespace failed",
-                "operation not permitted",
-                "no permissions to create a new namespace",
+    return (
+        (kind == "sandbox-exec" and "sandbox_apply" in stderr)
+        or (
+            kind == "bwrap"
+            and any(
+                marker in stderr
+                for marker in (
+                    "creating new namespace failed",
+                    "operation not permitted",
+                    "no permissions to create a new namespace",
+                )
             )
         )
+        or (kind == "unshare-net" and "unshare failed:" in stderr)
     )
 
 
@@ -874,6 +931,8 @@ def run_verification_command(
     environment = {
         key: value for key, value in os.environ.items() if key in _SAFE_ENV_KEYS
     }
+    sandbox_kind = "not-run"
+    isolation_detail = ""
     try:
         with (
             tempfile.TemporaryDirectory(prefix="codebuilder-run-") as run_home,
@@ -899,12 +958,17 @@ def run_verification_command(
                 network=command.network,
                 writable=command.category == "build",
             )
+            isolation_detail = {
+                "none": _NO_ISOLATION_DETAIL,
+                "unshare-net": _UNSHARE_NET_DETAIL,
+            }.get(sandbox_kind, "")
             if sandbox_error:
                 return CommandResult(
                     command_id=command.id,
                     passed=False,
                     returncode=127,
                     stderr=f"Verification sandbox unavailable: {sandbox_error}",
+                    isolation="not-run",
                 )
             before = snapshot_files(execution_root, include_excluded=True)
             environment.update(
@@ -951,6 +1015,8 @@ def run_verification_command(
                     stderr=truncate(stderr or ""),
                     timed_out=True,
                     mutated_paths=mutations,
+                    isolation=sandbox_kind,
+                    isolation_detail=isolation_detail,
                 )
             if _sandbox_startup_failed(sandbox_kind, completed):
                 return CommandResult(
@@ -961,6 +1027,8 @@ def run_verification_command(
                     stderr="Verification sandbox unavailable: "
                     + truncate(stderr or "sandbox startup failed"),
                     mutated_paths=mutations,
+                    isolation=sandbox_kind,
+                    isolation_detail=isolation_detail,
                 )
             # ponytail: the launcher prefixes its own exec diagnostic
             # (`sandbox-exec: execvp() of 'mypy' failed`, `bwrap: execvp mypy`).
@@ -985,6 +1053,8 @@ def run_verification_command(
                     )
                     + truncate(stderr or ""),
                     mutated_paths=mutations,
+                    isolation=sandbox_kind,
+                    isolation_detail=isolation_detail,
                 )
     except (OSError, WorkspaceSafetyError) as exc:
         return CommandResult(
@@ -992,6 +1062,8 @@ def run_verification_command(
             passed=False,
             returncode=127,
             stderr=str(exc),
+            isolation=sandbox_kind,
+            isolation_detail=isolation_detail,
         )
     stderr = stderr or ""
     denial_output = f"{stdout}\n{stderr}".lower()
@@ -1033,13 +1105,27 @@ def run_verification_command(
         stdout=truncate(stdout or ""),
         stderr=truncate(stderr),
         mutated_paths=mutations,
+        isolation=sandbox_kind,
+        isolation_detail=isolation_detail,
     )
 
 
 def run_verification_commands(
     build_dir: str, commands: list[VerificationCommand]
 ) -> list[CommandResult]:
-    return [run_verification_command(build_dir, command) for command in commands]
+    results = [run_verification_command(build_dir, command) for command in commands]
+    degraded = list(
+        dict.fromkeys(
+            result.isolation_detail
+            for result in results
+            if result.isolation in {"none", "unshare-net"}
+        )
+    )
+    if degraded:
+        log.warning(
+            "QA verification ran with degraded isolation: %s", " ".join(degraded)
+        )
+    return results
 
 
 def _module_exists(root: Path, module: str) -> bool:
@@ -1241,10 +1327,10 @@ def check_declared_tests(
     return "PASS" if not failures else "\n".join(failures)
 
 
-def check_spec_contract(build_dir: str, plan: Plan) -> str:
+def check_spec_contract(build_dir: str, plan: Plan, *, aggregate: bool = True) -> str:
     """Check exact paths, package/module names, exports, and protected assets."""
     try:
-        validate_plan(plan)
+        validate_plan(plan, aggregate=aggregate)
     except ValueError as exc:
         return str(exc)
     if not plan.is_structured:

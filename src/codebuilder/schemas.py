@@ -91,6 +91,10 @@ class CommandResult(StrictOutputModel):
     stderr: str = ""
     timed_out: bool = False
     mutated_paths: list[str] = Field(default_factory=list)
+    isolation: Literal["sandbox-exec", "bwrap", "unshare-net", "none", "not-run"] = (
+        "not-run"
+    )
+    isolation_detail: str = ""
 
 
 class SuccessCriterion(StrictOutputModel):

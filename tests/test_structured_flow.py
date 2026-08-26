@@ -127,6 +127,30 @@ def _green_qa(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(main.cc_agent, "run_reviewer", reviewer)
 
 
+def test_qa_markdown_records_degraded_isolation(flow: main.CodebuilderFlow) -> None:
+    detail = (
+        "No OS sandbox was used. Filesystem confinement outside the disposable "
+        "copy, network denial, and PID/IPC/UTS isolation were not provided."
+    )
+    flow.state.qa_report = QAReport(
+        passed=True,
+        command_results=[
+            CommandResult(
+                command_id="lint",
+                passed=True,
+                returncode=0,
+                isolation="none",
+                isolation_detail=detail,
+            )
+        ],
+    )
+
+    markdown = flow._qa_report_markdown()
+
+    assert "lint  PASS  [isolation: none - bwrap unavailable]" in markdown
+    assert detail in markdown
+
+
 def test_test_author_out_of_scope_change_is_restored_and_pauses_for_test_owner(
     flow: main.CodebuilderFlow, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -414,6 +438,9 @@ def test_dependent_package_qa_validates_an_independent_partial_spec(
     flow: main.CodebuilderFlow, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     plan = _plan(_package("wp-1"), _package("wp-2", depends_on=["wp-1"]))
+    plan.authoritative_assets = [AuthoritativeAsset(path="db/schema.sql")]
+    plan.work_packages[0].tests[0].verifies_schema = "db/schema.sql"
+    validate_plan(plan)
     workspace = Path(flow.state.workspace_dir)
     canonical = workspace / "output"
     canonical.mkdir()
@@ -429,8 +456,8 @@ def test_dependent_package_qa_validates_an_independent_partial_spec(
     flow.state.approved_spec_hash = plan_spec_hash(plan)
     captured = []
 
-    def contract(_build_dir, partial):
-        validate_plan(partial)
+    def contract(_build_dir, partial, *, aggregate):
+        validate_plan(partial, aggregate=aggregate)
         captured.append(partial)
         return "PASS"
 
@@ -451,6 +478,7 @@ def test_dependent_package_qa_validates_an_independent_partial_spec(
     report = asyncio.run(flow._structured_qa(stage, plan, plan.work_packages[1]))
 
     assert report.passed
+    assert captured
     assert captured[0].work_packages[0].depends_on == []
 
 

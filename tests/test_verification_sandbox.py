@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import logging
 import shutil
 import socket
+import subprocess
 import sys
 import time
 
@@ -257,12 +259,188 @@ def test_verification_network_requires_explicit_spec_capability(tmp_path):
     assert allowed.passed or allowed.returncode == 127
 
 
+def test_linux_without_bwrap_still_fails_closed_by_default(tmp_path, monkeypatch):
+    monkeypatch.setattr(runtime_qa.sys, "platform", "linux")
+    monkeypatch.delenv("CODEBUILDER_ALLOW_UNCONFINED_QA", raising=False)
+    original_which = shutil.which
+    monkeypatch.setattr(
+        runtime_qa.shutil,
+        "which",
+        lambda name, **kwargs: (
+            None if name == "bwrap" else original_which(name, **kwargs)
+        ),
+    )
+
+    result = run_verification_command(
+        str(tmp_path),
+        VerificationCommand(
+            id="default-closed",
+            category="test",
+            argv=[sys.executable, "-c", "print('must not run')"],
+        ),
+    )
+
+    assert result.returncode == 127
+    assert result.stderr == (
+        "Verification sandbox unavailable: bubblewrap is unavailable"
+    )
+    assert result.isolation == "not-run"
+
+
+def test_linux_opt_in_runs_without_os_isolation_when_no_tier_is_available(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(runtime_qa.sys, "platform", "linux")
+    monkeypatch.setenv("CODEBUILDER_ALLOW_UNCONFINED_QA", "true")
+    original_which = shutil.which
+    monkeypatch.setattr(
+        runtime_qa.shutil,
+        "which",
+        lambda name, **kwargs: (
+            None if name in {"bwrap", "unshare"} else original_which(name, **kwargs)
+        ),
+    )
+
+    result = run_verification_command(
+        str(tmp_path),
+        VerificationCommand(
+            id="explicit-degraded",
+            category="test",
+            argv=[sys.executable, "-c", "print('ok')"],
+        ),
+    )
+
+    assert result.passed
+    assert result.stdout.strip() == "ok"
+    assert result.isolation == "none"
+    assert "No OS sandbox was used" in result.isolation_detail
+    assert "network denial" in result.isolation_detail
+    assert "PID/IPC/UTS isolation" in result.isolation_detail
+
+
+def test_linux_opt_in_uses_only_a_successfully_probed_unshare_net(
+    tmp_path, monkeypatch
+):
+    project = tmp_path / "project"
+    qa_home = tmp_path / "qa"
+    project.mkdir()
+    qa_home.mkdir()
+    monkeypatch.setattr(runtime_qa.sys, "platform", "linux")
+    monkeypatch.setenv("CODEBUILDER_ALLOW_UNCONFINED_QA", "on")
+    original_which = shutil.which
+    monkeypatch.setattr(
+        runtime_qa.shutil,
+        "which",
+        lambda name, **kwargs: (
+            None
+            if name == "bwrap"
+            else "/usr/bin/unshare"
+            if name == "unshare"
+            else original_which(name, **kwargs)
+        ),
+    )
+    monkeypatch.setattr(runtime_qa, "_unshare_net_available", lambda _path: True)
+
+    argv, *_prefix, kind, error = runtime_qa._verification_sandbox(
+        project,
+        project,
+        qa_home,
+        [sys.executable, "-c", "print('ok')"],
+        network=False,
+        writable=False,
+    )
+
+    assert argv[:3] == ["/usr/bin/unshare", "-n", "--"]
+    assert kind == "unshare-net"
+    assert error == ""
+
+    monkeypatch.setattr(runtime_qa, "_unshare_net_available", lambda _path: False)
+    _argv, *_prefix, kind, error = runtime_qa._verification_sandbox(
+        project,
+        project,
+        qa_home,
+        [sys.executable, "-c", "print('ok')"],
+        network=False,
+        writable=False,
+    )
+    assert kind == "none"
+    assert error == ""
+
+    _argv, *_prefix, kind, error = runtime_qa._verification_sandbox(
+        project,
+        project,
+        qa_home,
+        [sys.executable, "-c", "print('ok')"],
+        network=True,
+        writable=False,
+    )
+    assert kind == "none"
+    assert error == ""
+
+
+def test_unshare_net_probe_executes_a_disposable_noop(monkeypatch):
+    calls = []
+    original_which = shutil.which
+    monkeypatch.setattr(
+        runtime_qa.shutil,
+        "which",
+        lambda name, **kwargs: (
+            "/usr/bin/true" if name == "true" else original_which(name, **kwargs)
+        ),
+    )
+
+    def probe(argv, **kwargs):
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 1)
+
+    monkeypatch.setattr(runtime_qa.subprocess, "run", probe)
+    runtime_qa._unshare_net_available.cache_clear()
+    try:
+        assert not runtime_qa._unshare_net_available("/usr/bin/unshare")
+    finally:
+        runtime_qa._unshare_net_available.cache_clear()
+
+    assert calls[0][0] == ["/usr/bin/unshare", "-n", "--", "/usr/bin/true"]
+    assert calls[0][1]["timeout"] == 2
+
+
+def test_degraded_isolation_logs_once_per_qa_run(tmp_path, monkeypatch, caplog):
+    detail = "No OS sandbox; reduced isolation."
+    monkeypatch.setattr(
+        runtime_qa,
+        "run_verification_command",
+        lambda _build_dir, command: runtime_qa.CommandResult(
+            command_id=command.id,
+            passed=True,
+            returncode=0,
+            isolation="none",
+            isolation_detail=detail,
+        ),
+    )
+    commands = [
+        VerificationCommand(id="lint", category="lint", argv=["ruff"]),
+        VerificationCommand(id="tests", category="test", argv=["python"]),
+    ]
+
+    with caplog.at_level(logging.WARNING, logger=runtime_qa.__name__):
+        runtime_qa.run_verification_commands(str(tmp_path), commands)
+
+    warnings = [
+        record
+        for record in caplog.records
+        if "QA verification ran with degraded isolation" in record.message
+    ]
+    assert len(warnings) == 1
+    assert detail in warnings[0].message
+
+
 def test_linux_bwrap_drops_caps_and_does_not_mount_the_host_root(tmp_path, monkeypatch):
     project = tmp_path / "project"
     qa_home = tmp_path / "qa"
     project.mkdir()
     qa_home.mkdir()
     monkeypatch.setattr(runtime_qa.sys, "platform", "linux")
+    monkeypatch.setenv("CODEBUILDER_ALLOW_UNCONFINED_QA", "true")
     original_which = shutil.which
     monkeypatch.setattr(
         runtime_qa.shutil,
@@ -291,6 +469,14 @@ def test_linux_bwrap_drops_caps_and_does_not_mount_the_host_root(tmp_path, monke
         argv[index : index + 3] == ["--ro-bind", "/", "/"]
         for index in range(len(argv) - 2)
     )
+    assert runtime_qa._sandbox_startup_failed(
+        "bwrap",
+        subprocess.CompletedProcess(
+            argv,
+            1,
+            stderr="bwrap: creating new namespace failed: Operation not permitted",
+        ),
+    )
 
 
 def test_macos_profile_denies_fork_and_network_by_default(tmp_path, monkeypatch):
@@ -299,6 +485,7 @@ def test_macos_profile_denies_fork_and_network_by_default(tmp_path, monkeypatch)
     project.mkdir()
     qa_home.mkdir()
     monkeypatch.setattr(runtime_qa.sys, "platform", "darwin")
+    monkeypatch.setenv("CODEBUILDER_ALLOW_UNCONFINED_QA", "true")
     original_which = shutil.which
     monkeypatch.setattr(
         runtime_qa.shutil,
@@ -337,7 +524,7 @@ def test_actual_execution_tree_mutation_fails_even_when_sandbox_uses_a_copy(
     def private_copy(root, cwd, qa_home, argv, *, network, writable):
         copied = qa_home / "private-project"
         shutil.copytree(root, copied)
-        return argv, copied / cwd.relative_to(root), copied, {}, "test", ""
+        return argv, copied / cwd.relative_to(root), copied, {}, "none", ""
 
     monkeypatch.setattr(runtime_qa, "_verification_sandbox", private_copy)
     command = VerificationCommand(
